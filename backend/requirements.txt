@@ -1,0 +1,22 @@
+# API 기능을 만드는 프레임워크
+fastapi
+
+# 그 FastAPI 앱을 실제로 띄워서 요청을 받을 수 있게 해주는 실행 서버
+uvicorn
+
+# Python 코드에서 PostgreSQL 같은 DB를 다루기 위한 ORM / DB Toolkit
+sqlalchemy
+
+# Python과 PostgreSQL 사이에서 실제 통신을 담당하는 드라이버
+psycopg[binary]
+
+# .env의 환경변수를 읽어서 설정 객체로 관리
+pydantic-settings
+
+# Database migrations
+alembic
+
+# Development and verification
+pytest
+ruff
+mypy
