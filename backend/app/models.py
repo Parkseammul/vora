@@ -9,12 +9,14 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -120,6 +122,12 @@ class WorkflowExecution(Base):
 
 class ExecutionInputSnapshot(Base):
     __tablename__ = "execution_input_snapshots"
+    __table_args__ = (
+        CheckConstraint(
+            "NULLIF(btrim(request_text), '') IS NOT NULL",
+            name="ck_execution_input_snapshot_request_text_nonblank",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     workflow_execution_id: Mapped[int] = mapped_column(
@@ -128,7 +136,7 @@ class ExecutionInputSnapshot(Base):
     input_type: Mapped[InputType] = mapped_column(
         Enum(InputType, name="input_type"), nullable=False
     )
-    request_text: Mapped[str | None] = mapped_column(Text)
+    request_text: Mapped[str] = mapped_column(Text, nullable=False)
     input_data: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, default=dict, server_default="{}"
     )
@@ -182,6 +190,23 @@ class FileAsset(Base):
             "(execution_input_snapshot_id IS NOT NULL) <> (node_execution_id IS NOT NULL)",
             name="ck_file_asset_exactly_one_source",
         ),
+        CheckConstraint(
+            "sort_order IS NULL OR sort_order >= 1",
+            name="ck_file_asset_sort_order_positive",
+        ),
+        CheckConstraint(
+            "execution_input_snapshot_id IS NULL OR asset_type <> 'IMAGE' OR sort_order IS NOT NULL",
+            name="ck_input_image_sort_order_required",
+        ),
+        Index(
+            "uq_file_asset_snapshot_sort_order",
+            "execution_input_snapshot_id",
+            "sort_order",
+            unique=True,
+            postgresql_where=text(
+                "execution_input_snapshot_id IS NOT NULL AND sort_order IS NOT NULL"
+            ),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -199,6 +224,7 @@ class FileAsset(Base):
     file_name: Mapped[str] = mapped_column(String(255), nullable=False)
     mime_type: Mapped[str] = mapped_column(String(100), nullable=False)
     file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sort_order: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

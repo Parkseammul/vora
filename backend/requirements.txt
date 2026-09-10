@@ -1,5 +1,6 @@
 # API 기능을 만드는 프레임워크
 fastapi
+python-multipart
 
 # 그 FastAPI 앱을 실제로 띄워서 요청을 받을 수 있게 해주는 실행 서버
 uvicorn
@@ -18,5 +19,6 @@ alembic
 
 # Development and verification
 pytest
+httpx
 ruff
 mypy

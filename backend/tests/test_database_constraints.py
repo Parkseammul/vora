@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -93,6 +94,23 @@ def test_workflow_has_only_one_snapshot_and_jsonb_round_trips(session: Session) 
         ExecutionInputSnapshot(
             workflow_execution_id=workflow.id,
             input_type=InputType.IMAGE,
+            request_text="image request",
+            input_data={},
+        ),
+    )
+
+
+@pytest.mark.parametrize("request_text", [None, "", "   "])
+def test_snapshot_request_text_must_not_be_null_or_blank(
+    session: Session, request_text: str | None
+) -> None:
+    workflow = create_workflow(session, create_user(session))
+    flush_fails(
+        session,
+        ExecutionInputSnapshot(
+            workflow_execution_id=workflow.id,
+            input_type=InputType.TEXT,
+            request_text=cast(str, request_text),
             input_data={},
         ),
     )
@@ -220,7 +238,10 @@ def test_file_asset_requires_exactly_one_source(
 ) -> None:
     workflow = create_workflow(session, create_user(session))
     snapshot = ExecutionInputSnapshot(
-        workflow_execution_id=workflow.id, input_type=InputType.IMAGE, input_data={}
+        workflow_execution_id=workflow.id,
+        input_type=InputType.IMAGE,
+        request_text="image request",
+        input_data={},
     )
     node = create_node(session, workflow)
     session.add(snapshot)
@@ -243,7 +264,10 @@ def test_file_asset_requires_exactly_one_source(
 def test_file_asset_accepts_each_valid_single_source(session: Session) -> None:
     workflow = create_workflow(session, create_user(session))
     snapshot = ExecutionInputSnapshot(
-        workflow_execution_id=workflow.id, input_type=InputType.IMAGE, input_data={}
+        workflow_execution_id=workflow.id,
+        input_type=InputType.IMAGE,
+        request_text="image request",
+        input_data={},
     )
     node = create_node(session, workflow)
     session.add(snapshot)
@@ -256,6 +280,7 @@ def test_file_asset_accepts_each_valid_single_source(session: Session) -> None:
         file_name="input.png",
         mime_type="image/png",
         file_size=1,
+        sort_order=1,
     )
     output_asset = FileAsset(
         workflow_execution_id=workflow.id,
@@ -270,6 +295,69 @@ def test_file_asset_accepts_each_valid_single_source(session: Session) -> None:
     session.flush()
     assert input_asset.id is not None
     assert output_asset.id is not None
+
+
+def test_input_asset_sort_order_must_be_positive_and_unique(session: Session) -> None:
+    workflow = create_workflow(session, create_user(session))
+    snapshot = ExecutionInputSnapshot(
+        workflow_execution_id=workflow.id,
+        input_type=InputType.TEXT_IMAGE,
+        request_text="image request",
+        input_data={},
+    )
+    session.add(snapshot)
+    session.flush()
+    flush_fails(
+        session,
+        FileAsset(
+            workflow_execution_id=workflow.id,
+            execution_input_snapshot_id=snapshot.id,
+            asset_type=AssetType.IMAGE,
+            storage_key=str(uuid4()),
+            file_name="missing-order.png",
+            mime_type="image/png",
+            file_size=1,
+            sort_order=None,
+        ),
+    )
+    flush_fails(
+        session,
+        FileAsset(
+            workflow_execution_id=workflow.id,
+            execution_input_snapshot_id=snapshot.id,
+            asset_type=AssetType.IMAGE,
+            storage_key=str(uuid4()),
+            file_name="invalid.png",
+            mime_type="image/png",
+            file_size=1,
+            sort_order=0,
+        ),
+    )
+    first_asset = FileAsset(
+        workflow_execution_id=workflow.id,
+        execution_input_snapshot_id=snapshot.id,
+        asset_type=AssetType.IMAGE,
+        storage_key=str(uuid4()),
+        file_name="first.png",
+        mime_type="image/png",
+        file_size=1,
+        sort_order=1,
+    )
+    session.add(first_asset)
+    session.flush()
+    flush_fails(
+        session,
+        FileAsset(
+            workflow_execution_id=workflow.id,
+            execution_input_snapshot_id=snapshot.id,
+            asset_type=AssetType.IMAGE,
+            storage_key=str(uuid4()),
+            file_name="duplicate.png",
+            mime_type="image/png",
+            file_size=1,
+            sort_order=1,
+        ),
+    )
 
 
 def test_publication_idempotency_key_is_unique(session: Session) -> None:
