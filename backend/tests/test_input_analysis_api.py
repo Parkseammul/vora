@@ -1,17 +1,21 @@
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from shutil import rmtree
+from typing import TypeVar
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app import main
+from app.content_planning import ContentPlanningService
 from app.database import engine
 from app.input_analysis import InputAnalysisResult
+from app.llm_provider import LLMMetadata, LLMProviderType, LLMResult
 from app.models import (
     AssetType,
     ExecutionInputSnapshot,
@@ -23,7 +27,62 @@ from app.models import (
     WorkflowExecution,
     WorkflowExecutionStatus,
 )
+from app.node_executors import RuleBasedNodeExecutor
 from app.workflow_execution_service import DEV_USER_EMAIL
+
+ResponseT = TypeVar("ResponseT", bound=BaseModel)
+
+
+class DeterministicPlanningProvider:
+    def generate_structured(
+        self,
+        prompt: str,
+        response_model: type[ResponseT],
+        provider: LLMProviderType,
+        model: str,
+        images: Sequence[str] = (),
+    ) -> LLMResult:
+        asset_ids = [int(image) for image in images]
+        scene_count = len(asset_ids) or 1
+        duration = 30 / scene_count
+        scenes: list[dict[str, object]] = [
+            {
+                "purpose": "scene",
+                "main_objects": [],
+                "description": "visual",
+                "duration_seconds": duration,
+                "source_asset_id": asset_id,
+                "visual_direction": "clean",
+                "transition_to_next": "CUT" if index < scene_count - 1 else None,
+            }
+            for index, asset_id in enumerate(asset_ids)
+        ]
+        if not scenes:
+            scenes = [
+                {
+                    "purpose": "scene",
+                    "main_objects": [],
+                    "description": "visual",
+                    "duration_seconds": duration,
+                    "source_asset_id": None,
+                    "visual_direction": "clean",
+                    "transition_to_next": None,
+                }
+            ]
+        return LLMResult(
+            data=response_model.model_validate(
+                {
+                    "concept": "concept",
+                    "hook": "hook",
+                    "key_message": "message",
+                    "cta": "cta",
+                    "visual_style": "clean",
+                    "bgm_direction": "upbeat",
+                    "scenes": scenes,
+                }
+            ),
+            metadata=LLMMetadata(provider=provider, model=model),
+        )
 
 
 @pytest.fixture
@@ -60,6 +119,18 @@ def client(
         yield session
 
     monkeypatch.setattr("app.workflow_execution_service.UPLOADS_ROOT", uploads_root)
+    monkeypatch.setattr(
+        main,
+        "RuleBasedNodeExecutor",
+        lambda: RuleBasedNodeExecutor(
+            content_planning_service=ContentPlanningService(
+                DeterministicPlanningProvider(),
+                LLMProviderType.OPENAI,
+                "test-model",
+                session,
+            )
+        ),
+    )
     main.app.dependency_overrides[main.get_session] = get_test_session
     with TestClient(main.app) as test_client:
         yield test_client

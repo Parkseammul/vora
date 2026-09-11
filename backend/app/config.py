@@ -19,4 +19,4 @@ class Settings(BaseSettings):
 
 
 # 애플리케이션 전체에서 사용할 설정 객체
-settings = Settings()
+settings = Settings()  # type: ignore[call-arg]  # Values are loaded by BaseSettings.
