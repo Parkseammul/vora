@@ -15,7 +15,7 @@ from app.models import (
     WorkflowExecution,
     WorkflowExecutionStatus,
 )
-from app.node_executors import NodeExecutor
+from app.node_executors import NodeExecutionResult, NodeExecutor
 from app.workflow_definitions import WorkflowDefinition, WorkflowRegistry
 
 
@@ -123,7 +123,11 @@ class WorkflowEngine:
             self._session.commit()
 
             try:
-                output_data = self._executor.execute(node_key, current_input)
+                execution_result = self._executor.execute(
+                    node_key,
+                    current_input,
+                    workflow_execution_id=execution.id,
+                )
             # Executors wrap replaceable external implementations, so any execution error
             # must be persisted as a workflow failure at this boundary.
             except Exception as exc:  # noqa: BLE001
@@ -141,6 +145,11 @@ class WorkflowEngine:
             finished_at = self._now()
             attempt.status = NodeExecutionAttemptStatus.SUCCESS
             attempt.finished_at = finished_at
+            if isinstance(execution_result, NodeExecutionResult):
+                output_data = execution_result.output_data
+                attempt.metadata_ = execution_result.attempt_metadata
+            else:
+                output_data = execution_result
             node_execution.output_data = output_data
             if node_definition.requires_approval:
                 node_execution.status = NodeExecutionStatus.WAITING_APPROVAL
