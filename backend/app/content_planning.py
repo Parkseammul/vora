@@ -92,7 +92,11 @@ class ContentPlanningService:
     ) -> ContentPlanningOutput:
         analysis = InputAnalysisResult.model_validate(input_data)
         self._validate_assets(analysis.source_asset_ids, workflow_execution_id)
-        prompt = self._build_prompt(analysis)
+        prompt = self._build_prompt(
+            analysis,
+            revision_request=input_data.get("revision_request"),
+            previous_output=input_data.get("previous_output"),
+        )
         llm_result = self._llm_provider.generate_structured(
             prompt,
             ContentPlanningDraft,
@@ -138,10 +142,21 @@ class ContentPlanningService:
             raise ValueError("Scene duration sum must equal the analyzed duration")
 
     @staticmethod
-    def _build_prompt(analysis: InputAnalysisResult) -> str:
-        return (
+    def _build_prompt(
+        analysis: InputAnalysisResult,
+        revision_request: object | None = None,
+        previous_output: object | None = None,
+    ) -> str:
+        prompt = (
             "Create a short-form content plan. Preserve source_asset_ids in their given order, "
             "use each exactly once, and make scene durations sum to duration_seconds. "
             "Do not provide scene_id; the backend creates it. Input: "
             + json.dumps(analysis.model_dump(mode="json"), ensure_ascii=False)
         )
+        if revision_request is not None:
+            prompt += " Revision request: " + str(revision_request)
+        if previous_output is not None:
+            prompt += " Previous result to revise: " + json.dumps(
+                previous_output, ensure_ascii=False
+            )
+        return prompt
