@@ -81,11 +81,17 @@ class WorkflowEngine:
             self._session.commit()
             return execution.status
 
+        next_input = waiting_node.output_data or {}
+        if next_node_key == "video_generation":
+            planning = self._latest_success(execution.id, "content_planning")
+            if planning is None or planning.output_data is None:
+                raise ValueError("No successful planning result exists for video_generation")
+            next_input = {"planning": planning.output_data, "script": next_input}
         return self._run_nodes(
             execution,
             definition,
             next_node_key,
-            waiting_node.output_data or {},
+            next_input,
             waiting_node.user_requested_version,
         )
 
@@ -160,6 +166,7 @@ class WorkflowEngine:
                     node_key,
                     current_input,
                     workflow_execution_id=execution.id,
+                    node_execution_id=node_execution.id,
                 )
             # Executors wrap replaceable external implementations, so any execution error
             # must be persisted as a workflow failure at this boundary.

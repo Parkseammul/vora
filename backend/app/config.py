@@ -1,4 +1,5 @@
-# .env 파일의 환경변수를 읽고 검증하기 위한 BaseSettings
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.llm_provider import LLMProviderType
@@ -16,6 +17,12 @@ class Settings(BaseSettings):
     content_planning_model: str = "gpt-4o-mini"
     script_generation_model: str = "gpt-4o-mini"
     revision_impact_model: str = "gpt-4o-mini"
+    fixed_bgm_asset_id: int | None = None
+    uploads_root: Path = Path("uploads")
+    runway_api_key: str | None = None
+    elevenlabs_api_key: str | None = None
+    elevenlabs_voice_id: str | None = None
+    elevenlabs_model: str = "eleven_multilingual_v2"
 
     # backend/.env 파일에서 값을 읽도록 설정
     model_config = SettingsConfigDict(
