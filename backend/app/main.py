@@ -14,10 +14,23 @@ from app.content_planning import ContentPlanningService
 # database.py에서 만든 PostgreSQL 연결 Engine 가져오기
 from app.database import engine
 from app.llm_provider import LLMProvider
+from app.media_providers import (
+    ElevenLabsHTTPClient,
+    ElevenLabsTTSProvider,
+    FFmpegVideoComposer,
+    RunwayHTTPClient,
+    RunwayVideoProvider,
+)
 from app.models import NodeExecution, NodeExecutionStatus, WorkflowExecutionStatus
 from app.node_executors import RuleBasedNodeExecutor
 from app.revision_impact import CoreNodeKey, RevisionImpactService
 from app.script_generation import ScriptGenerationService
+from app.video_generation import (
+    TTSProvider,
+    VideoComposer,
+    VideoGenerationService,
+    VideoProvider,
+)
 from app.workflow_definitions import workflow_registry
 from app.workflow_engine import WorkflowEngine
 from app.workflow_execution_service import (
@@ -47,6 +60,7 @@ class AIWorkflowServices:
     content_planning: ContentPlanningService
     script_generation: ScriptGenerationService
     revision_impact: RevisionImpactService
+    video_generation: VideoGenerationService | None
 
 
 def get_session() -> Iterator[Session]:
@@ -59,6 +73,26 @@ def configure_llm_provider(llm_provider: LLMProvider) -> None:
     app.state.llm_provider = llm_provider
 
 
+def configure_media_providers(
+    video_provider: VideoProvider, tts_provider: TTSProvider, composer: VideoComposer
+) -> None:
+    app.state.media_providers = (video_provider, tts_provider, composer)
+
+
+if settings.runway_api_key and settings.elevenlabs_api_key and settings.elevenlabs_voice_id:
+    configure_media_providers(
+        RunwayVideoProvider(RunwayHTTPClient(settings.runway_api_key)),
+        ElevenLabsTTSProvider(
+            ElevenLabsHTTPClient(
+                settings.elevenlabs_api_key,
+                settings.elevenlabs_voice_id,
+                settings.elevenlabs_model,
+            )
+        ),
+        FFmpegVideoComposer(),
+    )
+
+
 def get_llm_provider() -> LLMProvider:
     llm_provider = getattr(app.state, "llm_provider", None)
     if llm_provider is None:
@@ -68,6 +102,7 @@ def get_llm_provider() -> LLMProvider:
 
 def get_ai_workflow_services(session: Session) -> AIWorkflowServices:
     llm_provider = get_llm_provider()
+    media = getattr(app.state, "media_providers", None)
     return AIWorkflowServices(
         content_planning=ContentPlanningService(
             llm_provider,
@@ -85,6 +120,13 @@ def get_ai_workflow_services(session: Session) -> AIWorkflowServices:
             settings.llm_provider,
             settings.revision_impact_model,
         ),
+        video_generation=(
+            VideoGenerationService(
+                session, media[0], media[1], media[2], settings.uploads_root, settings.fixed_bgm_asset_id
+            )
+            if media is not None
+            else None
+        ),
     )
 
 
@@ -95,6 +137,8 @@ def get_workflow_engine(session: Session, services: AIWorkflowServices) -> Workf
         RuleBasedNodeExecutor(
             content_planning_service=services.content_planning,
             script_generation_service=services.script_generation,
+            video_generation_service=services.video_generation,
+            session=session,
         ),
     )
 
