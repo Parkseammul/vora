@@ -12,9 +12,14 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app import main
-from app.content_planning import ContentPlanningService
 from app.database import engine
-from app.input_analysis import InputAnalysisResult
+from app.input_analysis import (
+    AgeGroup,
+    ContentGoal,
+    InputAnalysisResult,
+    TargetAudience,
+    analyze_input,
+)
 from app.llm_provider import LLMMetadata, LLMProviderType, LLMResult
 from app.models import (
     AssetType,
@@ -27,7 +32,6 @@ from app.models import (
     WorkflowExecution,
     WorkflowExecutionStatus,
 )
-from app.node_executors import RuleBasedNodeExecutor
 from app.workflow_execution_service import DEV_USER_EMAIL
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
@@ -119,18 +123,7 @@ def client(
         yield session
 
     monkeypatch.setattr("app.workflow_execution_service.UPLOADS_ROOT", uploads_root)
-    monkeypatch.setattr(
-        main,
-        "RuleBasedNodeExecutor",
-        lambda: RuleBasedNodeExecutor(
-            content_planning_service=ContentPlanningService(
-                DeterministicPlanningProvider(),
-                LLMProviderType.OPENAI,
-                "test-model",
-                session,
-            )
-        ),
-    )
+    monkeypatch.setattr(main, "get_llm_provider", lambda: DeterministicPlanningProvider())
     main.app.dependency_overrides[main.get_session] = get_test_session
     with TestClient(main.app) as test_client:
         yield test_client
@@ -307,3 +300,40 @@ def test_input_analysis_result_contract_rejects_invalid_values() -> None:
         InputAnalysisResult(duration_seconds=61)
     with pytest.raises(ValueError):
         InputAnalysisResult(source_asset_ids=[1, 1])
+
+
+def test_input_analysis_applies_revision_request_to_target_audience() -> None:
+    result = analyze_input(
+        {
+            "request_text": "운동 영상을 만들어줘",
+            "revision_request": "타깃을 20대로 바꿔줘",
+            "source_asset_ids": [],
+        }
+    )
+
+    assert result.target_audience.age_group.value == "TWENTIES"
+
+
+def test_input_analysis_revision_preserves_unmodified_baseline_fields() -> None:
+    baseline = InputAnalysisResult(
+        content_goal=ContentGoal.INFORMATIONAL,
+        target_audience=TargetAudience(age_group=AgeGroup.THIRTIES, audience_group="러너"),
+        duration_seconds=45,
+        tone="차분하게",
+        source_asset_ids=[11, 12],
+    )
+
+    result = analyze_input(
+        {
+            "request_text": "기존 요청",
+            "revision_request": "타깃을 20대로 바꿔줘",
+            "source_asset_ids": [99],
+            "previous_output": baseline.model_dump(mode="json"),
+        }
+    )
+
+    assert result.target_audience.age_group is AgeGroup.TWENTIES
+    assert result.content_goal is ContentGoal.INFORMATIONAL
+    assert result.duration_seconds == 45
+    assert result.tone == "차분하게"
+    assert result.source_asset_ids == [11, 12]

@@ -1,6 +1,8 @@
 # .env 파일의 환경변수를 읽고 검증하기 위한 BaseSettings
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.llm_provider import LLMProviderType
+
 
 # VORA Backend에서 사용할 환경변수 정의
 class Settings(BaseSettings):
@@ -10,6 +12,10 @@ class Settings(BaseSettings):
     db_name: str
     db_user: str
     db_password: str
+    llm_provider: LLMProviderType = LLMProviderType.OPENAI
+    content_planning_model: str = "gpt-4o-mini"
+    script_generation_model: str = "gpt-4o-mini"
+    revision_impact_model: str = "gpt-4o-mini"
 
     # backend/.env 파일에서 값을 읽도록 설정
     model_config = SettingsConfigDict(

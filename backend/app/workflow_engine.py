@@ -55,7 +55,7 @@ class WorkflowEngine:
             select(NodeExecution).where(
                 NodeExecution.workflow_execution_id == execution.id,
                 NodeExecution.status == NodeExecutionStatus.WAITING_APPROVAL,
-            )
+            ).order_by(NodeExecution.user_requested_version.desc(), NodeExecution.id.desc())
         )
         if waiting_node is None:
             raise ValueError("No node execution is waiting for approval")
@@ -86,6 +86,37 @@ class WorkflowEngine:
             definition,
             next_node_key,
             waiting_node.output_data or {},
+            waiting_node.user_requested_version,
+        )
+
+    def start_revision(
+        self,
+        workflow_execution_id: int,
+        target_node_key: str,
+        revision_request: str,
+    ) -> WorkflowExecutionStatus:
+        """Starts a new user version without overwriting prior node execution history."""
+        if not revision_request.strip():
+            raise ValueError("revision_request must not be blank")
+        execution = self._get_execution(workflow_execution_id)
+        if execution.status is not WorkflowExecutionStatus.WAITING_APPROVAL:
+            raise ValueError("Only a WAITING_APPROVAL workflow execution can be revised")
+
+        definition = self._definition_for(execution)
+        definition.node(target_node_key)
+        revision_input = self._revision_input(
+            execution, definition, target_node_key, revision_request
+        )
+        next_version = self._next_user_requested_version(execution.id)
+        execution.status = WorkflowExecutionStatus.RUNNING
+        execution.finished_at = None
+        self._session.commit()
+        return self._run_nodes(
+            execution,
+            definition,
+            target_node_key,
+            revision_input,
+            next_version,
         )
 
     def _run_nodes(
@@ -94,6 +125,7 @@ class WorkflowEngine:
         definition: WorkflowDefinition,
         first_node_key: str,
         input_data: Mapping[str, Any],
+        user_requested_version: int = 1,
     ) -> WorkflowExecutionStatus:
         node_key: str | None = first_node_key
         current_input = dict(input_data)
@@ -103,6 +135,7 @@ class WorkflowEngine:
             node_execution = NodeExecution(
                 workflow_execution_id=execution.id,
                 node_key=node_key,
+                user_requested_version=user_requested_version,
                 input_data=current_input,
                 status=NodeExecutionStatus.PENDING,
             )
@@ -167,6 +200,68 @@ class WorkflowEngine:
         execution.finished_at = self._now()
         self._session.commit()
         return execution.status
+
+    def _revision_input(
+        self,
+        execution: WorkflowExecution,
+        definition: WorkflowDefinition,
+        target_node_key: str,
+        revision_request: str,
+    ) -> dict[str, Any]:
+        node_keys = [node.key for node in definition.nodes]
+        target_index = node_keys.index(target_node_key)
+        previous_target = self._latest_node_execution(execution.id, target_node_key)
+
+        if target_index == 0:
+            if previous_target is None:
+                raise ValueError("No prior input_analysis execution is available for revision")
+            revision_input = dict(previous_target.input_data)
+        else:
+            upstream_key = node_keys[target_index - 1]
+            upstream = self._latest_success(execution.id, upstream_key)
+            if upstream is None or upstream.output_data is None:
+                raise ValueError(f"No successful upstream result exists for {target_node_key}")
+            revision_input = dict(upstream.output_data)
+
+        # A revision needs both the approved upstream result and the prior target result.
+        if previous_target is not None and previous_target.output_data is not None:
+            revision_input["previous_output"] = previous_target.output_data
+        revision_input["revision_request"] = revision_request
+        return revision_input
+
+    def _latest_success(
+        self, workflow_execution_id: int, node_key: str
+    ) -> NodeExecution | None:
+        return self._session.scalar(
+            select(NodeExecution)
+            .where(
+                NodeExecution.workflow_execution_id == workflow_execution_id,
+                NodeExecution.node_key == node_key,
+                NodeExecution.status == NodeExecutionStatus.SUCCESS,
+            )
+            .order_by(NodeExecution.user_requested_version.desc(), NodeExecution.id.desc())
+        )
+
+    def _latest_node_execution(
+        self, workflow_execution_id: int, node_key: str
+    ) -> NodeExecution | None:
+        return self._session.scalar(
+            select(NodeExecution)
+            .where(
+                NodeExecution.workflow_execution_id == workflow_execution_id,
+                NodeExecution.node_key == node_key,
+            )
+            .order_by(NodeExecution.user_requested_version.desc(), NodeExecution.id.desc())
+        )
+
+    def _next_user_requested_version(self, workflow_execution_id: int) -> int:
+        latest = self._session.scalar(
+            select(NodeExecution.user_requested_version)
+            .where(NodeExecution.workflow_execution_id == workflow_execution_id)
+            .order_by(NodeExecution.user_requested_version.desc())
+            .limit(1)
+        )
+        return (latest or 0) + 1
 
     def _get_execution(self, workflow_execution_id: int) -> WorkflowExecution:
         execution = self._session.get(WorkflowExecution, workflow_execution_id)

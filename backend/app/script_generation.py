@@ -63,7 +63,11 @@ class ScriptGenerationService:
     def generate(self, input_data: dict[str, object]) -> ScriptGenerationOutput:
         planning = ContentPlanningResult.model_validate(input_data)
         llm_result = self._llm_provider.generate_structured(
-            self._build_prompt(planning),
+            self._build_prompt(
+                planning,
+                revision_request=input_data.get("revision_request"),
+                previous_output=input_data.get("previous_output"),
+            ),
             ScriptGenerationResult,
             self._provider,
             self._model,
@@ -88,9 +92,20 @@ class ScriptGenerationService:
                 raise ValueError(f"Subtitle exceeds scene duration: {scene.planning_scene_id}")
 
     @staticmethod
-    def _build_prompt(planning: ContentPlanningResult) -> str:
-        return (
+    def _build_prompt(
+        planning: ContentPlanningResult,
+        revision_request: object | None = None,
+        previous_output: object | None = None,
+    ) -> str:
+        prompt = (
             "Write one script scene for each planning scene, preserving IDs and order. "
             "Narration and subtitles must fit each scene duration. Planning: "
             + json.dumps(planning.model_dump(mode="json"), ensure_ascii=False)
         )
+        if revision_request is not None:
+            prompt += " Revision request: " + str(revision_request)
+        if previous_output is not None:
+            prompt += " Previous result to revise: " + json.dumps(
+                previous_output, ensure_ascii=False
+            )
+        return prompt

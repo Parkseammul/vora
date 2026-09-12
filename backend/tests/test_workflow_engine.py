@@ -172,3 +172,65 @@ def test_resume_requires_persisted_approval(session: Session) -> None:
 
     with pytest.raises(ValueError, match="has not been approved"):
         workflow_engine.resume_after_approval(execution.id)
+
+
+def test_revision_reruns_target_with_new_version_and_reuses_upstream_success(
+    session: Session,
+) -> None:
+    execution = create_execution(session)
+    executor = FakeNodeExecutor()
+    workflow_engine = WorkflowEngine(session, workflow_registry, executor)
+
+    workflow_engine.start_execution(execution.id, {"topic": "VORA"})
+    approve_waiting_node(session, execution)
+    workflow_engine.resume_after_approval(execution.id)
+
+    assert workflow_engine.start_revision(
+        execution.id,
+        "script_generation",
+        "첫 문장을 더 강하게 바꿔줘",
+    ) is WorkflowExecutionStatus.WAITING_APPROVAL
+
+    nodes = session.scalars(
+        select(NodeExecution)
+        .where(NodeExecution.workflow_execution_id == execution.id)
+        .order_by(NodeExecution.id)
+    ).all()
+    assert [node.node_key for node in nodes] == [
+        "input_analysis",
+        "content_planning",
+        "script_generation",
+        "script_generation",
+    ]
+    assert [node.user_requested_version for node in nodes] == [1, 1, 1, 2]
+    assert nodes[0].status is NodeExecutionStatus.SUCCESS
+    assert nodes[1].status is NodeExecutionStatus.SUCCESS
+    assert nodes[2].status is NodeExecutionStatus.WAITING_APPROVAL
+    assert nodes[3].status is NodeExecutionStatus.WAITING_APPROVAL
+    assert nodes[3].input_data["revision_request"] == "첫 문장을 더 강하게 바꿔줘"
+    assert nodes[3].input_data["previous_output"] == nodes[2].output_data
+    assert executor.executed_node_keys == [
+        "input_analysis",
+        "content_planning",
+        "script_generation",
+        "script_generation",
+    ]
+
+    # The latest version is the only current approval target; v1 remains immutable history.
+    session.add(
+        UserApproval(
+            node_execution_id=nodes[3].id,
+            user_id=execution.user_id,
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+    session.commit()
+    workflow_engine.resume_after_approval(execution.id)
+    video = session.scalars(
+        select(NodeExecution)
+        .where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_key == "video_generation",
+        )
+    ).one()
+    assert video.user_requested_version == 2
