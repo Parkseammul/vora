@@ -22,3 +22,7 @@ pytest
 httpx
 ruff
 mypy
+
+# Video generation asynchronous queue and progress events
+celery
+redis

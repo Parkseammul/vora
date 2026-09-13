@@ -1,4 +1,4 @@
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -31,6 +31,7 @@ class NodeExecutor(Protocol):
         *,
         workflow_execution_id: int | None = None,
         node_execution_id: int | None = None,
+        video_progress_callback: Callable[[str, str], None] | None = None,
     ) -> dict[str, Any] | NodeExecutionResult: ...
 
 
@@ -48,6 +49,7 @@ class FakeNodeExecutor:
         *,
         workflow_execution_id: int | None = None,
         node_execution_id: int | None = None,
+        video_progress_callback: Callable[[str, str], None] | None = None,
     ) -> dict[str, Any]:
         self.executed_node_keys.append(node_key)
         if node_key == self.failing_node_key:
@@ -77,6 +79,7 @@ class RuleBasedNodeExecutor:
         *,
         workflow_execution_id: int | None = None,
         node_execution_id: int | None = None,
+        video_progress_callback: Callable[[str, str], None] | None = None,
     ) -> dict[str, Any] | NodeExecutionResult:
         if node_key == "input_analysis":
             return analyze_input(dict(input_data)).model_dump(mode="json")
@@ -111,7 +114,9 @@ class RuleBasedNodeExecutor:
                 raise NodeExecutorConfigurationError("video_generation service is not configured")
             if workflow_execution_id is None or node_execution_id is None:
                 raise NodeExecutorConfigurationError("video_generation requires execution context")
-            video_generated = self._video_generation_service.generate(dict(input_data), workflow_execution_id)
+            video_generated = self._video_generation_service.generate(
+                dict(input_data), workflow_execution_id, video_progress_callback
+            )
             asset = FileAsset(
                 workflow_execution_id=workflow_execution_id,
                 node_execution_id=node_execution_id,
