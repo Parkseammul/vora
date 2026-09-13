@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     elevenlabs_api_key: str | None = None
     elevenlabs_voice_id: str | None = None
     elevenlabs_model: str = "eleven_multilingual_v2"
+    redis_url: str = "redis://localhost:6379/0"
+    video_generation_queue: str = "video_generation"
 
     # backend/.env 파일에서 값을 읽도록 설정
     model_config = SettingsConfigDict(

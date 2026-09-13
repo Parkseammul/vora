@@ -1,4 +1,4 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -51,6 +51,10 @@ class VideoComposer(Protocol):
     ) -> None: ...
 
 
+class TransientVideoProviderError(RuntimeError):
+    """Provider adapters use this only when the vendor identifies a temporary failure."""
+
+
 class VideoGenerationResult(BaseModel):
     width: int = 1080
     height: int = 1920
@@ -83,7 +87,12 @@ class VideoGenerationService:
         self._uploads_root = uploads_root
         self._fixed_bgm_asset_id = fixed_bgm_asset_id
 
-    def generate(self, input_data: Mapping[str, object], workflow_execution_id: int) -> VideoGenerationOutput:
+    def generate(
+        self,
+        input_data: Mapping[str, object],
+        workflow_execution_id: int,
+        progress_callback: Callable[[str, str], None] | None = None,
+    ) -> VideoGenerationOutput:
         planning = ContentPlanningResult.model_validate(input_data["planning"])
         script = ScriptGenerationResult.model_validate(input_data["script"])
         script_by_scene = self._validate_scene_mapping(planning, script)
@@ -93,14 +102,24 @@ class VideoGenerationService:
         output_dir.mkdir(parents=True, exist_ok=True)
         composition_scenes: list[CompositionScene] = []
         scene_metadata: list[dict[str, object]] = []
-        for scene in planning.scenes:
+        for scene_index, scene in enumerate(planning.scenes, start=1):
             script_scene = script_by_scene[scene.scene_id]
             reference = assets.get(scene.source_asset_id) if scene.source_asset_id is not None else None
+            if progress_callback is not None:
+                progress_callback(
+                    "SCENE_GENERATION",
+                    f"Generating video for scene {scene_index}",
+                )
             video = self._video_provider.generate_scene(
                 self._scene_prompt(scene), scene.duration_seconds, output_dir / f"{scene.scene_id}.mp4", reference
             )
             speech = (
-                self._tts_provider.synthesize(script_scene.narration, output_dir / f"{scene.scene_id}.mp3")
+                self._generate_speech(
+                    script_scene.narration,
+                    output_dir / f"{scene.scene_id}.mp3",
+                    scene_index,
+                    progress_callback,
+                )
                 if script_scene.narration is not None
                 else None
             )
@@ -112,10 +131,23 @@ class VideoGenerationService:
             )
             scene_metadata.append({"video": video.metadata, "tts": speech.metadata if speech else None})
         final_path = output_dir / "final_video.mp4"
+        if progress_callback is not None:
+            progress_callback("COMPOSING", "Composing final video")
         self._composer.compose(composition_scenes, bgm_path, final_path)
         if not final_path.is_file():
             raise RuntimeError("FFmpeg composition did not produce final_video.mp4")
         return VideoGenerationOutput(VideoGenerationResult(), final_path, {"scenes": scene_metadata})
+
+    def _generate_speech(
+        self,
+        narration: str,
+        output_path: Path,
+        scene_index: int,
+        progress_callback: Callable[[str, str], None] | None,
+    ) -> GeneratedSpeech:
+        if progress_callback is not None:
+            progress_callback("TTS_GENERATION", f"Generating narration for scene {scene_index}")
+        return self._tts_provider.synthesize(narration, output_path)
 
     @property
     def uploads_root(self) -> Path:

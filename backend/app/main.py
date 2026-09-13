@@ -2,12 +2,14 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
 # SQL 문자열을 안전하게 실행하기 위한 SQLAlchemy 함수
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from app.celery_app import celery_app
 from app.config import settings
 from app.content_planning import ContentPlanningService
 
@@ -25,6 +27,13 @@ from app.models import NodeExecution, NodeExecutionStatus, WorkflowExecutionStat
 from app.node_executors import RuleBasedNodeExecutor
 from app.revision_impact import CoreNodeKey, RevisionImpactService
 from app.script_generation import ScriptGenerationService
+from app.video_async import (
+    CeleryVideoTaskDispatcher,
+    RedisVideoProgressEvents,
+    VideoProgressEvents,
+    VideoTaskDispatcher,
+    sse_event,
+)
 from app.video_generation import (
     TTSProvider,
     VideoComposer,
@@ -100,9 +109,27 @@ def get_llm_provider() -> LLMProvider:
     return llm_provider
 
 
+def get_video_generation_service(session: Session) -> VideoGenerationService | None:
+    media = getattr(app.state, "media_providers", None)
+    if media is None:
+        return None
+    return VideoGenerationService(
+        session, media[0], media[1], media[2], settings.uploads_root, settings.fixed_bgm_asset_id
+    )
+
+
+def get_video_progress_events() -> VideoProgressEvents:
+    return RedisVideoProgressEvents(settings.redis_url)
+
+
+def get_video_task_dispatcher() -> VideoTaskDispatcher:
+    return CeleryVideoTaskDispatcher(
+        celery_app, get_video_progress_events(), settings.video_generation_queue
+    )
+
+
 def get_ai_workflow_services(session: Session) -> AIWorkflowServices:
     llm_provider = get_llm_provider()
-    media = getattr(app.state, "media_providers", None)
     return AIWorkflowServices(
         content_planning=ContentPlanningService(
             llm_provider,
@@ -120,13 +147,7 @@ def get_ai_workflow_services(session: Session) -> AIWorkflowServices:
             settings.llm_provider,
             settings.revision_impact_model,
         ),
-        video_generation=(
-            VideoGenerationService(
-                session, media[0], media[1], media[2], settings.uploads_root, settings.fixed_bgm_asset_id
-            )
-            if media is not None
-            else None
-        ),
+        video_generation=get_video_generation_service(session),
     )
 
 
@@ -140,6 +161,7 @@ def get_workflow_engine(session: Session, services: AIWorkflowServices) -> Workf
             video_generation_service=services.video_generation,
             session=session,
         ),
+        get_video_task_dispatcher(),
     )
 
 
@@ -147,6 +169,17 @@ def get_workflow_engine(session: Session, services: AIWorkflowServices) -> Workf
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+@app.get("/workflow-executions/{workflow_execution_id}/video-generation/events")
+def stream_video_generation_events(
+    workflow_execution_id: int,
+    events: VideoProgressEvents = Depends(get_video_progress_events),  # noqa: B008
+):
+    return StreamingResponse(
+        (sse_event(payload) for payload in events.subscribe(workflow_execution_id)),
+        media_type="text/event-stream",
+    )
 
 
 # FastAPI가 PostgreSQL에 실제로 연결되는지 확인하는 API

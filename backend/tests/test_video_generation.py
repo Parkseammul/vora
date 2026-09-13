@@ -174,6 +174,7 @@ def test_video_node_generates_media_and_persists_final_video_asset(
     session.add(node)
     session.flush()
     video_provider, tts_provider, composer = FakeVideoProvider(), FakeTTSProvider(), FakeComposer()
+    progress_events: list[tuple[str, str]] = []
     executor = RuleBasedNodeExecutor(
         video_generation_service=VideoGenerationService(session, video_provider, tts_provider, composer, uploads_root, bgm.id),
         session=session,
@@ -183,7 +184,10 @@ def test_video_node_generates_media_and_persists_final_video_asset(
         {
             "planning": {"concept": "c", "hook": "h", "key_message": "k", "cta": "c", "visual_style": "v", "bgm_direction": "b", "scenes": [{"scene_id": "s1", "purpose": "p", "main_objects": [], "description": "d", "duration_seconds": 15, "source_asset_id": image.id, "visual_direction": "cinematic", "transition_to_next": "CUT"}, {"scene_id": "s2", "purpose": "p", "main_objects": [], "description": "d", "duration_seconds": 15, "source_asset_id": None, "visual_direction": "cinematic", "transition_to_next": None}]},
             "script": {"scenes": [{"planning_scene_id": "s1", "narration": "hello", "subtitle": "shown", "speaking_style": "calm", "emphasis_keywords": []}, {"planning_scene_id": "s2", "narration": None, "subtitle": None, "speaking_style": None, "emphasis_keywords": []}]},
-        }, workflow_execution_id=execution.id, node_execution_id=node.id
+        },
+        workflow_execution_id=execution.id,
+        node_execution_id=node.id,
+        video_progress_callback=lambda stage, message: progress_events.append((stage, message)),
     )
     assert isinstance(result, NodeExecutionResult)
     asset = session.get(FileAsset, result.output_data["video_asset_id"])
@@ -193,6 +197,12 @@ def test_video_node_generates_media_and_persists_final_video_asset(
     assert composer.bgm_path == uploads_root / bgm.storage_key
     assert composer.scenes[0].subtitle == "shown"
     assert composer.scenes[1].subtitle is None and composer.scenes[1].audio_path is None
+    assert [stage for stage, _ in progress_events] == [
+        "SCENE_GENERATION",
+        "TTS_GENERATION",
+        "SCENE_GENERATION",
+        "COMPOSING",
+    ]
 
 
 def test_invalid_fixed_bgm_asset_fails_before_scene_generation(
