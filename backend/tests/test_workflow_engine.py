@@ -165,6 +165,33 @@ def test_executor_error_marks_node_attempt_and_workflow_failed(session: Session)
     assert execution.status is WorkflowExecutionStatus.FAILED
 
 
+def test_user_retry_creates_a_new_attempt_on_the_same_failed_node(session: Session) -> None:
+    execution = create_execution(session)
+    executor = FakeNodeExecutor(failing_node_key="content_planning")
+    workflow_engine = WorkflowEngine(session, workflow_registry, executor)
+
+    assert workflow_engine.start_execution(execution.id, {"topic": "VORA"}) is WorkflowExecutionStatus.FAILED
+    failed_node = session.scalars(
+        select(NodeExecution).where(NodeExecution.workflow_execution_id == execution.id)
+    ).all()[-1]
+    executor.failing_node_key = None
+
+    assert workflow_engine.retry_failed_execution(execution.id) is WorkflowExecutionStatus.WAITING_APPROVAL
+    session.refresh(failed_node)
+    attempts = session.scalars(
+        select(NodeExecutionAttempt)
+        .where(NodeExecutionAttempt.node_execution_id == failed_node.id)
+        .order_by(NodeExecutionAttempt.attempt_no)
+    ).all()
+    assert failed_node.status is NodeExecutionStatus.WAITING_APPROVAL
+    assert failed_node.user_requested_version == 1
+    assert [attempt.attempt_no for attempt in attempts] == [1, 2]
+    assert [attempt.status for attempt in attempts] == [
+        NodeExecutionAttemptStatus.FAILED,
+        NodeExecutionAttemptStatus.SUCCESS,
+    ]
+
+
 def test_resume_requires_persisted_approval(session: Session) -> None:
     execution = create_execution(session)
     workflow_engine = WorkflowEngine(session, workflow_registry, FakeNodeExecutor())
