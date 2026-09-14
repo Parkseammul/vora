@@ -161,6 +161,7 @@ def test_text_input_is_reassembled_from_db_and_stops_for_content_approval(
 
     input_analysis, content_planning = nodes_for(session, execution.id)
     assert input_analysis.output_data == content_planning.input_data
+    assert input_analysis.output_data["request_text"] == "짧은 영상을 만들어줘"
     assert input_analysis.input_data == {
         "request_text": "짧은 영상을 만들어줘",
         "input_type": "TEXT",
@@ -269,6 +270,8 @@ def test_api_rejects_image_larger_than_10mb(client: TestClient) -> None:
 def test_database_failure_cleans_files_and_does_not_start_engine(
     client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, uploads_root: Path
 ) -> None:
+    existing_workflow_ids = set(session.scalars(select(WorkflowExecution.id)))
+
     def fail_commit(self: Session) -> None:
         raise OperationalError("commit", {}, RuntimeError("database unavailable"))
 
@@ -281,11 +284,16 @@ def test_database_failure_cleans_files_and_does_not_start_engine(
 
     assert response.status_code == 500
     assert [path for path in uploads_root.rglob("*") if path.is_file()] == []
-    assert session.scalars(select(NodeExecution)).all() == []
+    created_workflow_ids = set(session.scalars(select(WorkflowExecution.id))) - existing_workflow_ids
+    assert created_workflow_ids == set()
+    assert session.scalars(
+        select(NodeExecution).where(NodeExecution.workflow_execution_id.in_(created_workflow_ids))
+    ).all() == []
 
 
 def test_input_analysis_result_contract_rejects_invalid_values() -> None:
     assert InputAnalysisResult().model_dump(mode="json") == {
+        "request_text": "",
         "content_goal": "GENERAL_SHORTFORM",
         "target_audience": {
             "age_group": "ALL",

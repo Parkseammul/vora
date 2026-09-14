@@ -171,9 +171,13 @@ def test_user_retry_creates_a_new_attempt_on_the_same_failed_node(session: Sessi
     workflow_engine = WorkflowEngine(session, workflow_registry, executor)
 
     assert workflow_engine.start_execution(execution.id, {"topic": "VORA"}) is WorkflowExecutionStatus.FAILED
-    failed_node = session.scalars(
-        select(NodeExecution).where(NodeExecution.workflow_execution_id == execution.id)
-    ).all()[-1]
+    failed_node = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_key == "content_planning",
+        )
+    )
+    assert failed_node is not None
     executor.failing_node_key = None
 
     assert workflow_engine.retry_failed_execution(execution.id) is WorkflowExecutionStatus.WAITING_APPROVAL
@@ -261,3 +265,12 @@ def test_revision_reruns_target_with_new_version_and_reuses_upstream_success(
         )
     ).one()
     assert video.user_requested_version == 2
+
+
+def test_revision_rejects_a_downstream_target_before_upstream_is_approved(session: Session) -> None:
+    execution = create_execution(session)
+    workflow_engine = WorkflowEngine(session, workflow_registry, FakeNodeExecutor())
+    assert workflow_engine.start_execution(execution.id, {"topic": "VORA"}) is WorkflowExecutionStatus.WAITING_APPROVAL
+
+    with pytest.raises(ValueError, match="cannot be downstream"):
+        workflow_engine.start_revision(execution.id, "script_generation", "대본을 바꿔줘")
