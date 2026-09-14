@@ -130,6 +130,87 @@ class WorkflowEngine:
             next_version,
         )
 
+    def retry_failed_execution(self, workflow_execution_id: int) -> WorkflowExecutionStatus:
+        """Retries the latest failed node without creating a user revision version."""
+        execution = self._get_execution(workflow_execution_id)
+        if execution.status is not WorkflowExecutionStatus.FAILED:
+            raise ValueError("Only a FAILED workflow execution can be retried")
+
+        node_execution = self._session.scalar(
+            select(NodeExecution)
+            .where(
+                NodeExecution.workflow_execution_id == execution.id,
+                NodeExecution.status == NodeExecutionStatus.FAILED,
+            )
+            .order_by(NodeExecution.user_requested_version.desc(), NodeExecution.id.desc())
+        )
+        if node_execution is None:
+            raise ValueError("No failed node execution is available for retry")
+
+        latest_attempt_no = self._session.scalar(
+            select(NodeExecutionAttempt.attempt_no)
+            .where(NodeExecutionAttempt.node_execution_id == node_execution.id)
+            .order_by(NodeExecutionAttempt.attempt_no.desc())
+            .limit(1)
+        )
+        if latest_attempt_no is None:
+            raise ValueError("Failed node execution has no attempt history")
+        definition = self._definition_for(execution)
+        node_definition = definition.node(node_execution.node_key)
+        started_at = self._now()
+        node_execution.status = NodeExecutionStatus.RUNNING
+        node_execution.finished_at = None
+        execution.status = WorkflowExecutionStatus.RUNNING
+        execution.finished_at = None
+        attempt = NodeExecutionAttempt(
+            node_execution_id=node_execution.id,
+            attempt_no=latest_attempt_no + 1,
+            status=NodeExecutionAttemptStatus.RUNNING,
+            started_at=started_at,
+            metadata_={"retry_kind": "USER_REQUESTED"},
+        )
+        self._session.add(attempt)
+        self._session.commit()
+
+        if node_execution.node_key == "video_generation" and self._video_task_dispatcher is not None:
+            return self._enqueue_video_attempt(execution, node_execution, attempt)
+
+        try:
+            execution_result = self._executor.execute(
+                node_execution.node_key,
+                node_execution.input_data,
+                workflow_execution_id=execution.id,
+                node_execution_id=node_execution.id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            finished_at = self._now()
+            attempt.status = NodeExecutionAttemptStatus.FAILED
+            attempt.error_message = str(exc)
+            attempt.finished_at = finished_at
+            node_execution.status = NodeExecutionStatus.FAILED
+            node_execution.finished_at = finished_at
+            execution.status = WorkflowExecutionStatus.FAILED
+            execution.finished_at = finished_at
+            self._session.commit()
+            return execution.status
+
+        finished_at = self._now()
+        attempt.status = NodeExecutionAttemptStatus.SUCCESS
+        attempt.finished_at = finished_at
+        if isinstance(execution_result, NodeExecutionResult):
+            node_execution.output_data = execution_result.output_data
+            attempt.metadata_ = {**attempt.metadata_, **execution_result.attempt_metadata}
+        else:
+            node_execution.output_data = execution_result
+        if node_definition.requires_approval:
+            node_execution.status = NodeExecutionStatus.WAITING_APPROVAL
+            execution.status = WorkflowExecutionStatus.WAITING_APPROVAL
+        else:
+            node_execution.status = NodeExecutionStatus.SUCCESS
+        node_execution.finished_at = finished_at
+        self._session.commit()
+        return execution.status
+
     def _run_nodes(
         self,
         execution: WorkflowExecution,

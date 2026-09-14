@@ -117,6 +117,7 @@ def test_revision_api_uses_ai_target_not_current_node_hint(
 
     assert response.status_code == 200
     assert response.json()["current_node"] == "script_generation"
+    assert response.json()["restart_node"] == "script_generation"
     latest_script = session.scalars(
         select(NodeExecution)
         .where(
@@ -156,3 +157,42 @@ def test_revision_api_rejects_blank_request(
     )
 
     assert response.status_code == 422
+
+
+def test_workflow_read_apis_and_approval_use_latest_node_state(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    execution = prepare_script_approval(session)
+    script = session.scalars(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_key == "script_generation",
+        )
+    ).one()
+
+    workflow_response = client.get(f"/workflow-executions/{execution.id}")
+    script_response = client.get(f"/workflow-executions/{execution.id}/script")
+    video_response = client.get(f"/workflow-executions/{execution.id}/video")
+
+    assert workflow_response.status_code == 200
+    assert workflow_response.json()["nodes"]["script_generation"]["id"] == script.id
+    assert workflow_response.json()["nodes"]["script_generation"]["attempt"] == {
+        "current": 1,
+        "automatic_max": 1,
+    }
+    assert script_response.json()["node"]["status"] == "WAITING_APPROVAL"
+    assert video_response.json()["video"] is None
+
+    monkeypatch.setattr(main, "get_llm_provider", lambda: ScriptImpactProvider())
+    monkeypatch.setattr(
+        main,
+        "get_workflow_engine",
+        lambda db_session, services: WorkflowEngine(db_session, workflow_registry, FakeNodeExecutor()),
+    )
+    approval_response = client.post(
+        f"/workflow-executions/{execution.id}/approvals",
+        json={"node_execution_id": script.id},
+    )
+
+    assert approval_response.status_code == 200
+    assert approval_response.json()["status"] == "WAITING_APPROVAL"

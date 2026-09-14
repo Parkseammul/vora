@@ -1,8 +1,9 @@
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, field_validator
 
 # SQL 문자열을 안전하게 실행하기 위한 SQLAlchemy 함수
@@ -23,7 +24,16 @@ from app.media_providers import (
     RunwayHTTPClient,
     RunwayVideoProvider,
 )
-from app.models import NodeExecution, NodeExecutionStatus, WorkflowExecutionStatus
+from app.models import (
+    ApprovalDecision,
+    FileAsset,
+    NodeExecution,
+    NodeExecutionAttempt,
+    NodeExecutionStatus,
+    UserApproval,
+    WorkflowExecution,
+    WorkflowExecutionStatus,
+)
 from app.node_executors import RuleBasedNodeExecutor
 from app.revision_impact import CoreNodeKey, RevisionImpactService
 from app.script_generation import ScriptGenerationService
@@ -62,6 +72,14 @@ class RevisionRequest(BaseModel):
         if not value.strip():
             raise ValueError("revision_request must not be blank")
         return value
+
+
+class ApprovalRequest(BaseModel):
+    node_execution_id: int
+
+
+NODE_KEYS = ("input_analysis", "content_planning", "script_generation", "video_generation")
+MAX_AUTOMATIC_VIDEO_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -165,10 +183,118 @@ def get_workflow_engine(session: Session, services: AIWorkflowServices) -> Workf
     )
 
 
+def _get_execution_or_404(session: Session, workflow_execution_id: int) -> WorkflowExecution:
+    execution = session.get(WorkflowExecution, workflow_execution_id)
+    if execution is None:
+        raise HTTPException(status_code=404, detail="Workflow execution was not found")
+    return execution
+
+
+def _latest_node(session: Session, workflow_execution_id: int, node_key: str) -> NodeExecution | None:
+    return session.scalar(
+        select(NodeExecution)
+        .where(
+            NodeExecution.workflow_execution_id == workflow_execution_id,
+            NodeExecution.node_key == node_key,
+        )
+        .order_by(NodeExecution.user_requested_version.desc(), NodeExecution.id.desc())
+    )
+
+
+def _latest_attempt(session: Session, node_execution_id: int) -> NodeExecutionAttempt | None:
+    return session.scalar(
+        select(NodeExecutionAttempt)
+        .where(NodeExecutionAttempt.node_execution_id == node_execution_id)
+        .order_by(NodeExecutionAttempt.attempt_no.desc())
+    )
+
+
+def _node_response(session: Session, node: NodeExecution | None) -> dict[str, object] | None:
+    if node is None:
+        return None
+    attempt = _latest_attempt(session, node.id)
+    return {
+        "id": node.id,
+        "node_key": node.node_key,
+        "user_requested_version": node.user_requested_version,
+        "status": node.status.value,
+        "attempt": {
+            "current": attempt.attempt_no if attempt is not None else 0,
+            "automatic_max": MAX_AUTOMATIC_VIDEO_ATTEMPTS if node.node_key == "video_generation" else 1,
+        },
+    }
+
+
+def _workflow_response(session: Session, execution: WorkflowExecution) -> dict[str, object]:
+    nodes = {key: _node_response(session, _latest_node(session, execution.id, key)) for key in NODE_KEYS}
+    return {
+        "id": execution.id,
+        "status": execution.status.value,
+        "nodes": nodes,
+    }
+
+
+def _detail_response(session: Session, execution: WorkflowExecution, node_key: str) -> dict[str, object]:
+    node = _latest_node(session, execution.id, node_key)
+    detail = _node_response(session, node)
+    return {
+        "workflow_execution_id": execution.id,
+        "workflow_status": execution.status.value,
+        "node": detail,
+        "output": node.output_data if node is not None else None,
+    }
+
+
 # 서버 자체가 정상 실행 중인지 확인하는 API
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+@app.get("/workflow-executions/{workflow_execution_id}")
+def get_workflow_execution(
+    workflow_execution_id: int,
+    session: Session = Depends(get_session),  # noqa: B008
+):
+    return _workflow_response(session, _get_execution_or_404(session, workflow_execution_id))
+
+
+@app.get("/workflow-executions/{workflow_execution_id}/plan")
+def get_workflow_plan(
+    workflow_execution_id: int,
+    session: Session = Depends(get_session),  # noqa: B008
+):
+    return _detail_response(
+        session, _get_execution_or_404(session, workflow_execution_id), "content_planning"
+    )
+
+
+@app.get("/workflow-executions/{workflow_execution_id}/script")
+def get_workflow_script(
+    workflow_execution_id: int,
+    session: Session = Depends(get_session),  # noqa: B008
+):
+    return _detail_response(
+        session, _get_execution_or_404(session, workflow_execution_id), "script_generation"
+    )
+
+
+@app.get("/workflow-executions/{workflow_execution_id}/video")
+def get_workflow_video(
+    workflow_execution_id: int,
+    session: Session = Depends(get_session),  # noqa: B008
+):
+    execution = _get_execution_or_404(session, workflow_execution_id)
+    response = _detail_response(session, execution, "video_generation")
+    output = response["output"]
+    if isinstance(output, dict) and isinstance(output.get("video_asset_id"), int):
+        response["video"] = {
+            "stream_url": f"/workflow-executions/{execution.id}/video/stream",
+            "download_url": f"/workflow-executions/{execution.id}/video/download",
+        }
+    else:
+        response["video"] = None
+    return response
 
 
 @app.get("/workflow-executions/{workflow_execution_id}/video-generation/events")
@@ -195,6 +321,51 @@ def database_health_check():
         "status": "ok",
         "database": "connected",
     }
+
+
+def _video_asset_or_404(session: Session, execution: WorkflowExecution) -> FileAsset:
+    video_node = _latest_node(session, execution.id, "video_generation")
+    if video_node is None or not isinstance(video_node.output_data, dict):
+        raise HTTPException(status_code=404, detail="Generated video was not found")
+    asset_id = video_node.output_data.get("video_asset_id")
+    if not isinstance(asset_id, int):
+        raise HTTPException(status_code=404, detail="Generated video was not found")
+    asset = session.get(FileAsset, asset_id)
+    if asset is None or asset.workflow_execution_id != execution.id:
+        raise HTTPException(status_code=404, detail="Generated video was not found")
+    return asset
+
+
+def _video_file_or_404(asset: FileAsset) -> Path:
+    uploads_root = Path(settings.uploads_root).resolve()
+    path = (uploads_root / asset.storage_key).resolve()
+    try:
+        path.relative_to(uploads_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Generated video was not found") from exc
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Generated video was not found")
+    return path
+
+
+@app.get("/workflow-executions/{workflow_execution_id}/video/stream")
+def stream_generated_video(
+    workflow_execution_id: int,
+    session: Session = Depends(get_session),  # noqa: B008
+):
+    asset = _video_asset_or_404(session, _get_execution_or_404(session, workflow_execution_id))
+    return FileResponse(_video_file_or_404(asset), media_type=asset.mime_type)
+
+
+@app.get("/workflow-executions/{workflow_execution_id}/video/download")
+def download_generated_video(
+    workflow_execution_id: int,
+    session: Session = Depends(get_session),  # noqa: B008
+):
+    asset = _video_asset_or_404(session, _get_execution_or_404(session, workflow_execution_id))
+    return FileResponse(
+        _video_file_or_404(asset), media_type=asset.mime_type, filename=asset.file_name
+    )
 
 
 @app.post("/workflow-executions")
@@ -265,6 +436,56 @@ def create_revision(
         "workflow_execution_id": workflow_execution_id,
         "status": status.value,
         "current_node": current_node.node_key,
+        "restart_node": impact.data.target_node.value,
         "current_node_execution_id": current_node.id,
         "result": current_node.output_data,
     }
+
+
+@app.post("/workflow-executions/{workflow_execution_id}/approvals")
+def approve_workflow_node(
+    workflow_execution_id: int,
+    request: ApprovalRequest,
+    session: Session = Depends(get_session),  # noqa: B008
+):
+    execution = _get_execution_or_404(session, workflow_execution_id)
+    node = session.get(NodeExecution, request.node_execution_id)
+    if (
+        node is None
+        or node.workflow_execution_id != execution.id
+        or node.status is not NodeExecutionStatus.WAITING_APPROVAL
+    ):
+        raise HTTPException(status_code=422, detail="Node is not waiting for approval")
+    if session.scalar(select(UserApproval).where(UserApproval.node_execution_id == node.id)) is not None:
+        raise HTTPException(status_code=422, detail="Node already has a user decision")
+
+    session.add(
+        UserApproval(
+            node_execution_id=node.id,
+            user_id=execution.user_id,
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+    session.commit()
+    try:
+        status = get_workflow_engine(session, get_ai_workflow_services(session)).resume_after_approval(
+            execution.id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"workflow_execution_id": execution.id, "status": status.value}
+
+
+@app.post("/workflow-executions/{workflow_execution_id}/retry")
+def retry_failed_workflow_execution(
+    workflow_execution_id: int,
+    session: Session = Depends(get_session),  # noqa: B008
+):
+    execution = _get_execution_or_404(session, workflow_execution_id)
+    try:
+        status = get_workflow_engine(session, get_ai_workflow_services(session)).retry_failed_execution(
+            execution.id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"workflow_execution_id": execution.id, "status": status.value}
