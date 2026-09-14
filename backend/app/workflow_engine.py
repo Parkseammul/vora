@@ -115,6 +115,12 @@ class WorkflowEngine:
 
         definition = self._definition_for(execution)
         definition.node(target_node_key)
+        waiting_node = self._latest_waiting_node(execution.id)
+        if waiting_node is None:
+            raise ValueError("No node execution is waiting for approval")
+        node_keys = [node.key for node in definition.nodes]
+        if node_keys.index(target_node_key) > node_keys.index(waiting_node.node_key):
+            raise ValueError("Revision target cannot be downstream of the current approval node")
         revision_input = self._revision_input(
             execution, definition, target_node_key, revision_request
         )
@@ -464,6 +470,16 @@ class WorkflowEngine:
             .where(
                 NodeExecution.workflow_execution_id == workflow_execution_id,
                 NodeExecution.node_key == node_key,
+            )
+            .order_by(NodeExecution.user_requested_version.desc(), NodeExecution.id.desc())
+        )
+
+    def _latest_waiting_node(self, workflow_execution_id: int) -> NodeExecution | None:
+        return self._session.scalar(
+            select(NodeExecution)
+            .where(
+                NodeExecution.workflow_execution_id == workflow_execution_id,
+                NodeExecution.status == NodeExecutionStatus.WAITING_APPROVAL,
             )
             .order_by(NodeExecution.user_requested_version.desc(), NodeExecution.id.desc())
         )

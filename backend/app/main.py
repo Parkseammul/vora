@@ -16,6 +16,11 @@ from app.content_planning import ContentPlanningService
 
 # database.py에서 만든 PostgreSQL 연결 Engine 가져오기
 from app.database import engine
+from app.e2e_providers import (
+    DeterministicE2ELLMProvider,
+    FFmpegE2ETTSProvider,
+    FFmpegE2EVideoProvider,
+)
 from app.llm_provider import LLMProvider
 from app.media_providers import (
     ElevenLabsHTTPClient,
@@ -106,7 +111,14 @@ def configure_media_providers(
     app.state.media_providers = (video_provider, tts_provider, composer)
 
 
-if settings.runway_api_key and settings.elevenlabs_api_key and settings.elevenlabs_voice_id:
+if settings.e2e_fake_providers:
+    configure_llm_provider(DeterministicE2ELLMProvider())
+    configure_media_providers(
+        FFmpegE2EVideoProvider(),
+        FFmpegE2ETTSProvider(),
+        FFmpegVideoComposer(settings.ffmpeg_subtitle_font_path),
+    )
+elif settings.runway_api_key and settings.elevenlabs_api_key and settings.elevenlabs_voice_id:
     configure_media_providers(
         RunwayVideoProvider(RunwayHTTPClient(settings.runway_api_key)),
         ElevenLabsTTSProvider(
@@ -116,7 +128,7 @@ if settings.runway_api_key and settings.elevenlabs_api_key and settings.elevenla
                 settings.elevenlabs_model,
             )
         ),
-        FFmpegVideoComposer(),
+        FFmpegVideoComposer(settings.ffmpeg_subtitle_font_path),
     )
 
 

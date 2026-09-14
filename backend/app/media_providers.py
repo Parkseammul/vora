@@ -102,6 +102,9 @@ class ElevenLabsTTSProvider(TTSProvider):
 
 
 class FFmpegVideoComposer(VideoComposer):
+    def __init__(self, subtitle_font_path: Path | None = None) -> None:
+        self._subtitle_font_path = subtitle_font_path
+
     def compose(
         self, scenes: Sequence[CompositionScene], bgm_path: Path, output_path: Path
     ) -> None:
@@ -118,14 +121,18 @@ class FFmpegVideoComposer(VideoComposer):
             check=True,
         )
 
-    @staticmethod
-    def _render_scene(scene: CompositionScene, output_dir: Path) -> Path:
+    def _render_scene(self, scene: CompositionScene, output_dir: Path) -> Path:
         clip_path = output_dir / f"{scene.scene_id}.composed.mp4"
         subtitle_filter = ""
         if scene.subtitle is not None:
             end = scene.timestamps[-1].get("end", scene.duration_seconds) if scene.timestamps else scene.duration_seconds
-            text = scene.subtitle.replace("'", r"\'").replace(":", r"\:")
-            subtitle_filter = f",drawtext=text='{text}':x=(w-text_w)/2:y=h*0.82:enable='between(t,0,{end})'"
+            text = self._escape_drawtext_value(scene.subtitle)
+            font = (
+                f":fontfile='{self._escape_drawtext_value(self._subtitle_font_path)}'"
+                if self._subtitle_font_path is not None
+                else ""
+            )
+            subtitle_filter = f",drawtext=text='{text}'{font}:x=(w-text_w)/2:y=h*0.82:enable='between(t,0,{end})'"
         command = ["ffmpeg", "-y", "-i", str(scene.video_path)]
         if scene.audio_path is not None:
             command += ["-i", str(scene.audio_path)]
@@ -138,3 +145,8 @@ class FFmpegVideoComposer(VideoComposer):
         ]
         subprocess.run(command, check=True)
         return clip_path
+
+    @staticmethod
+    def _escape_drawtext_value(value: str | Path) -> str:
+        """Escape filter separators; Windows drive colons require escaping for FFmpeg."""
+        return str(value).replace("\\", "/").replace("'", r"\'").replace(":", r"\:")

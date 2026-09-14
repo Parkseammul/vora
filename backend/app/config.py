@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.llm_provider import LLMProviderType
@@ -25,6 +26,10 @@ class Settings(BaseSettings):
     elevenlabs_model: str = "eleven_multilingual_v2"
     redis_url: str = "redis://localhost:6379/0"
     video_generation_queue: str = "video_generation"
+    e2e_fake_providers: bool = Field(False, validation_alias="VORA_E2E_FAKE_PROVIDERS")
+    ffmpeg_subtitle_font_path: Path | None = Field(
+        None, validation_alias="FFMPEG_SUBTITLE_FONT_PATH"
+    )
 
     # backend/.env 파일에서 값을 읽도록 설정
     model_config = SettingsConfigDict(

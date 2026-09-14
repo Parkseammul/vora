@@ -40,6 +40,8 @@ class TargetAudience(BaseModel):
 
 
 class InputAnalysisResult(BaseModel):
+    # Preserve the user's original intent for downstream planning; this remains NodeExecution JSON only.
+    request_text: str = ""
     content_goal: ContentGoal = ContentGoal.GENERAL_SHORTFORM
     target_audience: TargetAudience = Field(default_factory=TargetAudience)
     duration_seconds: int = Field(default=30, ge=5, le=60)
@@ -77,6 +79,7 @@ def analyze_input(input_data: dict[str, object]) -> InputAnalysisResult:
         else ContentGoal.GENERAL_SHORTFORM
     )
     return InputAnalysisResult(
+        request_text=request_text,
         content_goal=content_goal,
         target_audience=TargetAudience(
             age_group=(

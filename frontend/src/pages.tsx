@@ -20,18 +20,18 @@ function totalDuration(scenes: Array<{ duration_seconds: number }>) { return sce
 function Waiting({ label }: { label: string }) { return <section className="state-card"><h1>{label} 생성 중</h1><p>생성 결과를 확인하고 있어요.</p></section>; }
 
 export function PlanPage() {
-  const { workflowExecutionId } = useWorkflow(); const load = useCallback(() => api.getPlan(workflowExecutionId), [workflowExecutionId]); const { data, error } = usePolling<Detail<PlanOutput>>(load);
+  const { workflowExecutionId } = useWorkflow(); const load = useCallback(() => api.getPlan(workflowExecutionId), [workflowExecutionId]); const { data, error, refetch: refetchPlan } = usePolling<Detail<PlanOutput>>(load);
   if (error) return <p className="error">{error}</p>; if (!data?.output) return <Waiting label="기획" />;
   const plan = data.output; const fields = [["Concept", plan.concept], ["Hook", plan.hook], ["Key Message", plan.key_message], ["CTA", plan.cta], ["Visual Style", plan.visual_style], ["BGM Direction", plan.bgm_direction]];
-  return <section className="page"><p className="eyebrow">기획</p><h1>영상의 방향을 확인해주세요.</h1><dl className="detail-grid">{fields.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}<div><dt>총 영상 길이</dt><dd>{totalDuration(plan.scenes)}초</dd></div><div><dt>Scene 개수</dt><dd>{plan.scenes.length}개</dd></div></dl><ApprovalActions nodeKey="content_planning" /></section>;
+  return <section className="page"><p className="eyebrow">기획</p><h1>영상의 방향을 확인해주세요.</h1><dl className="detail-grid">{fields.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}<div><dt>총 영상 길이</dt><dd>{totalDuration(plan.scenes)}초</dd></div><div><dt>Scene 개수</dt><dd>{plan.scenes.length}개</dd></div></dl><ApprovalActions nodeKey="content_planning" onRevisionCompleted={refetchPlan} /></section>;
 }
 
 export function ScriptPage() {
-  const { workflowExecutionId } = useWorkflow(); const load = useCallback(() => api.getScript(workflowExecutionId), [workflowExecutionId]); const { data, error } = usePolling<Detail<ScriptOutput>>(load); const planLoad = useCallback(() => api.getPlan(workflowExecutionId), [workflowExecutionId]); const { data: planData } = usePolling<Detail<PlanOutput>>(planLoad);
+  const { workflowExecutionId } = useWorkflow(); const load = useCallback(() => api.getScript(workflowExecutionId), [workflowExecutionId]); const { data, error, refetch: refetchScript } = usePolling<Detail<ScriptOutput>>(load); const planLoad = useCallback(() => api.getPlan(workflowExecutionId), [workflowExecutionId]); const { data: planData } = usePolling<Detail<PlanOutput>>(planLoad);
   if (error) return <p className="error">{error}</p>; if (!data?.output) return <Waiting label="대본" />;
   const durations = planData?.output?.scenes.map((scene) => scene.duration_seconds) ?? [];
   const ranges = data.output.scenes.map((_, index) => ({ start: durations.slice(0, index).reduce((sum, value) => sum + value, 0), end: durations.slice(0, index + 1).reduce((sum, value) => sum + value, 0) }));
-  return <section className="page"><p className="eyebrow">대본</p><h1>장면 흐름을 확인해주세요.</h1><p>총 영상 길이 {totalDuration(planData?.output?.scenes ?? [])}초</p><ol className="timeline">{data.output.scenes.map((scene, index) => <li key={scene.planning_scene_id}><strong>{ranges[index].start}~{ranges[index].end}초</strong><p>Narration: {scene.narration ?? "—"}</p><p>Subtitle: {scene.subtitle ?? "—"}</p></li>)}</ol><ApprovalActions nodeKey="script_generation" /></section>;
+  return <section className="page"><p className="eyebrow">대본</p><h1>장면 흐름을 확인해주세요.</h1><p>총 영상 길이 {totalDuration(planData?.output?.scenes ?? [])}초</p><ol className="timeline">{data.output.scenes.map((scene, index) => <li key={scene.planning_scene_id}><strong>{ranges[index].start}~{ranges[index].end}초</strong><p>Narration: {scene.narration ?? "—"}</p><p>Subtitle: {scene.subtitle ?? "—"}</p></li>)}</ol><ApprovalActions nodeKey="script_generation" onRevisionCompleted={refetchScript} /></section>;
 }
 
 const stages = ["QUEUED", "SCENE_GENERATION", "TTS_GENERATION", "COMPOSING", "COMPLETED"] as const;
@@ -46,5 +46,5 @@ export function VideoPage() {
   if (detail?.status === "FAILED") return <section className="state-card"><h1>영상 생성에 실패했습니다.</h1><p>잠시 후 다시 시도해주세요.</p><button className="primary" onClick={() => void retry()} disabled={retrying}>{retrying ? "다시 시도 중…" : "다시 시도"}</button></section>;
   if (!data?.video) return <section className="page"><p className="eyebrow">영상</p><h1>영상 생성 중</h1>{detail?.status === "RETRYING" && <p className="notice">영상 생성 중 일시적인 문제가 발생했습니다. 자동으로 다시 시도하고 있어요. ({detail.attempt.current}/{detail.attempt.automatic_max})</p>}<ol className="progress">{stages.map((item) => <li key={item} className={stages.indexOf(item) <= stages.indexOf(stage) ? "done" : ""}>{stages.indexOf(item) < stages.indexOf(stage) ? "✓" : stages.indexOf(item) === stages.indexOf(stage) ? "●" : "○"} {stageLabel[item]}</li>)}</ol><p>{message}</p></section>;
   const scenes = planData?.output?.scenes ?? [];
-  return <section className="page"><p className="eyebrow">영상</p><h1>최종 영상을 확인해주세요.</h1><video className="player" controls src={api.assetUrl(data.video.stream_url)} /><p>총 길이 {totalDuration(scenes)}초 · Scene 수 {scenes.length}개</p><ApprovalActions nodeKey="video_generation" /></section>;
+  return <section className="page"><p className="eyebrow">영상</p><h1>최종 영상을 확인해주세요.</h1><video className="player" controls src={api.assetUrl(data.video.stream_url)} /><p>총 길이 {totalDuration(scenes)}초 · Scene 수 {scenes.length}개</p><ApprovalActions nodeKey="video_generation" onRevisionCompleted={refetchVideo} /></section>;
 }
