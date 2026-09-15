@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { api } from "./api";
 import { ApprovalActions, usePolling } from "./components";
 import { useWorkflow } from "./WorkflowContext";
-import type { Detail, PlanOutput, ScriptOutput, VideoDetail } from "./types";
+import type { Detail, PlanOutput, PublicationDetail, ScriptOutput, VideoDetail } from "./types";
 
 export function RequestPage() {
   const navigate = useNavigate(); const [text, setText] = useState(""); const [images, setImages] = useState<File[]>([]); const [busy, setBusy] = useState(false); const [error, setError] = useState(""); const drag = useRef<number | null>(null);
@@ -14,6 +14,24 @@ export function RequestPage() {
     {images.length > 0 && <ol className="image-list">{images.map((image, index) => <li key={`${image.name}-${index}`} draggable onDragStart={() => { drag.current = index; }} onDragOver={(event) => event.preventDefault()} onDrop={() => { if (drag.current === null || drag.current === index) return; const next = [...images]; const [moved] = next.splice(drag.current, 1); next.splice(index, 0, moved); setImages(next); drag.current = null; }}><span>↕</span>{image.name}<button aria-label={`${image.name} 삭제`} onClick={() => setImages(images.filter((_, itemIndex) => itemIndex !== index))}>삭제</button></li>)}</ol>}
     {error && <p className="error">{error}</p>}<button className="primary create" onClick={() => void submit()} disabled={busy}>{busy ? "기획 생성 중…" : "숏폼 만들기"}</button>
   </section></main>;
+}
+
+export function PublicationPanel({ workflowExecutionId }: { workflowExecutionId: number }) {
+  const [detail, setDetail] = useState<PublicationDetail | null>(null);
+  const [selected] = useState<string[]>(["YOUTUBE", "INSTAGRAM"]);
+  const [confirm, setConfirm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async () => setDetail(await api.getPublications(workflowExecutionId)), [workflowExecutionId]);
+  useEffect(() => { queueMicrotask(() => void load()); const source = new EventSource(api.publicationEventUrl(workflowExecutionId)); source.onmessage = () => void load(); source.onerror = () => source.close(); return () => source.close(); }, [load, workflowExecutionId]);
+  const publish = async (force_republish = false) => { setBusy(true); try { await api.publish(workflowExecutionId, { platforms: selected, ...(detail?.draft ?? {}), force_republish }); await load(); setConfirm(false); } finally { setBusy(false); } };
+  return <section className="publication"><h2>SNS 게시</h2>{detail?.publications.map((item) => <p key={item.id}>{item.platform}: {item.status} ({item.attempt.current}/{item.attempt.max}) {item.status === "FAILED" && <button onClick={() => void publish(true)}>다시 게시</button>}</p>)}<button className="primary" disabled={!selected.length} onClick={() => setConfirm(true)}>게시</button>{confirm && <div className="modal-backdrop" role="dialog" aria-modal="true"><section className="modal"><h2>게시를 시작할까요?</h2><button onClick={() => setConfirm(false)}>취소</button><button className="primary" disabled={busy} onClick={() => void publish()}>{busy ? "게시 중…" : "최종 게시"}</button></section></div>}</section>;
+}
+
+export function SocialSettingsPage() {
+  const [connections, setConnections] = useState<string[]>([]);
+  useEffect(() => { void api.connections().then((result) => setConnections(result.connections.map((item) => item.platform))); }, []);
+  const connect = async (platform: string) => { window.location.assign((await api.authorize(platform)).authorization_url); };
+  return <main className="page"><h1>SNS 계정 연결</h1>{["YOUTUBE", "INSTAGRAM"].map((platform) => <p key={platform}>{platform}: {connections.includes(platform) ? "CONNECTED" : "미연결"} {!connections.includes(platform) && <button onClick={() => void connect(platform)}>연결</button>}</p>)}</main>;
 }
 
 function totalDuration(scenes: Array<{ duration_seconds: number }>) { return scenes.reduce((sum, scene) => sum + scene.duration_seconds, 0); }

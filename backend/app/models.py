@@ -80,6 +80,13 @@ class SocialConnectionStatus(enum.Enum):
 
 class SocialPublicationStatus(enum.Enum):
     PENDING = "PENDING"
+    PUBLISHING = "PUBLISHING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+
+
+class SocialPublicationAttemptStatus(enum.Enum):
+    RUNNING = "RUNNING"
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
 
@@ -291,9 +298,8 @@ class UserApproval(Base):
 class SocialAccountConnection(Base):
     __tablename__ = "social_account_connections"
     __table_args__ = (
-        UniqueConstraint(
-            "user_id", "platform", "external_account_id", name="uq_social_account_connection"
-        ),
+        # MVP supports one account per platform; OAuth reconnect refreshes this row.
+        UniqueConstraint("user_id", "platform", name="uq_social_account_connection_platform"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -336,10 +342,39 @@ class SocialPublication(Base):
     external_post_id: Mapped[str | None] = mapped_column(String(255))
     external_post_url: Mapped[str | None] = mapped_column(Text)
     error_message: Mapped[str | None] = mapped_column(Text)
+    youtube_title: Mapped[str | None] = mapped_column(String(100))
+    youtube_description: Mapped[str | None] = mapped_column(Text)
+    instagram_caption: Mapped[str | None] = mapped_column(Text)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class SocialPublicationAttempt(Base):
+    __tablename__ = "social_publication_attempts"
+    __table_args__ = (
+        UniqueConstraint("social_publication_id", "attempt_no", name="uq_social_publication_attempt"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    social_publication_id: Mapped[int] = mapped_column(
+        ForeignKey("social_publications.id"), nullable=False
+    )
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[SocialPublicationAttemptStatus] = mapped_column(
+        Enum(SocialPublicationAttemptStatus, name="social_publication_attempt_status"), nullable=False
+    )
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    metadata_: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )

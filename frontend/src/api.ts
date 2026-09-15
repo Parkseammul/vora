@@ -1,4 +1,4 @@
-import type { Detail, PlanOutput, ScriptOutput, VideoDetail, Workflow } from "./types";
+import type { Detail, PlanOutput, PublicationDetail, ScriptOutput, SocialConnection, VideoDetail, Workflow } from "./types";
 
 const baseUrl = import.meta.env.VITE_API_BASE_URL ?? "";
 
@@ -28,5 +28,10 @@ export const api = {
   }),
   retry: (id: number) => request<void>(`/workflow-executions/${id}/retry`, { method: "POST" }),
   eventUrl: (id: number) => `${baseUrl}/workflow-executions/${id}/video-generation/events`,
+  getPublications: (id: number) => request<PublicationDetail>(`/workflow-executions/${id}/publications`),
+  publish: (id: number, body: object) => request<PublicationDetail>(`/workflow-executions/${id}/publications`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  publicationEventUrl: (id: number) => `${baseUrl}/workflow-executions/${id}/publication/events`,
+  connections: () => request<{ connections: SocialConnection[] }>("/social/connections"),
+  authorize: (platform: string, returnTo = "/settings/social") => request<{ authorization_url: string }>(`/social/${platform}/authorize?return_to=${encodeURIComponent(returnTo)}`),
   assetUrl: (path: string) => `${baseUrl}${path}`,
 };

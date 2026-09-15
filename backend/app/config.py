@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     content_planning_model: str = "gpt-4o-mini"
     script_generation_model: str = "gpt-4o-mini"
     revision_impact_model: str = "gpt-4o-mini"
+    publication_copy_model: str = "gpt-4o-mini"
     fixed_bgm_asset_id: int | None = None
     uploads_root: Path = Path("uploads")
     runway_api_key: str | None = None
@@ -26,6 +27,17 @@ class Settings(BaseSettings):
     elevenlabs_model: str = "eleven_multilingual_v2"
     redis_url: str = "redis://localhost:6379/0"
     video_generation_queue: str = "video_generation"
+    publication_queue: str = "publication"
+    storage_provider: str = "local"
+    s3_bucket: str | None = None
+    s3_region: str | None = None
+    youtube_client_id: str | None = None
+    youtube_client_secret: str | None = None
+    youtube_redirect_uri: str | None = None
+    instagram_client_id: str | None = None
+    instagram_client_secret: str | None = None
+    instagram_redirect_uri: str | None = None
+    frontend_url: str = "http://localhost:5173"
     e2e_fake_providers: bool = Field(False, validation_alias="VORA_E2E_FAKE_PROVIDERS")
     ffmpeg_subtitle_font_path: Path | None = Field(
         None, validation_alias="FFMPEG_SUBTITLE_FONT_PATH"

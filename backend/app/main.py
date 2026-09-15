@@ -1,9 +1,11 @@
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from secrets import token_urlsafe
+from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, field_validator
 
 # SQL 문자열을 안전하게 실행하기 위한 SQLAlchemy 함수
@@ -35,13 +37,28 @@ from app.models import (
     NodeExecution,
     NodeExecutionAttempt,
     NodeExecutionStatus,
+    SocialAccountConnection,
+    SocialConnectionStatus,
+    SocialPlatform,
+    SocialPublication,
+    SocialPublicationAttempt,
+    User,
     UserApproval,
     WorkflowExecution,
     WorkflowExecutionStatus,
 )
 from app.node_executors import RuleBasedNodeExecutor
+from app.publication import PublicationDraft, RedisPublicationEvents
+from app.publication_runtime import get_publication_service
 from app.revision_impact import CoreNodeKey, RevisionImpactService
 from app.script_generation import ScriptGenerationService
+from app.social_providers import (
+    InstagramProvider,
+    OAuthIdentity,
+    SocialProviderError,
+    YouTubeProvider,
+    platform_from_string,
+)
 from app.video_async import (
     CeleryVideoTaskDispatcher,
     RedisVideoProgressEvents,
@@ -65,6 +82,7 @@ from app.workflow_execution_service import (
 
 # VORA Backend의 FastAPI 애플리케이션 객체 생성
 app = FastAPI()
+app.state.oauth_states = {}
 
 
 class RevisionRequest(BaseModel):
@@ -81,6 +99,18 @@ class RevisionRequest(BaseModel):
 
 class ApprovalRequest(BaseModel):
     node_execution_id: int
+
+
+class PublishRequest(BaseModel):
+    platforms: list[str]
+    youtube_title: str | None = None
+    youtube_description: str | None = None
+    instagram_caption: str | None = None
+    force_republish: bool = False
+
+
+class OAuthCodeRequest(BaseModel):
+    code: str
 
 
 NODE_KEYS = ("input_analysis", "content_planning", "script_generation", "video_generation")
@@ -257,6 +287,19 @@ def _detail_response(session: Session, execution: WorkflowExecution, node_key: s
     }
 
 
+def _publication_response(session: Session, publication: SocialPublication) -> dict[str, object]:
+    connection = session.get(SocialAccountConnection, publication.social_account_connection_id)
+    attempts = list(session.scalars(select(SocialPublicationAttempt).where(SocialPublicationAttempt.social_publication_id == publication.id).order_by(SocialPublicationAttempt.attempt_no)))
+    return {"id": publication.id, "platform": connection.platform.value if connection else "UNKNOWN", "status": publication.status.value, "external_post_url": publication.external_post_url, "error_message": publication.error_message, "attempt": {"current": attempts[-1].attempt_no if attempts else 0, "max": 3}}
+
+
+def _dev_user_or_404(session: Session) -> User:
+    user = session.scalar(select(User).where(User.email == "dev@vora.local"))
+    if user is None:
+        raise HTTPException(status_code=404, detail="Development user was not found")
+    return user
+
+
 # 서버 자체가 정상 실행 중인지 확인하는 API
 @app.get("/health")
 def health_check():
@@ -318,6 +361,147 @@ def stream_video_generation_events(
         (sse_event(payload) for payload in events.subscribe(workflow_execution_id)),
         media_type="text/event-stream",
     )
+
+
+@app.get("/workflow-executions/{workflow_execution_id}/publications")
+def get_publications(
+    workflow_execution_id: int,
+    session: Session = Depends(get_session),  # noqa: B008
+):
+    execution = _get_execution_or_404(session, workflow_execution_id)
+    publications = list(
+        session.scalars(
+            select(SocialPublication)
+            .join(FileAsset, SocialPublication.file_asset_id == FileAsset.id)
+            .where(FileAsset.workflow_execution_id == execution.id)
+            .order_by(SocialPublication.id.desc())
+        )
+    )
+    draft = get_publication_service(session, get_llm_provider()).draft(execution)
+    return {"draft": draft.__dict__, "publications": [_publication_response(session, item) for item in publications]}
+
+
+@app.post("/workflow-executions/{workflow_execution_id}/publications")
+def publish_video(
+    workflow_execution_id: int,
+    request: PublishRequest,
+    session: Session = Depends(get_session),  # noqa: B008
+):
+    execution = _get_execution_or_404(session, workflow_execution_id)
+    try:
+        platforms = [platform_from_string(item) for item in request.platforms]
+        if not platforms or len(set(platforms)) != len(platforms):
+            raise ValueError("Select one or more unique platforms")
+        service = get_publication_service(session, get_llm_provider())
+        default = service.draft(execution)
+        draft = PublicationDraft(
+            request.youtube_title or default.youtube_title,
+            request.youtube_description or default.youtube_description,
+            request.instagram_caption or default.instagram_caption,
+        )
+        publications = service.request_publish(
+            execution, platforms, draft, request.force_republish
+        )
+    except (SocialProviderError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"publications": [_publication_response(session, item) for item in publications]}
+
+
+@app.get("/workflow-executions/{workflow_execution_id}/publication/events")
+def stream_publication_events(
+    workflow_execution_id: int,
+):
+    return StreamingResponse(
+        (sse_event(payload) for payload in RedisPublicationEvents(settings.redis_url).subscribe(workflow_execution_id)),
+        media_type="text/event-stream",
+    )
+
+
+def _oauth_provider(platform: SocialPlatform):
+    if platform is SocialPlatform.YOUTUBE:
+        return YouTubeProvider(settings.youtube_client_id, settings.youtube_client_secret, settings.youtube_redirect_uri)
+    return InstagramProvider(settings.instagram_client_id, settings.instagram_client_secret, settings.instagram_redirect_uri)
+
+
+@app.get("/social/{platform}/authorize")
+def social_authorize(
+    platform: str,
+    return_to: str = "/settings/social",
+    session: Session = Depends(get_session),  # noqa: B008
+):
+    try:
+        resolved = platform_from_string(platform)
+        if not return_to.startswith("/") or return_to.startswith("//"):
+            raise SocialProviderError("Invalid OAuth return path", code="bad_request")
+        state = token_urlsafe(32)
+        # State is short-lived server-side data; it never contains credentials or user tokens.
+        app.state.oauth_states[state] = {"user_id": _dev_user_or_404(session).id, "platform": resolved.value, "return_to": return_to}
+        return {"authorization_url": _oauth_provider(resolved).authorization_url(state)}
+    except SocialProviderError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/social/{platform}/callback")
+def social_callback(
+    platform: str,
+    request: OAuthCodeRequest,
+    session: Session = Depends(get_session),  # noqa: B008
+):
+    try:
+        resolved = platform_from_string(platform)
+        identity = _oauth_provider(resolved).exchange_code(request.code)
+        _upsert_social_connection(session, _dev_user_or_404(session), resolved, identity)
+    except SocialProviderError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"platform": resolved.value, "status": "CONNECTED"}
+
+
+def _upsert_social_connection(
+    session: Session, user: User, platform: SocialPlatform, identity: OAuthIdentity
+) -> None:
+    connection = session.scalar(select(SocialAccountConnection).where(SocialAccountConnection.user_id == user.id, SocialAccountConnection.platform == platform))
+    if connection is None:
+        connection = SocialAccountConnection(user_id=user.id, platform=platform, external_account_id=identity.external_account_id, account_name=identity.account_name, access_token=identity.access_token, refresh_token=identity.refresh_token, token_expires_at=identity.token_expires_at)
+        session.add(connection)
+    else:
+        connection.external_account_id, connection.account_name = identity.external_account_id, identity.account_name
+        connection.access_token, connection.refresh_token = identity.access_token, identity.refresh_token
+        connection.token_expires_at, connection.status = identity.token_expires_at, SocialConnectionStatus.CONNECTED
+    session.commit()
+
+
+@app.get("/social/{platform}/callback")
+def social_browser_callback(
+    platform: str,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    session: Session = Depends(get_session),  # noqa: B008
+):
+    resolved_path = "/settings/social"
+    try:
+        resolved = platform_from_string(platform)
+        saved = app.state.oauth_states.pop(state, None) if state else None
+        if not isinstance(saved, dict) or saved.get("platform") != resolved.value:
+            raise SocialProviderError("OAuth state validation failed", code="authorization")
+        resolved_path = str(saved["return_to"])
+        if error or not code:
+            raise SocialProviderError("OAuth connection was denied", code="authorization")
+        user = session.get(User, saved["user_id"])
+        if user is None:
+            raise SocialProviderError("OAuth user was not found", code="authorization")
+        _upsert_social_connection(session, user, resolved, _oauth_provider(resolved).exchange_code(code))
+        query = urlencode({"oauth": "success", "platform": resolved.value})
+    except SocialProviderError:
+        query = urlencode({"oauth": "failed", "platform": platform})
+    return RedirectResponse(f"{settings.frontend_url.rstrip('/')}{resolved_path}?{query}")
+
+
+@app.get("/social/connections")
+def social_connections(session: Session = Depends(get_session)):  # noqa: B008
+    user = _dev_user_or_404(session)
+    connections = list(session.scalars(select(SocialAccountConnection).where(SocialAccountConnection.user_id == user.id)))
+    return {"connections": [{"platform": item.platform.value, "account_name": item.account_name, "status": item.status.value} for item in connections]}
 
 
 # FastAPI가 PostgreSQL에 실제로 연결되는지 확인하는 API
