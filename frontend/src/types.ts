@@ -37,3 +37,8 @@ export interface VideoOutput { video_asset_id: number }
 export interface VideoDetail extends Detail<VideoOutput> {
   video: { stream_url: string; download_url: string } | null;
 }
+
+export type SocialPlatform = "YOUTUBE" | "INSTAGRAM";
+export interface Publication { id: number; platform: SocialPlatform; status: "PENDING" | "PUBLISHING" | "SUCCESS" | "FAILED"; external_post_url: string | null; error_message: string | null; attempt: { current: number; max: number }; }
+export interface PublicationDetail { draft: { youtube_title: string; youtube_description: string; instagram_caption: string }; publications: Publication[]; }
+export interface SocialConnection { platform: SocialPlatform; account_name: string | null; status: string; }

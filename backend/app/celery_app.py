@@ -6,9 +6,12 @@ celery_app = Celery(
     "vora",
     broker=settings.redis_url,
     backend=settings.redis_url,
-    include=["app.video_tasks"],
+    include=["app.video_tasks", "app.publication_tasks"],
 )
 celery_app.conf.update(
     task_default_queue=settings.video_generation_queue,
-    task_routes={"app.video_tasks.execute_video_generation": {"queue": settings.video_generation_queue}},
+    task_routes={
+        "app.video_tasks.execute_video_generation": {"queue": settings.video_generation_queue},
+        "app.publication_tasks.execute_publication": {"queue": settings.publication_queue},
+    },
 )

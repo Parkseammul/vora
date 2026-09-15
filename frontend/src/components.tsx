@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, Outlet, useNavigate, useParams } from "react-router-dom";
 import { api } from "./api";
+import { PublicationPanel } from "./publication";
 import { WorkflowProvider, useWorkflow } from "./WorkflowContext";
 import { statusLabel, steps } from "./workflow";
 import type { NodeKey } from "./types";
@@ -39,7 +40,7 @@ export function ApprovalActions({ nodeKey, onRevisionCompleted }: { nodeKey: Nod
   const { workflow, workflowExecutionId, refetch } = useWorkflow(); const navigate = useNavigate(); const [modal, setModal] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState("");
   const node = workflow?.nodes[nodeKey];
   const approve = async () => { if (!node) return; setBusy(true); setError(""); try { await api.approve(workflowExecutionId, node.id); await refetch(); navigate(`/workflows/${workflowExecutionId}/${nodeKey === "content_planning" ? "script" : "video"}`); } catch (e) { setError(e instanceof Error ? e.message : "승인에 실패했습니다."); } finally { setBusy(false); } };
-  if (node?.status !== "WAITING_APPROVAL") return null;
+  if (node?.status !== "WAITING_APPROVAL") return nodeKey === "video_generation" && workflow?.status === "SUCCESS" ? <PublicationPanel /> : null;
   return <><div className="actions">{nodeKey === "video_generation" && <a className="button" href={api.assetUrl(`/workflow-executions/${workflowExecutionId}/video/download`)}>영상 다운로드</a>}<button className="primary" onClick={() => void approve()} disabled={busy}>{busy ? "처리 중…" : nodeKey === "video_generation" ? "최종 승인" : "승인"}</button><button onClick={() => setModal(true)}>수정 요청</button></div>{error && <p className="error">{error}</p>}{modal && <RevisionModal nodeKey={nodeKey} onClose={() => setModal(false)} onRevisionCompleted={onRevisionCompleted} />}</>;
 }
 
