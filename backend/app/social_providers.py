@@ -2,11 +2,12 @@
 
 import json
 import re
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from uuid import uuid4
 
 import httpx
@@ -42,6 +43,22 @@ def _error(response: httpx.Response) -> SocialProviderError:
     if response.status_code in (401, 403):
         return SocialProviderError("Social account authorization was rejected", code="authorization")
     return SocialProviderError("Social provider rejected the publishing request", code="bad_request")
+
+
+def _instagram_error(response: httpx.Response, operation: str) -> SocialProviderError:
+    """Classify a Meta response without retaining its body or credentials."""
+    if response.status_code == 429 or response.status_code >= 500:
+        # Meta may have accepted a POST before this response became unavailable.
+        return SocialProviderError(
+            f"Instagram {operation} delivery is unknown (HTTP {response.status_code})",
+            code="delivery_unknown",
+        )
+    if response.status_code in (401, 403):
+        return SocialProviderError("Instagram account authorization was rejected", code="authorization")
+    return SocialProviderError(
+        f"Instagram {operation} was rejected (HTTP {response.status_code})",
+        code=f"instagram_http_{response.status_code}",
+    )
 
 
 class _MultipartRelatedStream(httpx.SyncByteStream):
@@ -181,8 +198,19 @@ class InstagramProvider:
     _AUTH_URL = "https://www.instagram.com/oauth/authorize"
     _TOKEN_URL = "https://api.instagram.com/oauth/access_token"
 
-    def __init__(self, client_id: str | None, client_secret: str | None, redirect_uri: str | None) -> None:
+    def __init__(
+        self,
+        client_id: str | None,
+        client_secret: str | None,
+        redirect_uri: str | None,
+        graph_api_version: str = "v24.0",
+        poll_interval_seconds: float = 5.0,
+        poll_max_attempts: int = 24,
+    ) -> None:
         self._client_id, self._client_secret, self._redirect_uri = client_id, client_secret, redirect_uri
+        self._graph_api_version = graph_api_version
+        self._poll_interval_seconds = poll_interval_seconds
+        self._poll_max_attempts = poll_max_attempts
 
     def authorization_url(self, state: str) -> str:
         if not self._client_id or not self._redirect_uri:
@@ -204,22 +232,275 @@ class InstagramProvider:
             raise SocialProviderError("OAuth token response was invalid")
         return OAuthIdentity(str(account_id), None, token, None, None)
 
-    def publish(self, access_token: str, account_id: str, video_url: str, caption: str) -> PublishedPost:
-        base = f"https://graph.instagram.com/{account_id}"
-        try:
-            creation = httpx.post(f"{base}/media", data={"media_type": "REELS", "video_url": video_url, "caption": caption, "access_token": access_token}, timeout=60.0)
+    def publish(
+        self,
+        access_token: str,
+        account_id: str,
+        video_url: str,
+        caption: str,
+        metadata: dict[str, object],
+        persist_progress: Callable[[], None],
+    ) -> PublishedPost:
+        """Publish one Reel while durably recording every non-idempotent boundary.
+
+        ``persist_progress`` commits the owning attempt. It is deliberately called
+        immediately after Meta returns an identifier and before another API call.
+        Neither the access token nor the presigned URL is placed in metadata.
+        """
+        base = f"https://graph.instagram.com/{self._graph_api_version}"
+        headers = {"Authorization": f"Bearer {access_token}"}
+        container_id = metadata.get("instagram_container_id")
+        if not isinstance(container_id, str):
+            try:
+                creation = httpx.post(
+                    f"{base}/{account_id}/media",
+                    data={"media_type": "REELS", "video_url": video_url, "caption": caption},
+                    headers=headers,
+                    timeout=60.0,
+                )
+            except httpx.HTTPError as exc:
+                metadata["instagram_reconciliation_required"] = True
+                persist_progress()
+                raise SocialProviderError(
+                    f"Instagram container creation delivery is unknown ({type(exc).__name__})",
+                    code="delivery_unknown",
+                ) from exc
             if creation.is_error:
-                raise _error(creation)
-            container_id = creation.json().get("id")
-            publish = httpx.post(f"{base}/media_publish", data={"creation_id": container_id, "access_token": access_token}, timeout=60.0)
+                if creation.status_code == 429 or creation.status_code >= 500:
+                    metadata["instagram_reconciliation_required"] = True
+                    persist_progress()
+                raise _instagram_error(creation, "container creation")
+            try:
+                container_id = creation.json().get("id")
+            except (json.JSONDecodeError, ValueError):
+                container_id = None
+            if not isinstance(container_id, str) or not container_id:
+                metadata["instagram_reconciliation_required"] = True
+                persist_progress()
+                raise SocialProviderError(
+                    "Instagram container creation delivery is unknown (invalid response)",
+                    code="delivery_unknown",
+                )
+            metadata["instagram_container_id"] = container_id
+            metadata["instagram_container_status"] = "CREATED"
+            persist_progress()
+
+        media_id = metadata.get("instagram_media_id")
+        status = self._wait_for_container(access_token, base, container_id, metadata, persist_progress)
+        if status in {"ERROR", "EXPIRED"}:
+            raise SocialProviderError(
+                f"Instagram container processing ended with {status}",
+                code="instagram_container_failed",
+            )
+        if status == "PUBLISHED":
+            # Meta has already published this container. Do not issue another POST.
+            if isinstance(media_id, str):
+                return self._verify_media(access_token, base, media_id, metadata, persist_progress)
+            metadata["instagram_reconciliation_required"] = True
+            persist_progress()
+            raise SocialProviderError(
+                "Instagram container is already published; reconciliation is required",
+                code="delivery_unknown",
+            )
+
+        if not isinstance(media_id, str) and isinstance(
+            metadata.get("instagram_publish_requested_at"), str
+        ):
+            # A worker can die after Meta accepts this POST but before its response
+            # is committed. Never send the same non-idempotent request again.
+            metadata["instagram_reconciliation_required"] = True
+            persist_progress()
+            raise SocialProviderError(
+                "Instagram media publish delivery is unknown; reconciliation is required",
+                code="delivery_unknown",
+            )
+
+        if not isinstance(media_id, str):
+            metadata["instagram_publish_requested_at"] = datetime.now(UTC).isoformat()
+            persist_progress()
+            try:
+                publication = httpx.post(
+                    f"{base}/{account_id}/media_publish",
+                    data={"creation_id": container_id},
+                    headers=headers,
+                    timeout=60.0,
+                )
+            except httpx.HTTPError as exc:
+                metadata["instagram_reconciliation_required"] = True
+                persist_progress()
+                raise SocialProviderError(
+                    f"Instagram media publish delivery is unknown ({type(exc).__name__})",
+                    code="delivery_unknown",
+                ) from exc
+            if publication.is_error:
+                if publication.status_code == 429 or publication.status_code >= 500:
+                    metadata["instagram_reconciliation_required"] = True
+                    persist_progress()
+                raise _instagram_error(publication, "media publish")
+            try:
+                media_id = publication.json().get("id")
+            except (json.JSONDecodeError, ValueError):
+                media_id = None
+            if not isinstance(media_id, str) or not media_id:
+                metadata["instagram_reconciliation_required"] = True
+                persist_progress()
+                raise SocialProviderError(
+                    "Instagram media publish delivery is unknown (invalid response)",
+                    code="delivery_unknown",
+                )
+            metadata["instagram_media_id"] = media_id
+            persist_progress()
+
+        return self._verify_media(access_token, base, media_id, metadata, persist_progress)
+
+    def reconcile(
+        self,
+        access_token: str,
+        account_id: str,
+        metadata: dict[str, object],
+        persist_progress: Callable[[], None],
+    ) -> PublishedPost | None:
+        """Read existing external state only; this method never creates or publishes."""
+        base = f"https://graph.instagram.com/{self._graph_api_version}"
+        media_id = metadata.get("instagram_media_id")
+        if isinstance(media_id, str):
+            try:
+                return self._verify_media(access_token, base, media_id, metadata, persist_progress)
+            except SocialProviderError:
+                return None
+
+        container_id = metadata.get("instagram_container_id")
+        if not isinstance(container_id, str):
+            return None
+        try:
+            status = self._wait_for_container(
+                access_token, base, container_id, metadata, persist_progress
+            )
+        except SocialProviderError:
+            return None
+        # A container alone cannot be mapped safely to a published Media ID.
+        # In every outcome, a caller must keep this delivery_unknown record blocked.
+        if status == "PUBLISHED":
+            metadata["instagram_reconciliation_required"] = True
+            persist_progress()
+        return None
+
+    def _wait_for_container(
+        self,
+        access_token: str,
+        base: str,
+        container_id: str,
+        metadata: dict[str, object],
+        persist_progress: Callable[[], None],
+    ) -> str:
+        headers = {"Authorization": f"Bearer {access_token}"}
+        for poll_no in range(self._poll_max_attempts):
+            try:
+                response = httpx.get(
+                    f"{base}/{container_id}",
+                    params={"fields": "status_code,status"},
+                    headers=headers,
+                    timeout=30.0,
+                )
+            except httpx.HTTPError:
+                # Retrying this GET is safe; it never creates or publishes media.
+                if poll_no + 1 < self._poll_max_attempts:
+                    time.sleep(self._poll_interval_seconds)
+                    continue
+                raise SocialProviderError(
+                    "Instagram container status could not be read", code="instagram_container_status_unavailable"
+                ) from None
+            if response.is_error:
+                if response.status_code == 429 or response.status_code >= 500:
+                    if poll_no + 1 < self._poll_max_attempts:
+                        time.sleep(self._poll_interval_seconds)
+                        continue
+                    raise SocialProviderError(
+                        "Instagram container status could not be read",
+                        code="instagram_container_status_unavailable",
+                    )
+                raise _instagram_error(response, "container status lookup")
+            try:
+                status = response.json().get("status_code")
+            except (json.JSONDecodeError, ValueError):
+                status = None
+            if not isinstance(status, str):
+                raise SocialProviderError("Instagram container status response was invalid", code="bad_response")
+            metadata["instagram_container_status"] = status
+            persist_progress()
+            if status == "FINISHED":
+                return status
+            if status in {"ERROR", "EXPIRED", "PUBLISHED"}:
+                return status
+            if status != "IN_PROGRESS":
+                raise SocialProviderError(
+                    "Instagram container returned an unsupported status", code="bad_response"
+                )
+            if poll_no + 1 < self._poll_max_attempts:
+                time.sleep(self._poll_interval_seconds)
+        raise SocialProviderError("Instagram container processing timed out", code="instagram_container_timeout")
+
+    def _verify_media(
+        self,
+        access_token: str,
+        base: str,
+        media_id: str,
+        metadata: dict[str, object],
+        persist_progress: Callable[[], None],
+    ) -> PublishedPost:
+        try:
+            response = httpx.get(
+                f"{base}/{media_id}",
+                params={"fields": "id,permalink"},
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=30.0,
+            )
         except httpx.HTTPError as exc:
-            raise SocialProviderError("Instagram publishing failed", retryable=True) from exc
-        if publish.is_error:
-            raise _error(publish)
-        post_id = publish.json().get("id")
-        if not isinstance(post_id, str):
-            raise SocialProviderError("Instagram publishing response was invalid")
-        return PublishedPost(post_id, None)
+            metadata["instagram_reconciliation_required"] = True
+            persist_progress()
+            raise SocialProviderError(
+                "Instagram published media could not be verified", code="instagram_media_verification_pending"
+            ) from exc
+        if response.is_error:
+            metadata["instagram_reconciliation_required"] = True
+            persist_progress()
+            raise SocialProviderError(
+                "Instagram published media could not be verified",
+                code="instagram_media_verification_pending",
+            )
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            metadata["instagram_reconciliation_required"] = True
+            persist_progress()
+            raise SocialProviderError(
+                "Instagram published media verification response was invalid",
+                code="instagram_media_verification_pending",
+            ) from exc
+        permalink = payload.get("permalink") if isinstance(payload, dict) else None
+        parsed_permalink = urlparse(permalink) if isinstance(permalink, str) else None
+        container_id = metadata.get("instagram_container_id")
+        if (
+            not isinstance(payload, dict)
+            or payload.get("id") != media_id
+            or not isinstance(container_id, str)
+            or parsed_permalink is None
+            or parsed_permalink.scheme != "https"
+            or not parsed_permalink.hostname
+            or (
+                parsed_permalink.hostname != "instagram.com"
+                and not parsed_permalink.hostname.endswith(".instagram.com")
+            )
+        ):
+            metadata["instagram_reconciliation_required"] = True
+            persist_progress()
+            raise SocialProviderError(
+                "Instagram published media verification was incomplete",
+                code="instagram_media_verification_pending",
+            )
+        metadata["instagram_reconciliation_required"] = False
+        persist_progress()
+        return PublishedPost(media_id, permalink)
 
 
 def platform_from_string(value: str) -> SocialPlatform:
