@@ -42,9 +42,15 @@ class S3StorageProvider:
         if not bucket.strip():
             raise ValueError("S3_BUCKET is required when STORAGE_PROVIDER=s3")
         import boto3  # type: ignore[import-untyped]
+        from botocore.config import Config  # type: ignore[import-untyped]
 
         self._bucket = bucket
-        self._client = boto3.client("s3", region_name=region)
+        self._client = boto3.client(
+            "s3",
+            region_name=region,
+            config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+            endpoint_url=f"https://s3.{region}.amazonaws.com" if region else None,
+        )
 
     def local_path(self, storage_key: str) -> Path | None:
         return None
