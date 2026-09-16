@@ -9,6 +9,7 @@ from app.e2e_providers import (
 )
 from app.llm_provider import LLMProviderType
 from app.media_providers import FFmpegVideoComposer
+from app.publication_copy import PublicationCopyDraft
 from app.revision_impact import RevisionImpactResult
 from app.script_generation import ScriptGenerationResult
 from app.video_generation import CompositionScene
@@ -139,3 +140,17 @@ def test_composer_renders_korean_subtitle_with_explicit_windows_font(tmp_path: P
         check=True,
         capture_output=True,
     )
+
+
+def test_fake_publication_copy_uses_planning_content() -> None:
+    provider = DeterministicE2ELLMProvider()
+
+    copy = provider.generate_structured(
+        'Create publication copy. Input: {"planning": {"concept": "VORA launch", "key_message": "Try VORA"}, "script": {}}',
+        PublicationCopyDraft,
+        LLMProviderType.OPENAI,
+        "unused",
+    )
+
+    assert copy.data.youtube_title == "VORA launch"
+    assert copy.data.youtube_description == "Try VORA"

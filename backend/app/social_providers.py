@@ -1,8 +1,13 @@
 """OAuth2 and publishing HTTP adapters. Secrets are never included in raised messages."""
 
+import json
+import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlencode
+from uuid import uuid4
 
 import httpx
 
@@ -39,6 +44,67 @@ def _error(response: httpx.Response) -> SocialProviderError:
     return SocialProviderError("Social provider rejected the publishing request", code="bad_request")
 
 
+class _MultipartRelatedStream(httpx.SyncByteStream):
+    """Streams a Google media upload without buffering the video in memory."""
+
+    def __init__(self, path: Path, metadata: bytes, media_type: str, boundary: str) -> None:
+        self._path = path
+        boundary_bytes = boundary.encode("ascii")
+        self._metadata_part = (
+            b"--" + boundary_bytes
+            + b"\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
+            + metadata
+            + b"\r\n"
+        )
+        self._media_part = (
+            b"--" + boundary_bytes
+            + f"\r\nContent-Type: {media_type}\r\n\r\n".encode("ascii")
+        )
+        self._closing = b"\r\n--" + boundary_bytes + b"--\r\n"
+
+    @property
+    def content_length(self) -> int:
+        return (
+            len(self._metadata_part)
+            + len(self._media_part)
+            + self._path.stat().st_size
+            + len(self._closing)
+        )
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield self._metadata_part
+        yield self._media_part
+        with self._path.open("rb") as video:
+            while chunk := video.read(1024 * 1024):
+                yield chunk
+        yield self._closing
+
+
+def _safe_youtube_reason(response: httpx.Response) -> str | None:
+    """Return Google error.reason only; never persist response text or request data."""
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    errors = error.get("errors") if isinstance(error, dict) else None
+    first = errors[0] if isinstance(errors, list) and errors else None
+    reason = first.get("reason") if isinstance(first, dict) else None
+    return reason if isinstance(reason, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", reason) else None
+
+
+def _youtube_upload_error(response: httpx.Response) -> SocialProviderError:
+    reason = _safe_youtube_reason(response)
+    details = f"HTTP {response.status_code}" + (f", reason={reason}" if reason else "")
+    if response.status_code >= 500 or response.status_code == 429:
+        return SocialProviderError(
+            f"YouTube upload result is unknown ({details})",
+            code="delivery_unknown",
+        )
+    code = f"youtube_http_{response.status_code}" + (f"_{reason}" if reason else "")
+    return SocialProviderError(f"YouTube rejected upload ({details})", code=code)
+
+
 class YouTubeProvider:
     _AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
     _TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -50,7 +116,8 @@ class YouTubeProvider:
     def authorization_url(self, state: str) -> str:
         if not self._client_id or not self._redirect_uri:
             raise SocialProviderError("YouTube OAuth is not configured", code="configuration")
-        return f"{self._AUTH_URL}?{urlencode({'client_id': self._client_id, 'redirect_uri': self._redirect_uri, 'response_type': 'code', 'scope': 'https://www.googleapis.com/auth/youtube.upload', 'access_type': 'offline', 'prompt': 'consent', 'state': state})}"
+        # return f"{self._AUTH_URL}?{urlencode({'client_id': self._client_id, 'redirect_uri': self._redirect_uri, 'response_type': 'code', 'scope': 'https://www.googleapis.com/auth/youtube.upload', 'access_type': 'offline', 'prompt': 'consent', 'state': state})}"
+        return f"{self._AUTH_URL}?{urlencode({'client_id': self._client_id, 'redirect_uri': self._redirect_uri, 'response_type': 'code', 'scope': 'https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly', 'access_type': 'offline', 'prompt': 'consent', 'state': state})}"
 
     def exchange_code(self, code: str) -> OAuthIdentity:
         if not self._client_id or not self._client_secret or not self._redirect_uri:
@@ -73,13 +140,36 @@ class YouTubeProvider:
 
     def publish(self, access_token: str, video_path: str, title: str, description: str) -> PublishedPost:
         metadata = {"snippet": {"title": title, "description": description}, "status": {"privacyStatus": "private"}}
+        path = Path(video_path)
+        boundary = f"vora-{uuid4().hex}"
+        stream = _MultipartRelatedStream(
+            path,
+            json.dumps(metadata, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            "video/mp4",
+            boundary,
+        )
         try:
-            with open(video_path, "rb") as video:
-                response = httpx.post("https://www.googleapis.com/upload/youtube/v3/videos?uploadType=multipart&part=snippet,status", headers={"Authorization": f"Bearer {access_token}"}, files={"video": ("video.mp4", video, "video/mp4"), "metadata": (None, __import__("json").dumps(metadata), "application/json")}, timeout=120.0)
-        except (OSError, httpx.HTTPError) as exc:
-            raise SocialProviderError("YouTube upload failed", retryable=True) from exc
+            response = httpx.post(
+                "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=multipart&part=snippet,status",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": f'multipart/related; boundary="{boundary}"',
+                    "Content-Length": str(stream.content_length),
+                },
+                content=stream,
+                timeout=120.0,
+            )
+        except OSError as exc:
+            raise SocialProviderError("YouTube video file could not be read", code="file_io") from exc
+        except httpx.HTTPError as exc:
+            # A transport failure can happen after YouTube accepted the upload. Retrying
+            # without a provider id could create a duplicate video.
+            raise SocialProviderError(
+                f"YouTube upload result is unknown after transport error ({type(exc).__name__})",
+                code="delivery_unknown",
+            ) from exc
         if response.is_error:
-            raise _error(response)
+            raise _youtube_upload_error(response)
         payload = response.json()
         post_id = payload.get("id")
         if not isinstance(post_id, str):

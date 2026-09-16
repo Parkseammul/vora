@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from app.content_planning import ContentPlanningDraft
 from app.llm_provider import LLMMetadata, LLMProviderType, LLMResult
+from app.publication_copy import PublicationCopyDraft
 from app.revision_impact import CoreNodeKey, RevisionImpactResult
 from app.script_generation import ScriptGenerationResult
 from app.video_generation import GeneratedSceneVideo, GeneratedSpeech
@@ -91,6 +92,18 @@ class DeterministicE2ELLMProvider:
                     }
                     for scene in planning["scenes"]
                 ]
+            }
+        if response_model is PublicationCopyDraft:
+            publication_input = self._input_after(prompt, "Input: ")
+            publication_planning = publication_input.get("planning")
+            if not isinstance(publication_planning, dict):
+                raise TypeError("Expected planning object in publication copy input")
+            concept = str(publication_planning.get("concept") or "VORA marketing video")
+            message = str(publication_planning.get("key_message") or concept)
+            return {
+                "youtube_title": concept[:100],
+                "youtube_description": message,
+                "instagram_caption": message,
             }
         if response_model is RevisionImpactResult:
             request = str(self._input_after(prompt, "Input: ")["revision_request"]).lower()
