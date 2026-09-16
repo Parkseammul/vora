@@ -12,8 +12,9 @@ from uuid import uuid4
 from celery import Celery  # type: ignore[import-untyped]
 from redis import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import (
     FileAsset,
@@ -46,7 +47,21 @@ class PublicationDispatcher(Protocol):
 
 
 class SocialPublisher(Protocol):
-    def publish(self, connection: SocialAccountConnection, asset: FileAsset, publication: SocialPublication) -> PublishedPost: ...
+    def publish(
+        self,
+        connection: SocialAccountConnection,
+        asset: FileAsset,
+        publication: SocialPublication,
+        attempt: SocialPublicationAttempt,
+        persist_progress: Callable[[], None],
+    ) -> PublishedPost: ...
+
+    def reconcile(
+        self,
+        connection: SocialAccountConnection,
+        attempt: SocialPublicationAttempt,
+        persist_progress: Callable[[], None],
+    ) -> PublishedPost | None: ...
 
 
 class RedisPublicationEvents:
@@ -113,6 +128,8 @@ class PublicationService:
             connection = self._session.scalar(select(SocialAccountConnection).where(SocialAccountConnection.user_id == execution.user_id, SocialAccountConnection.platform == platform))
             if connection is None:
                 raise ValueError(f"{platform.value} account is not connected")
+            if platform is SocialPlatform.INSTAGRAM:
+                self._reconcile_unresolved_instagram_publications(connection, asset)
             key = self._idempotency_key(asset.id, connection.id, platform, draft)
             if force_republish:
                 key = f"{key}:{uuid4()}"
@@ -130,24 +147,103 @@ class PublicationService:
                 self._dispatcher.enqueue(publication.id)
         return publications
 
+    def _reconcile_unresolved_instagram_publications(
+        self, connection: SocialAccountConnection, asset: FileAsset
+    ) -> None:
+        """Block a new POST until an ambiguous predecessor is read-only reconciled."""
+        records = self._session.execute(
+            select(SocialPublication, SocialPublicationAttempt)
+            .join(
+                SocialPublicationAttempt,
+                SocialPublicationAttempt.social_publication_id == SocialPublication.id,
+            )
+            .where(
+                SocialPublication.social_account_connection_id == connection.id,
+                SocialPublication.file_asset_id == asset.id,
+                SocialPublication.status != SocialPublicationStatus.SUCCESS,
+                or_(
+                    SocialPublicationAttempt.error_code.in_(
+                        ("delivery_unknown", "instagram_media_verification_pending")
+                    ),
+                    # A worker can have died after persisting publish intent but
+                    # before recording an error. Treat every active predecessor
+                    # for this account/asset as unresolved until reconciled.
+                    SocialPublicationAttempt.status == SocialPublicationAttemptStatus.RUNNING,
+                ),
+            )
+            .order_by(SocialPublication.id.desc(), SocialPublicationAttempt.attempt_no.desc())
+        ).all()
+        publisher = self._publisher_factory(SocialPlatform.INSTAGRAM)
+        for previous_publication, previous_attempt in records:
+            def persist_progress(
+                attempt: SocialPublicationAttempt = previous_attempt,
+            ) -> None:
+                flag_modified(attempt, "metadata_")
+                self._session.commit()
+
+            post = publisher.reconcile(connection, previous_attempt, persist_progress)
+            if post is None:
+                raise ValueError(
+                    "An earlier Instagram publication has an unresolved delivery result; "
+                    "reconciliation is required before republishing"
+                )
+            previous_attempt.status = SocialPublicationAttemptStatus.SUCCESS
+            previous_publication.status = SocialPublicationStatus.SUCCESS
+            previous_publication.external_post_id = post.external_post_id
+            previous_publication.external_post_url = post.external_post_url
+            previous_publication.published_at = datetime.now(UTC)
+            self._session.commit()
+
     def execute(self, publication_id: int) -> None:
         publication = self._session.get(SocialPublication, publication_id)
-        if publication is None or publication.status is not SocialPublicationStatus.PENDING:
+        if publication is None:
             return
         connection = self._session.get(SocialAccountConnection, publication.social_account_connection_id)
         asset = self._session.get(FileAsset, publication.file_asset_id)
         if connection is None or asset is None:
             self._fail(publication, "Publication dependencies were not found", "dependency")
             return
-        publication.status = SocialPublicationStatus.PUBLISHING
-        self._session.commit()
-        for attempt_no in range(1, MAX_PUBLICATION_ATTEMPTS + 1):
-            attempt = SocialPublicationAttempt(social_publication_id=publication.id, attempt_no=attempt_no, status=SocialPublicationAttemptStatus.RUNNING, started_at=datetime.now(UTC))
-            self._session.add(attempt)
+        resumed_attempt: SocialPublicationAttempt | None = None
+        if publication.status is SocialPublicationStatus.PUBLISHING and connection.platform is SocialPlatform.INSTAGRAM:
+            resumed_attempt = self._session.scalar(
+                select(SocialPublicationAttempt)
+                .where(
+                    SocialPublicationAttempt.social_publication_id == publication.id,
+                    SocialPublicationAttempt.status == SocialPublicationAttemptStatus.RUNNING,
+                )
+                .order_by(SocialPublicationAttempt.attempt_no.desc())
+            )
+            if resumed_attempt is None:
+                return
+        elif publication.status is not SocialPublicationStatus.PENDING:
+            return
+        else:
+            publication.status = SocialPublicationStatus.PUBLISHING
+            self._session.commit()
+
+        start_attempt = resumed_attempt.attempt_no if resumed_attempt is not None else 1
+        for attempt_no in range(start_attempt, MAX_PUBLICATION_ATTEMPTS + 1):
+            if resumed_attempt is not None and attempt_no == start_attempt:
+                attempt = resumed_attempt
+            else:
+                attempt = SocialPublicationAttempt(
+                    social_publication_id=publication.id,
+                    attempt_no=attempt_no,
+                    status=SocialPublicationAttemptStatus.RUNNING,
+                    started_at=datetime.now(UTC),
+                )
+                self._session.add(attempt)
             self._session.commit()
             self._emit(publication, connection.platform, "PUBLISHING", "Publishing started", attempt_no)
             try:
-                post = self._publisher_factory(connection.platform).publish(connection, asset, publication)
+                def persist_progress(current_attempt: SocialPublicationAttempt = attempt) -> None:
+                    # JSONB is not mutable-tracked; make each external boundary durable.
+                    flag_modified(current_attempt, "metadata_")
+                    self._session.commit()
+
+                post = self._publisher_factory(connection.platform).publish(
+                    connection, asset, publication, attempt, persist_progress
+                )
             except SocialProviderError as exc:
                 attempt.status, attempt.error_code, attempt.error_message, attempt.finished_at = SocialPublicationAttemptStatus.FAILED, exc.code, str(exc), datetime.now(UTC)
                 self._session.commit()

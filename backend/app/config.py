@@ -37,6 +37,12 @@ class Settings(BaseSettings):
     instagram_client_id: str | None = None
     instagram_client_secret: str | None = None
     instagram_redirect_uri: str | None = None
+    # Keep the Instagram Login Graph API contract pinned rather than relying on
+    # Meta's unversioned endpoint. Operators must update this deliberately.
+    instagram_graph_api_version: str = "v24.0"
+    instagram_container_poll_interval_seconds: float = 5.0
+    instagram_container_poll_max_attempts: int = 24
+    instagram_presigned_url_ttl_seconds: int = 3600
     frontend_url: str = "http://localhost:5173"
     e2e_fake_providers: bool = Field(False, validation_alias="VORA_E2E_FAKE_PROVIDERS")
     ffmpeg_subtitle_font_path: Path | None = Field(
