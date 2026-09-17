@@ -464,8 +464,15 @@ def _upsert_social_connection(
         connection = SocialAccountConnection(user_id=user.id, platform=platform, external_account_id=identity.external_account_id, account_name=identity.account_name, access_token=identity.access_token, refresh_token=identity.refresh_token, token_expires_at=identity.token_expires_at)
         session.add(connection)
     else:
+        keep_refresh_token = (
+            platform is SocialPlatform.YOUTUBE
+            and connection.external_account_id == identity.external_account_id
+            and identity.refresh_token is None
+        )
         connection.external_account_id, connection.account_name = identity.external_account_id, identity.account_name
-        connection.access_token, connection.refresh_token = identity.access_token, identity.refresh_token
+        connection.access_token = identity.access_token
+        if not keep_refresh_token:
+            connection.refresh_token = identity.refresh_token
         connection.token_expires_at, connection.status = identity.token_expires_at, SocialConnectionStatus.CONNECTED
     session.commit()
 
