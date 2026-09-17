@@ -37,6 +37,13 @@ class PublishedPost:
     external_post_url: str | None
 
 
+@dataclass(frozen=True)
+class RefreshedToken:
+    access_token: str
+    expires_in: int
+    refresh_token: str | None
+
+
 def _error(response: httpx.Response) -> SocialProviderError:
     if response.status_code >= 500 or response.status_code == 429:
         return SocialProviderError("Social provider is temporarily unavailable", retryable=True)
@@ -110,6 +117,18 @@ def _safe_youtube_reason(response: httpx.Response) -> str | None:
     return reason if isinstance(reason, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", reason) else None
 
 
+def _safe_google_oauth_error(response: httpx.Response) -> str | None:
+    """Return only a known OAuth error code; never retain Google's response body."""
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    # The allowlist intentionally distinguishes invalid credentials from a
+    # malformed request or transient provider-side failure without exposing text.
+    return error if error in {"invalid_grant", "invalid_client", "invalid_request"} else None
+
+
 def _youtube_upload_error(response: httpx.Response) -> SocialProviderError:
     reason = _safe_youtube_reason(response)
     details = f"HTTP {response.status_code}" + (f", reason={reason}" if reason else "")
@@ -154,6 +173,39 @@ class YouTubeProvider:
             raise _error(channel)
         item = channel.json().get("items", [{}])[0]
         return OAuthIdentity(str(item.get("id")), item.get("snippet", {}).get("title"), access_token, payload.get("refresh_token"), datetime.now(UTC) + timedelta(seconds=int(payload.get("expires_in", 3600))))
+
+    def refresh_access_token(self, refresh_token: str) -> RefreshedToken:
+        if not self._client_id or not self._client_secret:
+            raise SocialProviderError("YouTube OAuth is not configured", code="configuration")
+        try:
+            response = httpx.post(
+                self._TOKEN_URL,
+                data={
+                    "client_id": self._client_id,
+                    "client_secret": self._client_secret,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                },
+                timeout=15.0,
+            )
+        except httpx.HTTPError as exc:
+            raise SocialProviderError("YouTube token refresh network failure", code="token_refresh_network") from exc
+        if response.is_error:
+            if _safe_google_oauth_error(response) == "invalid_grant":
+                raise SocialProviderError("YouTube reconnection is required", code="reauth_required")
+            raise SocialProviderError("YouTube token refresh failed", code="token_refresh_failed")
+        try:
+            payload = response.json()
+            access_token = payload.get("access_token")
+            expires_in = int(payload.get("expires_in"))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            access_token, expires_in = None, 0
+        if not isinstance(access_token, str) or expires_in <= 0:
+            raise SocialProviderError("YouTube token refresh response was invalid", code="token_refresh_failed")
+        returned_refresh = payload.get("refresh_token") if isinstance(payload, dict) else None
+        return RefreshedToken(
+            access_token, expires_in, returned_refresh if isinstance(returned_refresh, str) else None
+        )
 
     def publish(self, access_token: str, video_path: str, title: str, description: str) -> PublishedPost:
         metadata = {"snippet": {"title": title, "description": description}, "status": {"privacyStatus": "private"}}

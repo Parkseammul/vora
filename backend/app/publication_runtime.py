@@ -22,6 +22,7 @@ from app.social_providers import (
     YouTubeProvider,
 )
 from app.storage import LocalStorageProvider, S3StorageProvider, StorageProvider
+from app.youtube_tokens import YouTubeTokenService
 
 
 def get_storage_provider() -> StorageProvider:
@@ -31,13 +32,17 @@ def get_storage_provider() -> StorageProvider:
 
 
 class RuntimePublisher:
-    def __init__(self, platform: SocialPlatform, storage: StorageProvider | None) -> None:
-        self._platform, self._storage = platform, storage
+    def __init__(self, platform: SocialPlatform, storage: StorageProvider | None, session: Session) -> None:
+        self._platform, self._storage, self._session = platform, storage, session
 
     def publish(self, connection, asset, publication, attempt, persist_progress) -> PublishedPost:  # type: ignore[no-untyped-def]
         local_path = (Path(settings.uploads_root) / asset.storage_key).resolve()
         if self._platform is SocialPlatform.YOUTUBE:
-            return YouTubeProvider(settings.youtube_client_id, settings.youtube_client_secret, settings.youtube_redirect_uri).publish(connection.access_token, str(local_path), publication.youtube_title or "VORA video", publication.youtube_description or "")
+            provider = YouTubeProvider(
+                settings.youtube_client_id, settings.youtube_client_secret, settings.youtube_redirect_uri
+            )
+            access_token = YouTubeTokenService(self._session, provider).valid_access_token(connection.id)
+            return provider.publish(access_token, str(local_path), publication.youtube_title or "VORA video", publication.youtube_description or "")
         # Instagram receives only a short-lived S3 URL; source video remains private.
         if self._storage is None:
             raise SocialProviderError("Instagram publishing requires S3 storage", code="configuration")
@@ -97,6 +102,7 @@ def get_publication_service(session: Session, llm_provider: LLMProvider | None =
         lambda platform: RuntimePublisher(
             platform,
             get_storage_provider() if platform is SocialPlatform.INSTAGRAM else None,
+            session,
         ),
         PublicationCopyService(llm_provider, settings.llm_provider, settings.publication_copy_model)
         if llm_provider is not None
