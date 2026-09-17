@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     instagram_container_poll_interval_seconds: float = 5.0
     instagram_container_poll_max_attempts: int = 24
     instagram_presigned_url_ttl_seconds: int = 3600
+    oauth_state_ttl_seconds: int = Field(600, ge=60, le=3600)
     frontend_url: str = "http://localhost:5173"
     e2e_fake_providers: bool = Field(False, validation_alias="VORA_E2E_FAKE_PROVIDERS")
     ffmpeg_subtitle_font_path: Path | None = Field(

@@ -1,8 +1,10 @@
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from secrets import token_urlsafe
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
@@ -37,6 +39,7 @@ from app.models import (
     NodeExecution,
     NodeExecutionAttempt,
     NodeExecutionStatus,
+    OAuthAuthorizationState,
     SocialAccountConnection,
     SocialConnectionStatus,
     SocialPlatform,
@@ -83,7 +86,6 @@ from app.workflow_execution_service import (
 
 # VORA Backend의 FastAPI 애플리케이션 객체 생성
 app = FastAPI()
-app.state.oauth_states = {}
 
 
 class RevisionRequest(BaseModel):
@@ -108,10 +110,6 @@ class PublishRequest(BaseModel):
     youtube_description: str | None = None
     instagram_caption: str | None = None
     force_republish: bool = False
-
-
-class OAuthCodeRequest(BaseModel):
-    code: str
 
 
 NODE_KEYS = ("input_analysis", "content_planning", "script_generation", "video_generation")
@@ -435,6 +433,76 @@ def _oauth_provider(platform: SocialPlatform):
     return InstagramProvider(settings.instagram_client_id, settings.instagram_client_secret, settings.instagram_redirect_uri)
 
 
+@dataclass(frozen=True)
+class OAuthStateContext:
+    user_id: int
+    return_to: str
+
+
+def _safe_oauth_return_path(return_to: str) -> str:
+    """Accept only a local, path-only frontend destination."""
+    parsed = urlsplit(return_to)
+    if (
+        not return_to.startswith("/")
+        or return_to.startswith("//")
+        or parsed.scheme
+        or parsed.netloc
+        or parsed.query
+        or parsed.fragment
+        or "\\" in return_to
+        or "%" in return_to
+        or any(ord(character) < 32 or ord(character) == 127 for character in return_to)
+        or any(part in {".", ".."} for part in parsed.path.split("/"))
+    ):
+        raise SocialProviderError("Invalid OAuth return path", code="bad_request")
+    return parsed.path
+
+
+def _oauth_state_hash(state: str) -> str:
+    return sha256(state.encode("utf-8")).hexdigest()
+
+
+def _issue_oauth_state(
+    session: Session, user: User, platform: SocialPlatform, return_to: str
+) -> str:
+    state = token_urlsafe(32)
+    session.add(
+        OAuthAuthorizationState(
+            state_hash=_oauth_state_hash(state),
+            user_id=user.id,
+            platform=platform,
+            return_to=return_to,
+            expires_at=datetime.now(UTC) + timedelta(seconds=settings.oauth_state_ttl_seconds),
+        )
+    )
+    session.commit()
+    return state
+
+
+def _consume_oauth_state(
+    session: Session, state: str | None, platform: SocialPlatform
+) -> OAuthStateContext:
+    if not state or len(state) > 1024:
+        raise SocialProviderError("OAuth state validation failed", code="authorization")
+    record = session.scalar(
+        select(OAuthAuthorizationState)
+        .where(
+            OAuthAuthorizationState.state_hash == _oauth_state_hash(state),
+            OAuthAuthorizationState.platform == platform,
+            OAuthAuthorizationState.consumed_at.is_(None),
+        )
+        .with_for_update()
+    )
+    now = datetime.now(UTC)
+    if record is None or record.expires_at <= now:
+        raise SocialProviderError("OAuth state validation failed", code="authorization")
+    context = OAuthStateContext(record.user_id, record.return_to)
+    record.consumed_at = now
+    # Commit before code exchange so concurrent callbacks cannot both exchange the same code.
+    session.commit()
+    return context
+
+
 @app.get("/social/{platform}/authorize")
 def social_authorize(
     platform: str,
@@ -443,29 +511,11 @@ def social_authorize(
 ):
     try:
         resolved = platform_from_string(platform)
-        if not return_to.startswith("/") or return_to.startswith("//"):
-            raise SocialProviderError("Invalid OAuth return path", code="bad_request")
-        state = token_urlsafe(32)
-        # State is short-lived server-side data; it never contains credentials or user tokens.
-        app.state.oauth_states[state] = {"user_id": _dev_user_or_404(session).id, "platform": resolved.value, "return_to": return_to}
+        safe_return_to = _safe_oauth_return_path(return_to)
+        state = _issue_oauth_state(session, _dev_user_or_404(session), resolved, safe_return_to)
         return {"authorization_url": _oauth_provider(resolved).authorization_url(state)}
     except SocialProviderError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-@app.post("/social/{platform}/callback")
-def social_callback(
-    platform: str,
-    request: OAuthCodeRequest,
-    session: Session = Depends(get_session),  # noqa: B008
-):
-    try:
-        resolved = platform_from_string(platform)
-        identity = _oauth_provider(resolved).exchange_code(request.code)
-        _upsert_social_connection(session, _dev_user_or_404(session), resolved, identity)
-    except SocialProviderError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {"platform": resolved.value, "status": "CONNECTED"}
 
 
 def _upsert_social_connection(
@@ -500,13 +550,11 @@ def social_browser_callback(
     resolved_path = "/settings/social"
     try:
         resolved = platform_from_string(platform)
-        saved = app.state.oauth_states.pop(state, None) if state else None
-        if not isinstance(saved, dict) or saved.get("platform") != resolved.value:
-            raise SocialProviderError("OAuth state validation failed", code="authorization")
-        resolved_path = str(saved["return_to"])
+        saved = _consume_oauth_state(session, state, resolved)
+        resolved_path = saved.return_to
         if error or not code:
             raise SocialProviderError("OAuth connection was denied", code="authorization")
-        user = session.get(User, saved["user_id"])
+        user = session.get(User, saved.user_id)
         if user is None:
             raise SocialProviderError("OAuth user was not found", code="authorization")
         _upsert_social_connection(session, user, resolved, _oauth_provider(resolved).exchange_code(code))

@@ -78,6 +78,25 @@ class SocialConnectionStatus(enum.Enum):
     REVOKED = "REVOKED"
 
 
+class OAuthAuthorizationState(Base):
+    """One-time OAuth authorization state; the raw browser value is never persisted."""
+
+    __tablename__ = "oauth_authorization_states"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    state_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    platform: Mapped[SocialPlatform] = mapped_column(
+        Enum(SocialPlatform, name="social_platform"), nullable=False
+    )
+    return_to: Mapped[str] = mapped_column(String(500), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class SocialPublicationStatus(enum.Enum):
     PENDING = "PENDING"
     PUBLISHING = "PUBLISHING"
