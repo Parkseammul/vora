@@ -6,6 +6,7 @@ import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol
+from urllib.error import HTTPError
 
 from app.video_generation import (
     CompositionScene,
@@ -25,11 +26,48 @@ class ElevenLabsClient(Protocol):
     def synthesize(self, narration: str, output_path: Path) -> tuple[list[dict[str, object]], dict[str, object]]: ...
 
 
+class RunwayTaskTimeoutError(TimeoutError):
+    """Preserves only the safe reconciliation identifiers for an existing Runway task."""
+
+    def __init__(self, task_id: str, status: str) -> None:
+        super().__init__("Runway task timed out")
+        self.task_id = task_id
+        self.status = status
+
+
+class RunwayOperationError(RuntimeError):
+    """Safe diagnostic context for a Runway operation without provider payloads."""
+
+    def __init__(
+        self,
+        phase: str,
+        exception_type: str,
+        http_status: int | None = None,
+        task_id: str | None = None,
+        task_status: str | None = None,
+    ) -> None:
+        super().__init__("Runway operation failed")
+        self.phase = phase
+        self.exception_type = exception_type
+        self.http_status = http_status
+        self.task_id = task_id
+        self.task_status = task_status
+
+
 class RunwayHTTPClient:
     """Runway task API client; polling and download stay inside the vendor adapter."""
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        task_poll_interval_seconds: float = 2.0,
+        task_poll_max_attempts: int = 180,
+    ) -> None:
+        if task_poll_interval_seconds <= 0 or task_poll_max_attempts < 1:
+            raise ValueError("Runway polling settings must be positive")
         self._api_key = api_key
+        self._task_poll_interval_seconds = task_poll_interval_seconds
+        self._task_poll_max_attempts = task_poll_max_attempts
 
     def generate(self, prompt: str, model: str, duration_seconds: float, reference_image: Path | None, output_path: Path) -> dict[str, object]:
         payload: dict[str, object] = {"model": model, "promptText": prompt, "ratio": "720:1280", "duration": max(4, round(duration_seconds))}
@@ -39,20 +77,68 @@ class RunwayHTTPClient:
             encoded = base64.b64encode(reference_image.read_bytes()).decode()
             payload["promptImage"] = f"data:{mime};base64,{encoded}"
             endpoint = "image_to_video"
-        task = self._request(f"/v1/{endpoint}", payload)
-        task_id = str(task["id"])
-        for _ in range(180):
-            task = self._request(f"/v1/tasks/{task_id}")
-            if task.get("status") == "SUCCEEDED":
+        try:
+            task = self._request(f"/v1/{endpoint}", payload)
+            task_id = str(task["id"])
+        except Exception as exc:
+            raise self._operation_error("generation_request", exc) from exc
+        last_status = "UNKNOWN"
+        for _ in range(self._task_poll_max_attempts):
+            try:
+                task = self._request(f"/v1/tasks/{task_id}")
+            except Exception as exc:
+                raise self._operation_error(
+                    "task_status", exc, task_id, last_status
+                ) from exc
+            status = task.get("status")
+            last_status = self._safe_task_status(status)
+            if last_status == "SUCCEEDED":
                 output = task.get("output", [])
                 if not isinstance(output, list) or not output or not isinstance(output[0], str):
-                    raise RuntimeError("Runway task has no output URL")
-                output_path.write_bytes(urllib.request.urlopen(output[0], timeout=60).read())
+                    raise RunwayOperationError(
+                        "download", "RunwayOutputMissing", task_id=task_id, task_status=last_status
+                    )
+                try:
+                    output_path.write_bytes(urllib.request.urlopen(output[0], timeout=60).read())
+                except Exception as exc:
+                    raise self._operation_error(
+                        "download", exc, task_id, last_status
+                    ) from exc
                 return {"task_id": task_id, "model": model}
-            if task.get("status") == "FAILED":
-                raise RuntimeError(f"Runway task failed: {task_id}")
-            time.sleep(2)
-        raise TimeoutError(f"Runway task timed out: {task_id}")
+            if last_status == "FAILED":
+                raise RunwayOperationError(
+                    "task_status", "RunwayTaskFailed", task_id=task_id, task_status=last_status
+                )
+            time.sleep(self._task_poll_interval_seconds)
+        raise RunwayTaskTimeoutError(task_id, last_status)
+
+    @staticmethod
+    def _safe_task_status(value: object) -> str:
+        if isinstance(value, str) and value in {
+            "PENDING",
+            "RUNNING",
+            "THROTTLED",
+            "SUCCEEDED",
+            "FAILED",
+            "CANCELLED",
+        }:
+            return value
+        return "UNKNOWN"
+
+    @staticmethod
+    def _operation_error(
+        phase: str,
+        exc: Exception,
+        task_id: str | None = None,
+        task_status: str | None = None,
+    ) -> RunwayOperationError:
+        return RunwayOperationError(
+            phase,
+            type(exc).__name__,
+            exc.code if isinstance(exc, HTTPError) else None,
+            task_id,
+            task_status,
+        )
 
     def _request(self, path: str, payload: dict[str, object] | None = None) -> dict[str, object]:
         request = urllib.request.Request("https://api.dev.runwayml.com" + path, data=json.dumps(payload).encode() if payload is not None else None, headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json", "X-Runway-Version": "2024-11-06"})

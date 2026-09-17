@@ -13,6 +13,7 @@ ResponseT = TypeVar("ResponseT", bound=BaseModel)
 class FakeProvider:
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload
+        self.prompt: str | None = None
 
     def generate_structured(
         self,
@@ -22,6 +23,7 @@ class FakeProvider:
         model: str,
         images: Sequence[str] = (),
     ) -> LLMResult:
+        self.prompt = prompt
         return LLMResult(
             data=response_model.model_validate(self.payload),
             metadata=LLMMetadata(provider=provider, model=model),
@@ -90,3 +92,14 @@ def test_plan_rejects_duration_sum_and_final_transition() -> None:
 def test_duration_allows_at_most_one_decimal_place() -> None:
     with pytest.raises(ValueError, match="decimal place"):
         ContentPlanningDraft.model_validate(payload(duration=29.99))
+
+
+def test_korean_request_instructs_korean_planning_output() -> None:
+    provider = FakeProvider(payload())
+
+    ContentPlanningService(provider, LLMProviderType.OPENAI, "model").generate(
+        {**analysis(), "request_text": "한국어로 기획해 주세요"}
+    )
+
+    assert provider.prompt is not None
+    assert "write all human-readable planning fields in Korean" in provider.prompt

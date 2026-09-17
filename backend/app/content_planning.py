@@ -150,6 +150,7 @@ class ContentPlanningService:
         prompt = (
             "Create a short-form content plan. Preserve source_asset_ids in their given order, "
             "use each exactly once, and make scene durations sum to duration_seconds. "
+            "When the request is Korean, write all human-readable planning fields in Korean. "
             "Do not provide scene_id; the backend creates it. Input: "
             + json.dumps(analysis.model_dump(mode="json"), ensure_ascii=False)
         )
