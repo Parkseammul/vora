@@ -23,7 +23,7 @@ from app.e2e_providers import (
     FFmpegE2ETTSProvider,
     FFmpegE2EVideoProvider,
 )
-from app.llm_provider import LLMProvider
+from app.llm_provider import LLMProvider, LLMProviderType, MultiVendorLLMProvider
 from app.media_providers import (
     ElevenLabsHTTPClient,
     ElevenLabsTTSProvider,
@@ -48,6 +48,7 @@ from app.models import (
     WorkflowExecutionStatus,
 )
 from app.node_executors import RuleBasedNodeExecutor
+from app.openai_client import OpenAIStructuredClient
 from app.publication import PublicationDraft, RedisPublicationEvents
 from app.publication_runtime import get_publication_service
 from app.revision_impact import CoreNodeKey, RevisionImpactService
@@ -141,25 +142,36 @@ def configure_media_providers(
     app.state.media_providers = (video_provider, tts_provider, composer)
 
 
-if settings.e2e_fake_providers:
-    configure_llm_provider(DeterministicE2ELLMProvider())
-    configure_media_providers(
-        FFmpegE2EVideoProvider(),
-        FFmpegE2ETTSProvider(),
-        FFmpegVideoComposer(settings.ffmpeg_subtitle_font_path),
-    )
-elif settings.runway_api_key and settings.elevenlabs_api_key and settings.elevenlabs_voice_id:
-    configure_media_providers(
-        RunwayVideoProvider(RunwayHTTPClient(settings.runway_api_key)),
-        ElevenLabsTTSProvider(
-            ElevenLabsHTTPClient(
-                settings.elevenlabs_api_key,
-                settings.elevenlabs_voice_id,
-                settings.elevenlabs_model,
+def _configure_default_providers() -> None:
+    if settings.e2e_fake_providers:
+        configure_llm_provider(DeterministicE2ELLMProvider())
+        configure_media_providers(
+            FFmpegE2EVideoProvider(),
+            FFmpegE2ETTSProvider(),
+            FFmpegVideoComposer(settings.ffmpeg_subtitle_font_path),
+        )
+        return
+    if settings.openai_api_key:
+        configure_llm_provider(
+            MultiVendorLLMProvider(
+                {LLMProviderType.OPENAI: OpenAIStructuredClient(settings.openai_api_key)}
             )
-        ),
-        FFmpegVideoComposer(settings.ffmpeg_subtitle_font_path),
-    )
+        )
+    if settings.runway_api_key and settings.elevenlabs_api_key and settings.elevenlabs_voice_id:
+        configure_media_providers(
+            RunwayVideoProvider(RunwayHTTPClient(settings.runway_api_key)),
+            ElevenLabsTTSProvider(
+                ElevenLabsHTTPClient(
+                    settings.elevenlabs_api_key,
+                    settings.elevenlabs_voice_id,
+                    settings.elevenlabs_model,
+                )
+            ),
+            FFmpegVideoComposer(settings.ffmpeg_subtitle_font_path),
+        )
+
+
+_configure_default_providers()
 
 
 def get_llm_provider() -> LLMProvider:

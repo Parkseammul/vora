@@ -14,6 +14,7 @@ ResponseT = TypeVar("ResponseT", bound=BaseModel)
 class FakeProvider:
     def __init__(self, scenes: list[dict[str, object]]) -> None:
         self.scenes = scenes
+        self.prompt: str | None = None
 
     def generate_structured(
         self,
@@ -23,6 +24,7 @@ class FakeProvider:
         model: str,
         images: Sequence[str] = (),
     ) -> LLMResult:
+        self.prompt = prompt
         return LLMResult(
             data=response_model.model_validate({"scenes": self.scenes}),
             metadata=LLMMetadata(provider=provider, model=model),
@@ -96,3 +98,70 @@ def test_script_rejects_wrong_scene_reference_and_duration_overflow() -> None:
 def test_speaking_style_requires_narration() -> None:
     with pytest.raises(ValueError, match="speaking_style"):
         ScriptScene(planning_scene_id="scene-1", speaking_style="energetic")
+
+
+def test_korean_planning_instructs_korean_script_output() -> None:
+    provider = FakeProvider([{"planning_scene_id": "scene-1", "narration": "한국어 대본"}])
+
+    ScriptGenerationService(provider, LLMProviderType.OPENAI, "model").generate(planning())
+
+    assert provider.prompt is not None
+    assert "write narration, subtitles, speaking_style, and emphasis_keywords in Korean" in provider.prompt
+
+
+def test_korean_three_scene_script_preserves_order_and_duration_limits() -> None:
+    korean_plan = ContentPlanningResult.model_validate(
+        {
+            "concept": "텀블러 소개",
+            "hook": "출근길 필수품",
+            "key_message": "가볍고 편리합니다",
+            "cta": "지금 골라보세요",
+            "visual_style": "밝은 제품 영상",
+            "bgm_direction": "경쾌한 리듬",
+            "scenes": [
+                {
+                    "scene_id": "scene-1",
+                    "purpose": "hook",
+                    "main_objects": ["텀블러"],
+                    "description": "텀블러를 드는 장면",
+                    "duration_seconds": 5,
+                    "visual_direction": "제품 클로즈업",
+                    "transition_to_next": "CUT",
+                },
+                {
+                    "scene_id": "scene-2",
+                    "purpose": "benefit",
+                    "main_objects": ["텀블러"],
+                    "description": "가방에 넣는 장면",
+                    "duration_seconds": 5,
+                    "visual_direction": "사용 장면",
+                    "transition_to_next": "CUT",
+                },
+                {
+                    "scene_id": "scene-3",
+                    "purpose": "cta",
+                    "main_objects": ["텀블러"],
+                    "description": "출근하는 장면",
+                    "duration_seconds": 5,
+                    "visual_direction": "밝은 마무리",
+                    "transition_to_next": None,
+                },
+            ],
+        }
+    ).model_dump(mode="json")
+    provider = FakeProvider(
+        [
+            {"planning_scene_id": "scene-1", "narration": "출근길을 가볍게", "subtitle": "가볍게 시작"},
+            {"planning_scene_id": "scene-2", "narration": "가방에도 쏙 들어가요", "subtitle": "간편한 휴대"},
+            {"planning_scene_id": "scene-3", "narration": "오늘의 텀블러를 골라보세요", "subtitle": "나만의 선택"},
+        ]
+    )
+
+    output = ScriptGenerationService(provider, LLMProviderType.OPENAI, "model").generate(korean_plan)
+
+    assert [scene.planning_scene_id for scene in output.data.scenes] == [
+        "scene-1",
+        "scene-2",
+        "scene-3",
+    ]
+    assert all(scene.narration and scene.subtitle for scene in output.data.scenes)

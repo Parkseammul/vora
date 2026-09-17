@@ -100,6 +100,8 @@ class ScriptGenerationService:
         prompt = (
             "Write one script scene for each planning scene, preserving IDs and order. "
             "Narration and subtitles must fit each scene duration. Planning: "
+            "When the planning content is Korean, write narration, subtitles, speaking_style, "
+            "and emphasis_keywords in Korean. "
             + json.dumps(planning.model_dump(mode="json"), ensure_ascii=False)
         )
         if revision_request is not None:
