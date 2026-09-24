@@ -55,3 +55,9 @@ VORA는 AI Workflow를 안정적으로 실행·승인·재실행·게시하는 B
 5. 남은 문제
 6. 아키텍처 판단이 필요한 항목
 7. 핵심 Diff 요약
+
+## Harness 상세 문서
+
+- 상세 Architecture Rule: [architecture-rules.md](docs/harness/architecture-rules.md)
+- 검증 명령과 완료 Gate: [quality-gates.md](docs/harness/quality-gates.md)
+- 장애/Retry/복구 정책: [failure-recovery-rules.md](docs/harness/failure-recovery-rules.md)
