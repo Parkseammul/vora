@@ -2,8 +2,21 @@
 
 ## 준비와 실행
 
-Windows PowerShell 5.1에서 실행한다. Python 환경을 먼저 활성화하고
-backend/requirements.txt의 의존성을 설치한다. Harness는 PATH의 python과 git을 사용한다.
+Windows PowerShell 5.1 and the root Python 3.12 .venv are required.
+Harness directly invokes .venv/Scripts/python.exe regardless of PATH or activation.
+A missing interpreter or a version other than 3.12 fails without falling back to system Python.
+git and npm.cmd are resolved from PATH.
+
+Prepare from the repository root (skip venv creation if it already exists):
+
+~~~powershell
+py -3.12 -m venv .venv
+. .\.venv\Scripts\Activate.ps1
+python --version
+python -m pip install -r backend/requirements.txt
+python -m pip check
+~~~
+
 Frontend는 Node.js와 npm.cmd, frontend/package.json의 설치된 의존성이 필요하다.
 Harness는 의존성을 자동 설치하지 않는다.
 

@@ -3,6 +3,7 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $source = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/harness.ps1'
+$projectPython = Join-Path (Split-Path -Parent $PSScriptRoot) '.venv/Scripts/python.exe'
 $tokens = $null
 $errors = $null
 $null = [System.Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
@@ -31,6 +32,26 @@ exit /b 0
     foreach ($name in @('python', 'npm', 'git')) {
         Set-Content -Encoding ASCII -LiteralPath (Join-Path $fixture "bin/$name.cmd") -Value $mock
     }
+    # Real venv and fake modules exercise interpreter selection without backend dependencies.
+    & $projectPython -m venv --without-pip (Join-Path $fixture '.venv')
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot create the regression Python 3.12 venv.' }
+    $gateModule = @'
+import os
+import sys
+from pathlib import Path
+
+call = "python:-m " + Path(__file__).stem
+if sys.argv[1:]:
+    call += " " + " ".join(sys.argv[1:])
+with open(os.environ["VORA_HARNESS_TEST_LOG"], "a") as log:
+    log.write(call + "|" + os.getcwd() + "\n")
+sys.exit(7 if os.environ.get("VORA_HARNESS_TEST_FAILURE") == call else 0)
+'@
+    foreach ($module in @('pytest', 'ruff', 'mypy')) {
+        Set-Content -Encoding ASCII -LiteralPath (Join-Path $fixture "backend/$module.py") -Value $gateModule
+    }
+    # PATH Python must never be selected.
+    Set-Content -Encoding ASCII -LiteralPath (Join-Path $fixture 'bin/python.cmd') -Value @('@echo off', 'exit /b 99')
     $env:VORA_HARNESS_TEST_LOG = Join-Path $fixture 'calls.txt'
     $cases = @(
         @('Backend', ''), @('Frontend', ''), @('All', ''),
@@ -38,7 +59,7 @@ exit /b 0
         @('All', 'python:-m mypy app'), @('All', 'npm:run lint'),
         @('All', 'npm:test'), @('All', 'npm:run build'),
         @('All', 'git:diff --check'), @('All', 'git:diff --cached --check'),
-        @('Invalid', ''), @('All', 'missing-tools')
+        @('Invalid', ''), @('All', 'missing-tools'), @('Backend', 'missing-python')
     )
     Push-Location -LiteralPath (Join-Path $fixture 'caller')
     try {
@@ -49,6 +70,10 @@ exit /b 0
             $env:PATH = if ($failure -eq 'missing-tools') {
                 Join-Path $fixture 'empty'
             } else { Join-Path $fixture 'bin' }
+            $fixturePython = Join-Path $fixture '.venv/Scripts/python.exe'
+            if ($failure -eq 'missing-python') {
+                Rename-Item -LiteralPath $fixturePython -NewName 'python.disabled'
+            }
             $expected = @()
             if ($scope -in @('Backend', 'All')) {
                 $expected += @('python:-m pytest', 'python:-m ruff check .', 'python:-m mypy app')
@@ -57,12 +82,21 @@ exit /b 0
                 $expected += @('npm:run lint', 'npm:test', 'npm:run build')
             }
             $expected += @('git:diff --check', 'git:diff --cached --check')
-            if ($scope -eq 'Invalid' -or $failure -eq 'missing-tools') { $expected = @() }
+            if ($scope -eq 'Invalid') { $expected = @() }
+            if ($failure -eq 'missing-tools') {
+                $expected = @('python:-m pytest', 'python:-m ruff check .', 'python:-m mypy app')
+            }
+            if ($failure -eq 'missing-python') {
+                $expected = @('git:diff --check', 'git:diff --cached --check')
+            }
             $ErrorActionPreference = 'Continue'
             $output = & $hostExe -NoProfile -ExecutionPolicy Bypass -File (
                 Join-Path $fixture 'scripts/harness.ps1'
             ) -Scope $scope 2>&1
             $code = $LASTEXITCODE
+            if ($failure -eq 'missing-python') {
+                Rename-Item -LiteralPath (Join-Path $fixture '.venv/Scripts/python.disabled') -NewName 'python.exe'
+            }
             $ErrorActionPreference = 'Stop'
             $calls = @(Get-Content -LiteralPath $env:VORA_HARNESS_TEST_LOG)
             $expectFailure = $failure -ne '' -or $scope -eq 'Invalid'
@@ -80,7 +114,7 @@ exit /b 0
                 $summary = if ($expectFailure) { '[FAIL] Harness' } else { '[PASS] Harness' }
                 $valid = $valid -and (($output | Out-String).Contains($summary))
             }
-            if ($failure -ne '' -and $failure -ne 'missing-tools') {
+            if ($failure -ne '' -and $failure -notin @('missing-tools', 'missing-python')) {
                 $valid = $valid -and (($output | Out-String).Contains('(exit 7)'))
             }
             if ($valid) { Write-Host "[PASS] Scope=$scope failure=$failure" }
@@ -105,5 +139,5 @@ exit /b 0
     if (Test-Path -LiteralPath $resolved) { Remove-Item -LiteralPath $resolved -Recurse -Force }
 }
 if ($failures) { exit 1 }
-Write-Host '[PASS] Harness regression checks (13 cases); production gates are separate.'
+Write-Host '[PASS] Harness regression checks (14 cases); production gates are separate.'
 exit 0
