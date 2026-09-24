@@ -24,17 +24,22 @@ function Invoke-Gate {
     try {
         Push-Location -LiteralPath $Directory
         $pushed = $true
-        # Only native applications are allowed; functions cannot mask a missing tool.
-        $application = Get-Command $Command -CommandType Application -ErrorAction Stop |
-            Select-Object -First 1
         if ($Command -eq 'python') {
-            # Resolve PATH shims and invoke the Python interpreter directly.
-            $interpreter = & $application.Source -c 'import sys; print(sys.executable)'
-            if ($LASTEXITCODE -ne 0 -or @($interpreter).Count -ne 1 -or
-                -not (Test-Path -LiteralPath "$interpreter" -PathType Leaf)) {
-                throw 'Cannot resolve the Python interpreter from PATH.'
+            # Always use this checkout's venv, regardless of PATH or another active environment.
+            $pythonPath = Join-Path $repoRoot '.venv/Scripts/python.exe'
+            if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
+                throw 'Root .venv Python is missing. Run: py -3.12 -m venv .venv'
             }
-            $application = Get-Command "$interpreter" -CommandType Application -ErrorAction Stop
+            $application = Get-Command $pythonPath -CommandType Application -ErrorAction Stop
+            $version = & $application.Source -c 'import sys; print(sys.version.split()[0]); sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)'
+            if ($LASTEXITCODE -ne 0) {
+                throw 'Root .venv must use Python 3.12.'
+            }
+            Write-Host "[Python] $pythonPath ($version)"
+        } else {
+            # Only native applications are allowed; functions cannot mask a missing tool.
+            $application = Get-Command $Command -CommandType Application -ErrorAction Stop |
+                Select-Object -First 1
         }
         # Windows PowerShell may wrap native stderr as ErrorRecord. Exit code decides PASS.
         $ErrorActionPreference = 'Continue'
