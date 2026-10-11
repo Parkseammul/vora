@@ -28,6 +28,7 @@ from app.models import (
     SocialPublicationStatus,
     UserApproval,
     WorkflowExecution,
+    WorkflowExecutionStatus,
 )
 from app.publication_copy import PublicationCopyService
 from app.social_providers import PublishedPost, SocialProviderError
@@ -114,9 +115,9 @@ class PublicationService:
         self._copy_service = copy_service
 
     def draft(self, execution: WorkflowExecution) -> PublicationDraft:
-        plan = self._session.scalar(select(NodeExecution).where(NodeExecution.workflow_execution_id == execution.id, NodeExecution.node_key == "content_planning").order_by(NodeExecution.user_requested_version.desc()))
+        plan = self._session.scalar(select(NodeExecution).where(NodeExecution.workflow_execution_id == execution.id, NodeExecution.node_type == "content_planning").order_by(NodeExecution.revision_no.desc()))
         planning = plan.output_data if plan and isinstance(plan.output_data, dict) else {}
-        script_node = self._session.scalar(select(NodeExecution).where(NodeExecution.workflow_execution_id == execution.id, NodeExecution.node_key == "script_generation").order_by(NodeExecution.user_requested_version.desc()))
+        script_node = self._session.scalar(select(NodeExecution).where(NodeExecution.workflow_execution_id == execution.id, NodeExecution.node_type == "script_generation").order_by(NodeExecution.revision_no.desc()))
         script = script_node.output_data if script_node and isinstance(script_node.output_data, dict) else {}
         copy = self._copy_service.generate(planning, script) if self._copy_service else PublicationCopyService.fallback(planning)
         return PublicationDraft(copy.youtube_title, copy.youtube_description, copy.instagram_caption)
@@ -137,7 +138,7 @@ class PublicationService:
             if existing is not None:
                 publications.append(existing)
                 continue
-            publication = SocialPublication(social_account_connection_id=connection.id, file_asset_id=asset.id, idempotency_key=key, youtube_title=draft.youtube_title, youtube_description=draft.youtube_description, instagram_caption=draft.instagram_caption)
+            publication = SocialPublication(social_account_connection_id=connection.id, file_asset_id=asset.id, idempotency_key=key)
             self._session.add(publication)
             self._session.flush()
             publications.append(publication)
@@ -160,7 +161,7 @@ class PublicationService:
             .where(
                 SocialPublication.social_account_connection_id == connection.id,
                 SocialPublication.file_asset_id == asset.id,
-                SocialPublication.status != SocialPublicationStatus.SUCCESS,
+                SocialPublication.status != SocialPublicationStatus.PUBLISHED,
                 or_(
                     SocialPublicationAttempt.error_code.in_(
                         ("delivery_unknown", "instagram_media_verification_pending")
@@ -188,7 +189,7 @@ class PublicationService:
                     "reconciliation is required before republishing"
                 )
             previous_attempt.status = SocialPublicationAttemptStatus.SUCCESS
-            previous_publication.status = SocialPublicationStatus.SUCCESS
+            previous_publication.status = SocialPublicationStatus.PUBLISHED
             previous_publication.external_post_id = post.external_post_id
             previous_publication.external_post_url = post.external_post_url
             previous_publication.published_at = datetime.now(UTC)
@@ -254,14 +255,14 @@ class PublicationService:
                 self._fail(publication, str(exc), exc.code, attempt_no, connection.platform)
                 return
             attempt.status, attempt.finished_at = SocialPublicationAttemptStatus.SUCCESS, datetime.now(UTC)
-            publication.status, publication.external_post_id, publication.external_post_url, publication.published_at = SocialPublicationStatus.SUCCESS, post.external_post_id, post.external_post_url, datetime.now(UTC)
+            publication.status, publication.external_post_id, publication.external_post_url, publication.published_at = SocialPublicationStatus.PUBLISHED, post.external_post_id, post.external_post_url, datetime.now(UTC)
             self._session.commit()
             self._emit(publication, connection.platform, "SUCCESS", "Publishing completed", attempt_no)
             return
 
     def _approved_video_asset(self, execution: WorkflowExecution) -> FileAsset:
-        node = self._session.scalar(select(NodeExecution).where(NodeExecution.workflow_execution_id == execution.id, NodeExecution.node_key == "video_generation").order_by(NodeExecution.user_requested_version.desc()))
-        if execution.status.value != "SUCCESS" or node is None or node.status is not NodeExecutionStatus.SUCCESS:
+        node = self._session.scalar(select(NodeExecution).where(NodeExecution.workflow_execution_id == execution.id, NodeExecution.node_type == "video_generation").order_by(NodeExecution.revision_no.desc()))
+        if execution.status is not WorkflowExecutionStatus.SUCCEEDED or node is None or node.status is not NodeExecutionStatus.SUCCEEDED:
             raise ValueError("Final video approval is required before publishing")
         if self._session.scalar(select(UserApproval).where(UserApproval.node_execution_id == node.id)) is None:
             raise ValueError("Final video approval is required before publishing")
@@ -277,15 +278,15 @@ class PublicationService:
         return hashlib.sha256(raw.encode()).hexdigest()
 
     def _fail(self, publication: SocialPublication, message: str, code: str, attempt_no: int = 0, platform: SocialPlatform | None = None) -> None:
-        publication.status, publication.error_message = SocialPublicationStatus.FAILED, message
+        publication.status = SocialPublicationStatus.FAILED
         self._session.commit()
         connection = self._session.get(SocialAccountConnection, publication.social_account_connection_id)
         self._emit(publication, platform or (connection.platform if connection else SocialPlatform.YOUTUBE), "FAILED", message, attempt_no)
 
     def _emit(self, publication: SocialPublication, platform: SocialPlatform, stage: str, message: str, attempt_no: int) -> None:
         try:
-            asset = self._session.get(FileAsset, publication.file_asset_id)
-            if asset:
-                self._events.publish(asset.workflow_execution_id, publication.id, platform.value, stage, message, attempt_no)
+            node = self._session.get(NodeExecution, publication.node_execution_id)
+            if node:
+                self._events.publish(node.workflow_execution_id, publication.id, platform.value, stage, message, attempt_no)
         except (OSError, RedisError):
             return

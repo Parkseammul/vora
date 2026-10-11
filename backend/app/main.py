@@ -247,9 +247,9 @@ def _latest_node(session: Session, workflow_execution_id: int, node_key: str) ->
         select(NodeExecution)
         .where(
             NodeExecution.workflow_execution_id == workflow_execution_id,
-            NodeExecution.node_key == node_key,
+            NodeExecution.node_type == node_key,
         )
-        .order_by(NodeExecution.user_requested_version.desc(), NodeExecution.id.desc())
+        .order_by(NodeExecution.revision_no.desc(), NodeExecution.id.desc())
     )
 
 
@@ -267,12 +267,12 @@ def _node_response(session: Session, node: NodeExecution | None) -> dict[str, ob
     attempt = _latest_attempt(session, node.id)
     return {
         "id": node.id,
-        "node_key": node.node_key,
-        "user_requested_version": node.user_requested_version,
+        "node_type": node.node_type,
+        "revision_no": node.revision_no,
         "status": node.status.value,
         "attempt": {
             "current": attempt.attempt_no if attempt is not None else 0,
-            "automatic_max": MAX_AUTOMATIC_VIDEO_ATTEMPTS if node.node_key == "video_generation" else 1,
+            "automatic_max": MAX_AUTOMATIC_VIDEO_ATTEMPTS if node.node_type == "video_generation" else 1,
         },
     }
 
@@ -300,7 +300,7 @@ def _detail_response(session: Session, execution: WorkflowExecution, node_key: s
 def _publication_response(session: Session, publication: SocialPublication) -> dict[str, object]:
     connection = session.get(SocialAccountConnection, publication.social_account_connection_id)
     attempts = list(session.scalars(select(SocialPublicationAttempt).where(SocialPublicationAttempt.social_publication_id == publication.id).order_by(SocialPublicationAttempt.attempt_no)))
-    return {"id": publication.id, "platform": connection.platform.value if connection else "UNKNOWN", "status": publication.status.value, "external_post_url": publication.external_post_url, "error_message": publication.error_message, "attempt": {"current": attempts[-1].attempt_no if attempts else 0, "max": 3}}
+    return {"id": publication.id, "platform": connection.platform.value if connection else "UNKNOWN", "status": publication.status.value, "external_post_url": publication.external_post_url, "attempt": {"current": attempts[-1].attempt_no if attempts else 0, "max": 3}}
 
 
 def _dev_user_or_404(session: Session) -> User:
@@ -382,8 +382,8 @@ def get_publications(
     publications = list(
         session.scalars(
             select(SocialPublication)
-            .join(FileAsset, SocialPublication.file_asset_id == FileAsset.id)
-            .where(FileAsset.workflow_execution_id == execution.id)
+            .join(NodeExecution, SocialPublication.node_execution_id == NodeExecution.id)
+            .where(NodeExecution.workflow_execution_id == execution.id)
             .order_by(SocialPublication.id.desc())
         )
     )
@@ -634,21 +634,28 @@ def download_generated_video(
 @app.post("/workflow-executions")
 async def create_workflow_execution(
     request_text: str = Form(...),
-    images: list[UploadFile] | None = File(default=None),  # noqa: B008
+    marketing_info: str = Form(...),
+    theme: str | None = Form(default=None),
+    rules_version_id: int = Form(...),
+    source_image: UploadFile = File(...),  # noqa: B008
     session: Session = Depends(get_session),  # noqa: B008
 ):
-    uploaded_images = [
-        UploadedInputImage(
-            file_name=image.filename or "upload",
-            content_type=image.content_type or "",
-            content=await image.read(),
-        )
-        for image in images or []
-    ]
+    uploaded_source_image = UploadedInputImage(
+        file_name=source_image.filename or "upload",
+        content_type=source_image.content_type or "",
+        content=await source_image.read(),
+    )
     workflow_engine = get_workflow_engine(session, get_ai_workflow_services(session))
     service = WorkflowExecutionService(session)
     try:
-        result = service.create_and_start(request_text, uploaded_images, workflow_engine)
+        result = service.create_and_start(
+            request_text=request_text,
+            marketing_info=marketing_info,
+            theme=theme,
+            rules_version_id=rules_version_id,
+            source_image=uploaded_source_image,
+            workflow_engine=workflow_engine,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except WorkflowCreationError as exc:
@@ -657,7 +664,7 @@ async def create_workflow_execution(
     return {
         "workflow_execution_id": result.workflow_execution.id,
         "status": result.workflow_execution.status.value,
-        "current_node": result.current_node.node_key,
+        "current_node": result.current_node.node_type,
         "current_node_execution_id": result.current_node.id,
         "result": result.current_node.output_data,
     }
@@ -684,9 +691,9 @@ def create_revision(
             select(NodeExecution)
             .where(
                 NodeExecution.workflow_execution_id == workflow_execution_id,
-                NodeExecution.status == NodeExecutionStatus.WAITING_APPROVAL,
+                NodeExecution.status == NodeExecutionStatus.WAITING,
             )
-            .order_by(NodeExecution.user_requested_version.desc(), NodeExecution.id.desc())
+            .order_by(NodeExecution.revision_no.desc(), NodeExecution.id.desc())
         ).first()
         if status is not WorkflowExecutionStatus.WAITING_APPROVAL or current_node is None:
             raise RuntimeError("Revision did not reach an approval node")
@@ -698,7 +705,7 @@ def create_revision(
     return {
         "workflow_execution_id": workflow_execution_id,
         "status": status.value,
-        "current_node": current_node.node_key,
+        "current_node": current_node.node_type,
         "restart_node": impact.data.target_node.value,
         "current_node_execution_id": current_node.id,
         "result": current_node.output_data,
@@ -716,7 +723,7 @@ def approve_workflow_node(
     if (
         node is None
         or node.workflow_execution_id != execution.id
-        or node.status is not NodeExecutionStatus.WAITING_APPROVAL
+        or node.status is not NodeExecutionStatus.WAITING
     ):
         raise HTTPException(status_code=422, detail="Node is not waiting for approval")
     if session.scalar(select(UserApproval).where(UserApproval.node_execution_id == node.id)) is not None:
@@ -724,8 +731,8 @@ def approve_workflow_node(
 
     session.add(
         UserApproval(
+            workflow_execution_id=execution.id,
             node_execution_id=node.id,
-            user_id=execution.user_id,
             decision=ApprovalDecision.APPROVED,
         )
     )

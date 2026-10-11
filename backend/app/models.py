@@ -9,14 +9,12 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
-    Index,
     Integer,
     Numeric,
     String,
     Text,
     UniqueConstraint,
     func,
-    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -30,14 +28,10 @@ class WorkflowExecutionStatus(enum.Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
     WAITING_APPROVAL = "WAITING_APPROVAL"
-    SUCCESS = "SUCCESS"
+    REVISING = "REVISING"
+    SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
-
-
-class InputType(enum.Enum):
-    TEXT = "TEXT"
-    IMAGE = "IMAGE"
-    TEXT_IMAGE = "TEXT_IMAGE"
+    CANCELED = "CANCELED"
 
 
 class AssetType(enum.Enum):
@@ -50,21 +44,21 @@ class AssetType(enum.Enum):
 class NodeExecutionStatus(enum.Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
-    WAITING_APPROVAL = "WAITING_APPROVAL"
-    SUCCESS = "SUCCESS"
+    WAITING = "WAITING"
+    SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
-    RETRYING = "RETRYING"
+    SKIPPED = "SKIPPED"
 
 
 class NodeExecutionAttemptStatus(enum.Enum):
     RUNNING = "RUNNING"
-    SUCCESS = "SUCCESS"
+    SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
 
 
 class ApprovalDecision(enum.Enum):
     APPROVED = "APPROVED"
-    REVISION_REQUESTED = "REVISION_REQUESTED"
+    REJECTED = "REJECTED"
 
 
 class SocialPlatform(enum.Enum):
@@ -100,8 +94,9 @@ class OAuthAuthorizationState(Base):
 class SocialPublicationStatus(enum.Enum):
     PENDING = "PENDING"
     PUBLISHING = "PUBLISHING"
-    SUCCESS = "SUCCESS"
+    PUBLISHED = "PUBLISHED"
     FAILED = "FAILED"
+    DELETED = "DELETED"
 
 
 class SocialPublicationAttemptStatus(enum.Enum):
@@ -136,8 +131,9 @@ class WorkflowExecution(Base):
         nullable=False,
         server_default=WorkflowExecutionStatus.PENDING.value,
     )
+    current_node_type: Mapped[str | None] = mapped_column(String(30))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -159,13 +155,11 @@ class ExecutionInputSnapshot(Base):
     workflow_execution_id: Mapped[int] = mapped_column(
         ForeignKey("workflow_executions.id"), nullable=False, unique=True
     )
-    input_type: Mapped[InputType] = mapped_column(
-        Enum(InputType, name="input_type"), nullable=False
-    )
     request_text: Mapped[str] = mapped_column(Text, nullable=False)
-    input_data: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, default=dict, server_default="{}"
-    )
+    marketing_info: Mapped[str] = mapped_column(Text, nullable=False)
+    theme: Mapped[str | None] = mapped_column(Text)
+    source_asset_id: Mapped[int] = mapped_column(ForeignKey("file_assets.id"), nullable=False)
+    rules_version_id: Mapped[int] = mapped_column(ForeignKey("rules_versions.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -176,9 +170,9 @@ class NodeExecution(Base):
     __table_args__ = (
         UniqueConstraint(
             "workflow_execution_id",
-            "node_key",
-            "user_requested_version",
-            name="uq_node_execution_version",
+            "node_type",
+            "revision_no",
+            name="uq_node_execution_revision",
         ),
     )
 
@@ -186,9 +180,9 @@ class NodeExecution(Base):
     workflow_execution_id: Mapped[int] = mapped_column(
         ForeignKey("workflow_executions.id"), nullable=False
     )
-    node_key: Mapped[str] = mapped_column(String(100), nullable=False)
-    user_requested_version: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=1, server_default="1"
+    node_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    revision_no: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
     )
     status: Mapped[NodeExecutionStatus] = mapped_column(
         Enum(NodeExecutionStatus, name="node_execution_status"),
@@ -200,7 +194,7 @@ class NodeExecution(Base):
     )
     output_data: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -213,25 +207,8 @@ class FileAsset(Base):
     __tablename__ = "file_assets"
     __table_args__ = (
         CheckConstraint(
-            "(execution_input_snapshot_id IS NOT NULL) <> (node_execution_id IS NOT NULL)",
-            name="ck_file_asset_exactly_one_source",
-        ),
-        CheckConstraint(
-            "sort_order IS NULL OR sort_order >= 1",
-            name="ck_file_asset_sort_order_positive",
-        ),
-        CheckConstraint(
-            "execution_input_snapshot_id IS NULL OR asset_type <> 'IMAGE' OR sort_order IS NOT NULL",
-            name="ck_input_image_sort_order_required",
-        ),
-        Index(
-            "uq_file_asset_snapshot_sort_order",
-            "execution_input_snapshot_id",
-            "sort_order",
-            unique=True,
-            postgresql_where=text(
-                "execution_input_snapshot_id IS NOT NULL AND sort_order IS NOT NULL"
-            ),
+            "slide_no IS NULL OR slide_no >= 1",
+            name="ck_file_asset_slide_no_positive",
         ),
     )
 
@@ -239,10 +216,9 @@ class FileAsset(Base):
     workflow_execution_id: Mapped[int] = mapped_column(
         ForeignKey("workflow_executions.id"), nullable=False
     )
-    execution_input_snapshot_id: Mapped[int | None] = mapped_column(
-        ForeignKey("execution_input_snapshots.id")
+    created_by_node_execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("node_executions.id")
     )
-    node_execution_id: Mapped[int | None] = mapped_column(ForeignKey("node_executions.id"))
     asset_type: Mapped[AssetType] = mapped_column(
         Enum(AssetType, name="asset_type"), nullable=False
     )
@@ -250,7 +226,7 @@ class FileAsset(Base):
     file_name: Mapped[str] = mapped_column(String(255), nullable=False)
     mime_type: Mapped[str] = mapped_column(String(100), nullable=False)
     file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    sort_order: Mapped[int | None] = mapped_column(Integer)
+    slide_no: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -273,8 +249,9 @@ class NodeExecutionAttempt(Base):
     status: Mapped[NodeExecutionAttemptStatus] = mapped_column(
         Enum(NodeExecutionAttemptStatus, name="node_execution_attempt_status"), nullable=False
     )
-    llm_provider: Mapped[str | None] = mapped_column(String(50))
-    llm_model: Mapped[str | None] = mapped_column(String(100))
+    ai_company: Mapped[str | None] = mapped_column(String(50))
+    model: Mapped[str | None] = mapped_column(String(100))
+    prompt_version_id: Mapped[int | None] = mapped_column(ForeignKey("prompt_versions.id"))
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     input_tokens: Mapped[int | None] = mapped_column(Integer)
     output_tokens: Mapped[int | None] = mapped_column(Integer)
@@ -285,7 +262,7 @@ class NodeExecutionAttempt(Base):
         "metadata", JSONB, nullable=False, default=dict, server_default="{}"
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -293,23 +270,18 @@ class NodeExecutionAttempt(Base):
 
 class UserApproval(Base):
     __tablename__ = "user_approvals"
-    __table_args__ = (
-        CheckConstraint(
-            "decision <> 'REVISION_REQUESTED' OR NULLIF(btrim(revision_request), '') IS NOT NULL",
-            name="ck_revision_request_required",
-        ),
-    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    workflow_execution_id: Mapped[int] = mapped_column(
+        ForeignKey("workflow_executions.id"), nullable=False
+    )
     node_execution_id: Mapped[int] = mapped_column(
         ForeignKey("node_executions.id"), nullable=False, unique=True
     )
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     decision: Mapped[ApprovalDecision] = mapped_column(
         Enum(ApprovalDecision, name="approval_decision"), nullable=False
     )
-    revision_request: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(
+    decided_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
@@ -348,10 +320,12 @@ class SocialPublication(Base):
     __tablename__ = "social_publications"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    node_execution_id: Mapped[int] = mapped_column(
+        ForeignKey("node_executions.id"), nullable=False, unique=True
+    )
     social_account_connection_id: Mapped[int] = mapped_column(
         ForeignKey("social_account_connections.id"), nullable=False
     )
-    file_asset_id: Mapped[int] = mapped_column(ForeignKey("file_assets.id"), nullable=False)
     status: Mapped[SocialPublicationStatus] = mapped_column(
         Enum(SocialPublicationStatus, name="social_publication_status"),
         nullable=False,
@@ -360,11 +334,8 @@ class SocialPublication(Base):
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     external_post_id: Mapped[str | None] = mapped_column(String(255))
     external_post_url: Mapped[str | None] = mapped_column(Text)
-    error_message: Mapped[str | None] = mapped_column(Text)
-    youtube_title: Mapped[str | None] = mapped_column(String(100))
-    youtube_description: Mapped[str | None] = mapped_column(Text)
-    instagram_caption: Mapped[str | None] = mapped_column(Text)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -394,6 +365,54 @@ class SocialPublicationAttempt(Base):
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RulesVersion(Base):
+    __tablename__ = "rules_versions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    rules_data: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class PromptVersion(Base):
+    __tablename__ = "prompt_versions"
+    __table_args__ = (
+        UniqueConstraint("node_type", "version", name="uq_prompt_version_node_type_version"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    node_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    prompt_template: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class Revision(Base):
+    __tablename__ = "revisions"
+    __table_args__ = (
+        UniqueConstraint("workflow_execution_id", "revision_no", name="uq_revision_workflow_revision"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    workflow_execution_id: Mapped[int] = mapped_column(
+        ForeignKey("workflow_executions.id"), nullable=False
+    )
+    user_approval_id: Mapped[int] = mapped_column(
+        ForeignKey("user_approvals.id"), nullable=False, unique=True
+    )
+    # User revisions start at 1; initial execution and technical retries create no Revision row.
+    revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_node_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    request_text: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
