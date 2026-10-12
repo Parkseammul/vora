@@ -53,13 +53,13 @@ def approve_waiting_node(session: Session, execution: WorkflowExecution) -> Node
     waiting_node = session.scalars(
         select(NodeExecution).where(
             NodeExecution.workflow_execution_id == execution.id,
-            NodeExecution.status == NodeExecutionStatus.WAITING_APPROVAL,
+            NodeExecution.status == NodeExecutionStatus.WAITING,
         )
     ).one()
     session.add(
         UserApproval(
             node_execution_id=waiting_node.id,
-            user_id=execution.user_id,
+            workflow_execution_id=execution.id,
             decision=ApprovalDecision.APPROVED,
         )
     )
@@ -94,8 +94,8 @@ def test_workflow_runs_stops_and_resumes_through_final_approval(session: Session
         .order_by(NodeExecution.id)
     ).all()
     assert [node.status for node in nodes] == [
-        NodeExecutionStatus.SUCCESS,
-        NodeExecutionStatus.WAITING_APPROVAL,
+        NodeExecutionStatus.SUCCEEDED,
+        NodeExecutionStatus.WAITING,
     ]
     content_planning = nodes[1]
     content_planning_attempt = session.scalars(
@@ -103,9 +103,9 @@ def test_workflow_runs_stops_and_resumes_through_final_approval(session: Session
             NodeExecutionAttempt.node_execution_id == content_planning.id
         )
     ).one()
-    assert content_planning.node_key == "content_planning"
-    assert content_planning.status is NodeExecutionStatus.WAITING_APPROVAL
-    assert content_planning_attempt.status is NodeExecutionAttemptStatus.SUCCESS
+    assert content_planning.node_type == "content_planning"
+    assert content_planning.status is NodeExecutionStatus.WAITING
+    assert content_planning_attempt.status is NodeExecutionAttemptStatus.SUCCEEDED
     assert content_planning_attempt.attempt_no == 1
     assert content_planning.output_data == {
         "result": "fake content_planning result",
@@ -121,14 +121,14 @@ def test_workflow_runs_stops_and_resumes_through_final_approval(session: Session
     assert executor.executed_node_keys[-1] == "video_generation"
 
     approve_waiting_node(session, execution)
-    assert workflow_engine.resume_after_approval(execution.id) is WorkflowExecutionStatus.SUCCESS
+    assert workflow_engine.resume_after_approval(execution.id) is WorkflowExecutionStatus.SUCCEEDED
     session.refresh(execution)
-    assert execution.status is WorkflowExecutionStatus.SUCCESS
+    assert execution.status is WorkflowExecutionStatus.SUCCEEDED
     assert session.scalars(
         select(NodeExecution).where(NodeExecution.workflow_execution_id == execution.id)
     ).all()
     assert all(
-        node.status is NodeExecutionStatus.SUCCESS
+        node.status is NodeExecutionStatus.SUCCEEDED
         for node in session.scalars(
             select(NodeExecution).where(NodeExecution.workflow_execution_id == execution.id)
         )
@@ -141,7 +141,7 @@ def test_workflow_runs_stops_and_resumes_through_final_approval(session: Session
     ).all()
     assert len(attempts) == 4
     assert all(attempt.attempt_no == 1 for attempt in attempts)
-    assert all(attempt.status is NodeExecutionAttemptStatus.SUCCESS for attempt in attempts)
+    assert all(attempt.status is NodeExecutionAttemptStatus.SUCCEEDED for attempt in attempts)
 
 
 def test_executor_error_marks_node_attempt_and_workflow_failed(session: Session) -> None:
@@ -174,7 +174,7 @@ def test_user_retry_creates_a_new_attempt_on_the_same_failed_node(session: Sessi
     failed_node = session.scalar(
         select(NodeExecution).where(
             NodeExecution.workflow_execution_id == execution.id,
-            NodeExecution.node_key == "content_planning",
+            NodeExecution.node_type == "content_planning",
         )
     )
     assert failed_node is not None
@@ -187,12 +187,12 @@ def test_user_retry_creates_a_new_attempt_on_the_same_failed_node(session: Sessi
         .where(NodeExecutionAttempt.node_execution_id == failed_node.id)
         .order_by(NodeExecutionAttempt.attempt_no)
     ).all()
-    assert failed_node.status is NodeExecutionStatus.WAITING_APPROVAL
-    assert failed_node.user_requested_version == 1
+    assert failed_node.status is NodeExecutionStatus.WAITING
+    assert failed_node.revision_no == 0
     assert [attempt.attempt_no for attempt in attempts] == [1, 2]
     assert [attempt.status for attempt in attempts] == [
         NodeExecutionAttemptStatus.FAILED,
-        NodeExecutionAttemptStatus.SUCCESS,
+        NodeExecutionAttemptStatus.SUCCEEDED,
     ]
 
 
@@ -227,17 +227,17 @@ def test_revision_reruns_target_with_new_version_and_reuses_upstream_success(
         .where(NodeExecution.workflow_execution_id == execution.id)
         .order_by(NodeExecution.id)
     ).all()
-    assert [node.node_key for node in nodes] == [
+    assert [node.node_type for node in nodes] == [
         "input_analysis",
         "content_planning",
         "script_generation",
         "script_generation",
     ]
-    assert [node.user_requested_version for node in nodes] == [1, 1, 1, 2]
-    assert nodes[0].status is NodeExecutionStatus.SUCCESS
-    assert nodes[1].status is NodeExecutionStatus.SUCCESS
-    assert nodes[2].status is NodeExecutionStatus.WAITING_APPROVAL
-    assert nodes[3].status is NodeExecutionStatus.WAITING_APPROVAL
+    assert [node.revision_no for node in nodes] == [0, 0, 0, 1]
+    assert nodes[0].status is NodeExecutionStatus.SUCCEEDED
+    assert nodes[1].status is NodeExecutionStatus.SUCCEEDED
+    assert nodes[2].status is NodeExecutionStatus.WAITING
+    assert nodes[3].status is NodeExecutionStatus.WAITING
     assert nodes[3].input_data["revision_request"] == "첫 문장을 더 강하게 바꿔줘"
     assert nodes[3].input_data["previous_output"] == nodes[2].output_data
     assert executor.executed_node_keys == [
@@ -251,7 +251,7 @@ def test_revision_reruns_target_with_new_version_and_reuses_upstream_success(
     session.add(
         UserApproval(
             node_execution_id=nodes[3].id,
-            user_id=execution.user_id,
+            workflow_execution_id=execution.id,
             decision=ApprovalDecision.APPROVED,
         )
     )
@@ -261,10 +261,10 @@ def test_revision_reruns_target_with_new_version_and_reuses_upstream_success(
         select(NodeExecution)
         .where(
             NodeExecution.workflow_execution_id == execution.id,
-            NodeExecution.node_key == "video_generation",
+            NodeExecution.node_type == "video_generation",
         )
     ).one()
-    assert video.user_requested_version == 2
+    assert video.revision_no == 1
 
 
 def test_revision_rejects_a_downstream_target_before_upstream_is_approved(session: Session) -> None:

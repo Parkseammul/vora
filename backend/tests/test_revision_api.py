@@ -81,13 +81,13 @@ def prepare_script_approval(session: Session) -> WorkflowExecution:
     planning = session.scalars(
         select(NodeExecution).where(
             NodeExecution.workflow_execution_id == execution.id,
-            NodeExecution.node_key == "content_planning",
+            NodeExecution.node_type == "content_planning",
         )
     ).one()
     session.add(
         UserApproval(
             node_execution_id=planning.id,
-            user_id=user.id,
+            workflow_execution_id=execution.id,
             decision=ApprovalDecision.APPROVED,
         )
     )
@@ -122,13 +122,13 @@ def test_revision_api_uses_ai_target_not_current_node_hint(
         select(NodeExecution)
         .where(
             NodeExecution.workflow_execution_id == execution.id,
-            NodeExecution.node_key == "script_generation",
+            NodeExecution.node_type == "script_generation",
         )
-        .order_by(NodeExecution.user_requested_version.desc())
+        .order_by(NodeExecution.revision_no.desc())
     ).first()
     assert latest_script is not None
-    assert latest_script.user_requested_version == 2
-    assert latest_script.status is NodeExecutionStatus.WAITING_APPROVAL
+    assert latest_script.revision_no == 1
+    assert latest_script.status is NodeExecutionStatus.WAITING
 
 
 def test_application_wiring_reuses_one_injected_provider_for_all_ai_services(
@@ -166,7 +166,7 @@ def test_workflow_read_apis_and_approval_use_latest_node_state(
     script = session.scalars(
         select(NodeExecution).where(
             NodeExecution.workflow_execution_id == execution.id,
-            NodeExecution.node_key == "script_generation",
+            NodeExecution.node_type == "script_generation",
         )
     ).one()
 
@@ -180,7 +180,7 @@ def test_workflow_read_apis_and_approval_use_latest_node_state(
         "current": 1,
         "automatic_max": 1,
     }
-    assert script_response.json()["node"]["status"] == "WAITING_APPROVAL"
+    assert script_response.json()["node"]["status"] == "WAITING"
     assert video_response.json()["video"] is None
 
     monkeypatch.setattr(main, "get_llm_provider", lambda: ScriptImpactProvider())

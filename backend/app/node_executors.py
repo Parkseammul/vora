@@ -119,7 +119,7 @@ class RuleBasedNodeExecutor:
             )
             asset = FileAsset(
                 workflow_execution_id=workflow_execution_id,
-                node_execution_id=node_execution_id,
+                created_by_node_execution_id=node_execution_id,
                 asset_type=AssetType.VIDEO,
                 storage_key=str(video_generated.final_path.relative_to(self._video_generation_service.uploads_root)),
                 file_name="final_video.mp4",

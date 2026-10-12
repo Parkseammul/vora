@@ -144,12 +144,14 @@ def nodes_for(session: Session, workflow_execution_id: int) -> list[NodeExecutio
 def test_source_image_input_is_reassembled_from_db_and_stops_for_content_approval(
     client: TestClient, session: Session
 ) -> None:
+    rules_version = session.scalar(select(RulesVersion).where(RulesVersion.version == 1))
+    assert rules_version is not None
     response = client.post(
         "/workflow-executions",
         data={
             "request_text": "짧은 영상을 만들어줘",
             "marketing_info": "product information",
-            "rules_version_id": "1",
+            "rules_version_id": str(rules_version.id),
         },
         files={"source_image": ("source.png", b"source", "image/png")},
     )
@@ -195,12 +197,14 @@ def test_source_image_input_is_reassembled_from_db_and_stops_for_content_approva
 def test_source_image_is_persisted_and_reaches_input_analysis(
     client: TestClient, session: Session, uploads_root: Path
 ) -> None:
+    rules_version = session.scalar(select(RulesVersion).where(RulesVersion.version == 1))
+    assert rules_version is not None
     response = client.post(
         "/workflow-executions",
         data={
             "request_text": "request",
             "marketing_info": "product information",
-            "rules_version_id": "1",
+            "rules_version_id": str(rules_version.id),
         },
         files={"source_image": ("source.jpg", b"source", "image/jpeg")},
     )
@@ -313,7 +317,7 @@ def test_input_analysis_applies_revision_request_to_target_audience() -> None:
         {
             "request_text": "운동 영상을 만들어줘",
             "revision_request": "타깃을 20대로 바꿔줘",
-            "source_asset_ids": [],
+            "source_asset_id": 1,
         }
     )
 
@@ -333,7 +337,7 @@ def test_input_analysis_revision_preserves_unmodified_baseline_fields() -> None:
         {
             "request_text": "기존 요청",
             "revision_request": "타깃을 20대로 바꿔줘",
-            "source_asset_ids": [99],
+            "source_asset_id": 99,
             "previous_output": baseline.model_dump(mode="json"),
         }
     )
