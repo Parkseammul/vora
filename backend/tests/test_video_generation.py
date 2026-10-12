@@ -15,9 +15,9 @@ from app.models import (
     AssetType,
     ExecutionInputSnapshot,
     FileAsset,
-    InputType,
     NodeExecution,
     NodeExecutionStatus,
+    RulesVersion,
     User,
     UserApproval,
     WorkflowExecution,
@@ -115,6 +115,30 @@ class FixtureTTSProvider(FakeTTSProvider):
         return GeneratedSpeech(output_path, [{"start": 0, "end": 1}], {"provider": "fake-tts"})
 
 
+def create_snapshot(session: Session, execution: WorkflowExecution) -> ExecutionInputSnapshot:
+    rules = RulesVersion(version=1, rules_data={})
+    source = FileAsset(
+        workflow_execution_id=execution.id,
+        asset_type=AssetType.IMAGE,
+        storage_key=f"input/{uuid4()}.jpg",
+        file_name="source.jpg",
+        mime_type="image/jpeg",
+        file_size=1,
+    )
+    session.add_all([rules, source])
+    session.flush()
+    snapshot = ExecutionInputSnapshot(
+        workflow_execution_id=execution.id,
+        request_text="video",
+        marketing_info="product information",
+        source_asset_id=source.id,
+        rules_version_id=rules.id,
+    )
+    session.add(snapshot)
+    session.flush()
+    return snapshot
+
+
 def test_scene_failure_keeps_prior_scene_file(uploads_root: Path) -> None:
     class SessionStub:
         def get(self, model: object, asset_id: int) -> object:
@@ -157,20 +181,17 @@ def test_video_node_generates_media_and_persists_final_video_asset(
     execution = WorkflowExecution(user_id=user.id, workflow_key="vora_content_creation", workflow_version=1)
     session.add(execution)
     session.flush()
-    snapshot = ExecutionInputSnapshot(
-        workflow_execution_id=execution.id, input_type=InputType.TEXT_IMAGE, request_text="video"
-    )
-    session.add(snapshot)
-    session.flush()
-    image = FileAsset(workflow_execution_id=execution.id, execution_input_snapshot_id=snapshot.id, asset_type=AssetType.IMAGE, storage_key=f"input/{uuid4()}.jpg", file_name="source.jpg", mime_type="image/jpeg", file_size=1, sort_order=1)
-    bgm = FileAsset(workflow_execution_id=execution.id, execution_input_snapshot_id=snapshot.id, asset_type=AssetType.AUDIO, storage_key=f"bgm/{uuid4()}.mp3", file_name="bgm.mp3", mime_type="audio/mpeg", file_size=1)
-    session.add_all([image, bgm])
+    snapshot = create_snapshot(session, execution)
+    image = session.get(FileAsset, snapshot.source_asset_id)
+    assert image is not None
+    bgm = FileAsset(workflow_execution_id=execution.id, asset_type=AssetType.AUDIO, storage_key=f"bgm/{uuid4()}.mp3", file_name="bgm.mp3", mime_type="audio/mpeg", file_size=1)
+    session.add(bgm)
     session.flush()
     (uploads_root / image.storage_key).parent.mkdir(parents=True)
     (uploads_root / image.storage_key).write_bytes(b"image")
     (uploads_root / bgm.storage_key).parent.mkdir(parents=True)
     (uploads_root / bgm.storage_key).write_bytes(b"bgm")
-    node = NodeExecution(workflow_execution_id=execution.id, node_key="video_generation", input_data={})
+    node = NodeExecution(workflow_execution_id=execution.id, node_type="video_generation", input_data={})
     session.add(node)
     session.flush()
     video_provider, tts_provider, composer = FakeVideoProvider(), FakeTTSProvider(), FakeComposer()
@@ -191,7 +212,7 @@ def test_video_node_generates_media_and_persists_final_video_asset(
     )
     assert isinstance(result, NodeExecutionResult)
     asset = session.get(FileAsset, result.output_data["video_asset_id"])
-    assert asset is not None and asset.asset_type is AssetType.VIDEO and asset.node_execution_id == node.id
+    assert asset is not None and asset.asset_type is AssetType.VIDEO and asset.created_by_node_execution_id == node.id
     assert video_provider.references == [uploads_root / image.storage_key, None]
     assert tts_provider.narrations == ["hello"]
     assert composer.bgm_path == uploads_root / bgm.storage_key
@@ -214,20 +235,14 @@ def test_invalid_fixed_bgm_asset_fails_before_scene_generation(
     execution = WorkflowExecution(user_id=user.id, workflow_key="vora_content_creation", workflow_version=1)
     session.add(execution)
     session.flush()
-    snapshot = ExecutionInputSnapshot(
-        workflow_execution_id=execution.id, input_type=InputType.TEXT, request_text="video"
-    )
-    session.add(snapshot)
-    session.flush()
+    create_snapshot(session, execution)
     invalid_bgm = FileAsset(
         workflow_execution_id=execution.id,
-        execution_input_snapshot_id=snapshot.id,
         asset_type=AssetType.IMAGE,
         storage_key=f"input/{uuid4()}.jpg",
         file_name="not-bgm.jpg",
         mime_type="image/jpeg",
         file_size=1,
-        sort_order=1,
     )
     session.add(invalid_bgm)
     session.flush()
@@ -256,14 +271,9 @@ def test_script_approval_generates_final_video_asset_and_waits_for_video_approva
     )
     session.add(execution)
     session.flush()
-    snapshot = ExecutionInputSnapshot(
-        workflow_execution_id=execution.id, input_type=InputType.TEXT, request_text="offline video"
-    )
-    session.add(snapshot)
-    session.flush()
+    create_snapshot(session, execution)
     bgm = FileAsset(
         workflow_execution_id=execution.id,
-        execution_input_snapshot_id=snapshot.id,
         asset_type=AssetType.AUDIO,
         storage_key=f"fixed-bgm/{uuid4()}.wav",
         file_name="fixed.wav",
@@ -292,22 +302,22 @@ def test_script_approval_generates_final_video_asset_and_waits_for_video_approva
     bgm.file_size = bgm_path.stat().st_size
     planning = NodeExecution(
         workflow_execution_id=execution.id,
-        node_key="content_planning",
-        status=NodeExecutionStatus.SUCCESS,
+        node_type="content_planning",
+        status=NodeExecutionStatus.SUCCEEDED,
         output_data=_text_only_video_input()["planning"],
     )
     script = NodeExecution(
         workflow_execution_id=execution.id,
-        node_key="script_generation",
-        status=NodeExecutionStatus.WAITING_APPROVAL,
+        node_type="script_generation",
+        status=NodeExecutionStatus.WAITING,
         output_data=_text_only_video_input()["script"],
     )
     session.add_all([planning, script])
     session.flush()
     session.add(
         UserApproval(
+            workflow_execution_id=execution.id,
             node_execution_id=script.id,
-            user_id=user.id,
             decision=ApprovalDecision.APPROVED,
         )
     )
@@ -332,12 +342,12 @@ def test_script_approval_generates_final_video_asset_and_waits_for_video_approva
     session.refresh(execution)
     assert execution.status is WorkflowExecutionStatus.WAITING_APPROVAL
     video_node = session.query(NodeExecution).filter_by(
-        workflow_execution_id=execution.id, node_key="video_generation"
+        workflow_execution_id=execution.id, node_type="video_generation"
     ).one()
-    assert video_node.status is NodeExecutionStatus.WAITING_APPROVAL
+    assert video_node.status is NodeExecutionStatus.WAITING
     asset = session.get(FileAsset, video_node.output_data["video_asset_id"])
     assert asset is not None and asset.asset_type is AssetType.VIDEO
-    assert asset.node_execution_id == video_node.id
+    assert asset.created_by_node_execution_id == video_node.id
     assert (uploads_root / asset.storage_key).name == "final_video.mp4"
     assert (uploads_root / asset.storage_key).stat().st_size > 0
     assert video_provider.references == [None]

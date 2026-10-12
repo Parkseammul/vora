@@ -12,10 +12,10 @@ from app.models import (
     AssetType,
     ExecutionInputSnapshot,
     FileAsset,
-    InputType,
     NodeExecution,
     NodeExecutionAttempt,
     NodeExecutionAttemptStatus,
+    RulesVersion,
     SocialAccountConnection,
     SocialPlatform,
     SocialPublication,
@@ -60,16 +60,48 @@ def create_workflow(session: Session, user: User) -> WorkflowExecution:
     return workflow
 
 
-def create_node(session: Session, workflow: WorkflowExecution, version: int = 1) -> NodeExecution:
+def create_node(session: Session, workflow: WorkflowExecution, version: int = 0) -> NodeExecution:
     node = NodeExecution(
         workflow_execution_id=workflow.id,
-        node_key="SCRIPT_GENERATION",
-        user_requested_version=version,
+        node_type="SCRIPT_GENERATION",
+        revision_no=version,
         input_data={"topic": "VORA"},
     )
     session.add(node)
     session.flush()
     return node
+
+
+def create_snapshot_dependencies(
+    session: Session, workflow: WorkflowExecution
+) -> tuple[RulesVersion, FileAsset]:
+    rules = RulesVersion(version=1, rules_data={})
+    source = FileAsset(
+        workflow_execution_id=workflow.id,
+        asset_type=AssetType.IMAGE,
+        storage_key=str(uuid4()),
+        file_name="source.png",
+        mime_type="image/png",
+        file_size=1,
+    )
+    session.add_all([rules, source])
+    session.flush()
+    return rules, source
+
+
+def create_snapshot(session: Session, workflow: WorkflowExecution) -> ExecutionInputSnapshot:
+    rules, source = create_snapshot_dependencies(session, workflow)
+    snapshot = ExecutionInputSnapshot(
+        workflow_execution_id=workflow.id,
+        request_text="request",
+        marketing_info="product information",
+        theme=None,
+        source_asset_id=source.id,
+        rules_version_id=rules.id,
+    )
+    session.add(snapshot)
+    session.flush()
+    return snapshot
 
 
 def test_user_email_is_unique(session: Session) -> None:
@@ -79,23 +111,17 @@ def test_user_email_is_unique(session: Session) -> None:
 
 def test_workflow_has_only_one_snapshot_and_jsonb_round_trips(session: Session) -> None:
     workflow = create_workflow(session, create_user(session))
-    snapshot = ExecutionInputSnapshot(
-        workflow_execution_id=workflow.id,
-        input_type=InputType.TEXT,
-        request_text="request",
-        input_data={"nested": {"value": 1}},
-    )
-    session.add(snapshot)
-    session.flush()
-    session.expire(snapshot)
-    assert snapshot.input_data == {"nested": {"value": 1}}
+    snapshot = create_snapshot(session, workflow)
+    assert snapshot.marketing_info == "product information"
+    assert snapshot.source_asset_id is not None
     flush_fails(
         session,
         ExecutionInputSnapshot(
             workflow_execution_id=workflow.id,
-            input_type=InputType.IMAGE,
             request_text="image request",
-            input_data={},
+            marketing_info="other product",
+            source_asset_id=snapshot.source_asset_id,
+            rules_version_id=snapshot.rules_version_id,
         ),
     )
 
@@ -105,13 +131,15 @@ def test_snapshot_request_text_must_not_be_null_or_blank(
     session: Session, request_text: str | None
 ) -> None:
     workflow = create_workflow(session, create_user(session))
+    rules, source = create_snapshot_dependencies(session, workflow)
     flush_fails(
         session,
         ExecutionInputSnapshot(
             workflow_execution_id=workflow.id,
-            input_type=InputType.TEXT,
             request_text=cast(str, request_text),
-            input_data={},
+            marketing_info="product information",
+            source_asset_id=source.id,
+            rules_version_id=rules.id,
         ),
     )
 
@@ -123,8 +151,8 @@ def test_node_versions_are_unique_but_distinct_versions_are_allowed(session: Ses
         session,
         NodeExecution(
             workflow_execution_id=workflow.id,
-            node_key="SCRIPT_GENERATION",
-            user_requested_version=1,
+            node_type="SCRIPT_GENERATION",
+            revision_no=1,
             input_data={},
         ),
     )
@@ -155,60 +183,43 @@ def test_attempt_numbers_are_unique_but_distinct_attempts_are_allowed(session: S
         NodeExecutionAttempt(
             node_execution_id=node.id,
             attempt_no=2,
-            status=NodeExecutionAttemptStatus.SUCCESS,
+            status=NodeExecutionAttemptStatus.SUCCEEDED,
             metadata_={},
         )
     )
     session.flush()
 
 
-def test_approval_is_unique_and_revision_text_is_required(session: Session) -> None:
+def test_approval_is_unique_and_workflow_scoped(session: Session) -> None:
     user = create_user(session)
     node = create_node(session, create_workflow(session, user))
     session.add(
-        UserApproval(node_execution_id=node.id, user_id=user.id, decision=ApprovalDecision.APPROVED)
+        UserApproval(
+            workflow_execution_id=node.workflow_execution_id,
+            node_execution_id=node.id,
+            decision=ApprovalDecision.APPROVED,
+        )
     )
     session.flush()
     flush_fails(
         session,
-        UserApproval(node_execution_id=node.id, user_id=user.id, decision=ApprovalDecision.APPROVED),
+        UserApproval(
+            workflow_execution_id=node.workflow_execution_id,
+            node_execution_id=node.id,
+            decision=ApprovalDecision.APPROVED,
+        ),
     )
 
     second_node = create_node(session, node_workflow := create_workflow(session, user))
     assert second_node.workflow_execution_id == node_workflow.id
-    flush_fails(
-        session,
-        UserApproval(
-            node_execution_id=second_node.id,
-            user_id=user.id,
-            decision=ApprovalDecision.REVISION_REQUESTED,
-        ),
+    second_approval = UserApproval(
+        workflow_execution_id=second_node.workflow_execution_id,
+        node_execution_id=second_node.id,
+        decision=ApprovalDecision.REJECTED,
     )
-    revision_node = create_node(session, create_workflow(session, user))
-    revision_approval = UserApproval(
-        node_execution_id=revision_node.id,
-        user_id=user.id,
-        decision=ApprovalDecision.REVISION_REQUESTED,
-        revision_request="Make the ending more concise.",
-    )
-    session.add(revision_approval)
+    session.add(second_approval)
     session.flush()
-    assert revision_approval.id is not None
-
-
-@pytest.mark.parametrize("revision_request", ["", "   "])
-def test_revision_request_must_not_be_blank(session: Session, revision_request: str) -> None:
-    user = create_user(session)
-    node = create_node(session, create_workflow(session, user))
-    flush_fails(
-        session,
-        UserApproval(
-            node_execution_id=node.id,
-            user_id=user.id,
-            decision=ApprovalDecision.REVISION_REQUESTED,
-            revision_request=revision_request,
-        ),
-    )
+    assert second_approval.id is not None
 
 
 def test_social_connection_identity_is_unique(session: Session) -> None:
@@ -232,132 +243,75 @@ def test_social_connection_identity_is_unique(session: Session) -> None:
     )
 
 
-@pytest.mark.parametrize("with_snapshot,with_node", [(False, False), (True, True)])
-def test_file_asset_requires_exactly_one_source(
-    session: Session, with_snapshot: bool, with_node: bool
-) -> None:
+def test_file_asset_source_image_allows_null_producer(session: Session) -> None:
     workflow = create_workflow(session, create_user(session))
-    snapshot = ExecutionInputSnapshot(
+    source = FileAsset(
         workflow_execution_id=workflow.id,
-        input_type=InputType.IMAGE,
-        request_text="image request",
-        input_data={},
+        created_by_node_execution_id=None,
+        asset_type=AssetType.IMAGE,
+        storage_key=str(uuid4()),
+        file_name="image.png",
+        mime_type="image/png",
+        file_size=1,
+        slide_no=None,
     )
-    node = create_node(session, workflow)
-    session.add(snapshot)
+    session.add(source)
     session.flush()
-    flush_fails(
-        session,
-        FileAsset(
-            workflow_execution_id=workflow.id,
-            execution_input_snapshot_id=snapshot.id if with_snapshot else None,
-            node_execution_id=node.id if with_node else None,
-            asset_type=AssetType.IMAGE,
-            storage_key=str(uuid4()),
-            file_name="image.png",
-            mime_type="image/png",
-            file_size=1,
-        ),
-    )
+    assert source.id is not None
 
 
 def test_file_asset_accepts_each_valid_single_source(session: Session) -> None:
     workflow = create_workflow(session, create_user(session))
-    snapshot = ExecutionInputSnapshot(
-        workflow_execution_id=workflow.id,
-        input_type=InputType.IMAGE,
-        request_text="image request",
-        input_data={},
-    )
     node = create_node(session, workflow)
-    session.add(snapshot)
-    session.flush()
-    input_asset = FileAsset(
-        workflow_execution_id=workflow.id,
-        execution_input_snapshot_id=snapshot.id,
-        asset_type=AssetType.IMAGE,
-        storage_key=str(uuid4()),
-        file_name="input.png",
-        mime_type="image/png",
-        file_size=1,
-        sort_order=1,
-    )
     output_asset = FileAsset(
         workflow_execution_id=workflow.id,
-        node_execution_id=node.id,
+        created_by_node_execution_id=node.id,
         asset_type=AssetType.VIDEO,
         storage_key=str(uuid4()),
         file_name="output.mp4",
         mime_type="video/mp4",
         file_size=1,
     )
-    session.add_all([input_asset, output_asset])
+    session.add(output_asset)
     session.flush()
-    assert input_asset.id is not None
     assert output_asset.id is not None
 
 
-def test_input_asset_sort_order_must_be_positive_and_unique(session: Session) -> None:
+def test_asset_slide_no_must_be_positive(session: Session) -> None:
     workflow = create_workflow(session, create_user(session))
-    snapshot = ExecutionInputSnapshot(
-        workflow_execution_id=workflow.id,
-        input_type=InputType.TEXT_IMAGE,
-        request_text="image request",
-        input_data={},
-    )
-    session.add(snapshot)
-    session.flush()
     flush_fails(
         session,
         FileAsset(
             workflow_execution_id=workflow.id,
-            execution_input_snapshot_id=snapshot.id,
-            asset_type=AssetType.IMAGE,
-            storage_key=str(uuid4()),
-            file_name="missing-order.png",
-            mime_type="image/png",
-            file_size=1,
-            sort_order=None,
-        ),
-    )
-    flush_fails(
-        session,
-        FileAsset(
-            workflow_execution_id=workflow.id,
-            execution_input_snapshot_id=snapshot.id,
             asset_type=AssetType.IMAGE,
             storage_key=str(uuid4()),
             file_name="invalid.png",
             mime_type="image/png",
             file_size=1,
-            sort_order=0,
+            slide_no=0,
         ),
     )
     first_asset = FileAsset(
         workflow_execution_id=workflow.id,
-        execution_input_snapshot_id=snapshot.id,
         asset_type=AssetType.IMAGE,
         storage_key=str(uuid4()),
         file_name="first.png",
         mime_type="image/png",
         file_size=1,
-        sort_order=1,
+        slide_no=1,
     )
-    session.add(first_asset)
+    second_asset = FileAsset(
+        workflow_execution_id=workflow.id,
+        asset_type=AssetType.IMAGE,
+        storage_key=str(uuid4()),
+        file_name="duplicate.png",
+        mime_type="image/png",
+        file_size=1,
+        slide_no=1,
+    )
+    session.add_all([first_asset, second_asset])
     session.flush()
-    flush_fails(
-        session,
-        FileAsset(
-            workflow_execution_id=workflow.id,
-            execution_input_snapshot_id=snapshot.id,
-            asset_type=AssetType.IMAGE,
-            storage_key=str(uuid4()),
-            file_name="duplicate.png",
-            mime_type="image/png",
-            file_size=1,
-            sort_order=1,
-        ),
-    )
+    assert first_asset.slide_no == second_asset.slide_no == 1
 
 
 def test_publication_idempotency_key_is_unique(session: Session) -> None:
@@ -366,7 +320,7 @@ def test_publication_idempotency_key_is_unique(session: Session) -> None:
     node = create_node(session, workflow)
     asset = FileAsset(
         workflow_execution_id=workflow.id,
-        node_execution_id=node.id,
+        created_by_node_execution_id=node.id,
         asset_type=AssetType.VIDEO,
         storage_key=str(uuid4()),
         file_name="video.mp4",
@@ -383,8 +337,8 @@ def test_publication_idempotency_key_is_unique(session: Session) -> None:
     session.flush()
     session.add(
         SocialPublication(
+            node_execution_id=node.id,
             social_account_connection_id=account.id,
-            file_asset_id=asset.id,
             idempotency_key="publish-once",
         )
     )
@@ -392,8 +346,8 @@ def test_publication_idempotency_key_is_unique(session: Session) -> None:
     flush_fails(
         session,
         SocialPublication(
+            node_execution_id=node.id,
             social_account_connection_id=account.id,
-            file_asset_id=asset.id,
             idempotency_key="publish-once",
         ),
     )
