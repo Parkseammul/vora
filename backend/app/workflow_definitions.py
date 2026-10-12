@@ -5,6 +5,7 @@ from dataclasses import dataclass
 class NodeDefinition:
     key: str
     requires_approval: bool
+    creates_attempt: bool = True
 
 
 @dataclass(frozen=True)
@@ -71,5 +72,28 @@ VORA_CONTENT_CREATION_V1 = WorkflowDefinition(
 )
 
 
+VORA_CONTENT_CREATION_V3 = WorkflowDefinition(
+    key="vora_content_creation",
+    version=3,
+    start_node_key="CONTENT_PLAN",
+    nodes=(
+        NodeDefinition(key="CONTENT_PLAN", requires_approval=False),
+        NodeDefinition(key="TEXT_GENERATE", requires_approval=False),
+        NodeDefinition(key="TEXT_CHECK", requires_approval=False),
+        NodeDefinition(key="IMAGE_GENERATE", requires_approval=False),
+        NodeDefinition(key="IMAGE_CHECK", requires_approval=False),
+        NodeDefinition(key="HUMAN_APPROVAL", requires_approval=True, creates_attempt=False),
+    ),
+    transitions=(
+        Transition("CONTENT_PLAN", "TEXT_GENERATE"),
+        Transition("TEXT_GENERATE", "TEXT_CHECK"),
+        Transition("TEXT_CHECK", "IMAGE_GENERATE"),
+        Transition("IMAGE_GENERATE", "IMAGE_CHECK"),
+        Transition("IMAGE_CHECK", "HUMAN_APPROVAL"),
+    ),
+)
+
+
 workflow_registry = WorkflowRegistry()
 workflow_registry.register(VORA_CONTENT_CREATION_V1)
+workflow_registry.register(VORA_CONTENT_CREATION_V3)

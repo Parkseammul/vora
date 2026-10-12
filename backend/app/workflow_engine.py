@@ -248,6 +248,12 @@ class WorkflowEngine:
             node_execution.status = NodeExecutionStatus.RUNNING
             execution.current_node_type = node_execution.node_type
             node_execution.started_at = started_at
+            if node_definition.requires_approval and not node_definition.creates_attempt:
+                node_execution.status = NodeExecutionStatus.WAITING
+                execution.status = WorkflowExecutionStatus.WAITING_APPROVAL
+                execution.current_node_type = node_execution.node_type
+                self._session.commit()
+                return execution.status
             attempt = NodeExecutionAttempt(
                 node_execution_id=node_execution.id,
                 attempt_no=1,
