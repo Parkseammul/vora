@@ -72,7 +72,7 @@ class WorkflowExecutionService:
             execution = WorkflowExecution(
                 user_id=user.id,
                 workflow_key="vora_content_creation",
-                workflow_version=1,
+                workflow_version=3,
             )
             self._session.add(execution)
             self._session.flush()
@@ -111,11 +111,11 @@ class WorkflowExecutionService:
         input_data = self._assemble_input_data(execution.id)
         status = workflow_engine.start_execution(execution.id, input_data)
         if status is not WorkflowExecutionStatus.WAITING_APPROVAL:
-            raise WorkflowCreationError("Workflow did not reach content planning approval")
+            raise WorkflowCreationError("Workflow did not reach human approval")
         current_node = self._session.scalars(
             select(NodeExecution).where(
                 NodeExecution.workflow_execution_id == execution.id,
-                NodeExecution.node_type == "content_planning",
+                NodeExecution.node_type == "HUMAN_APPROVAL",
                 NodeExecution.status == NodeExecutionStatus.WAITING,
             )
         ).one()

@@ -1,5 +1,6 @@
 """Small V3 fake node runtime used until provider-backed nodes are connected."""
 
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from langchain_core.runnables import RunnableLambda
@@ -25,15 +26,15 @@ class V3NodeExecutor:
     def execute(
         self,
         node_key: str,
-        input_data: dict[str, Any],
+        input_data: Mapping[str, Any],
         *,
         workflow_execution_id: int | None = None,
         node_execution_id: int | None = None,
-        video_progress_callback: Any = None,
+        video_progress_callback: Callable[[str, str], None] | None = None,
     ) -> NodeExecutionResult | dict[str, Any]:
         del video_progress_callback
         if node_key == "IMAGE_GENERATE":
-            return self._image_generate(input_data, workflow_execution_id, node_execution_id)
+            return self._image_generate(dict(input_data), workflow_execution_id, node_execution_id)
         if node_key == "HUMAN_APPROVAL":
             return {"status": "WAITING_APPROVAL"}
         runnable = self._runnables.get(node_key)
@@ -42,7 +43,7 @@ class V3NodeExecutor:
         if node_key == self._fail_node:
             raise RuntimeError(f"Fake V3 executor failure for {node_key}")
         return NodeExecutionResult(
-            output_data=runnable.invoke(input_data),
+            output_data=runnable.invoke(dict(input_data)),
             attempt_metadata={"runtime": "v3-fake-runnable"},
         )
 

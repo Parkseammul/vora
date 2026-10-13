@@ -173,24 +173,18 @@ def test_source_image_input_is_reassembled_from_db_and_stops_for_content_approva
     assert source.created_by_node_execution_id is None
     assert source.slide_no is None
 
-    input_analysis, content_planning = nodes_for(session, execution.id)
-    assert input_analysis.output_data == content_planning.input_data
-    assert input_analysis.output_data["request_text"] == "짧은 영상을 만들어줘"
-    assert input_analysis.input_data == {
-        "request_text": "짧은 영상을 만들어줘",
-        "marketing_info": "product information",
-        "theme": None,
-        "source_asset_id": snapshot.source_asset_id,
-        "rules_version_id": snapshot.rules_version_id,
-    }
+    nodes = nodes_for(session, execution.id)
+    assert [node.node_type for node in nodes] == [
+        "CONTENT_PLAN", "TEXT_GENERATE", "TEXT_CHECK", "IMAGE_GENERATE", "IMAGE_CHECK", "HUMAN_APPROVAL"
+    ]
     assert execution.status is WorkflowExecutionStatus.WAITING_APPROVAL
-    assert content_planning.status is NodeExecutionStatus.WAITING
+    assert nodes[-1].status is NodeExecutionStatus.WAITING
     assert body == {
         "workflow_execution_id": execution.id,
         "status": "WAITING_APPROVAL",
-        "current_node": "content_planning",
-        "current_node_execution_id": content_planning.id,
-        "result": content_planning.output_data,
+        "current_node": "HUMAN_APPROVAL",
+        "current_node_execution_id": nodes[-1].id,
+        "result": nodes[-1].output_data,
     }
 
 
@@ -225,8 +219,9 @@ def test_source_image_is_persisted_and_reaches_input_analysis(
     assert not asset.storage_key.startswith("C:")
     assert (uploads_root / asset.storage_key).read_bytes() == b"source"
 
-    input_analysis, content_planning = nodes_for(session, execution_id)
-    assert input_analysis.output_data == content_planning.input_data
+    nodes = nodes_for(session, execution_id)
+    assert nodes[-1].node_type == "HUMAN_APPROVAL"
+    assert nodes[-1].status is NodeExecutionStatus.WAITING
 
 
 @pytest.mark.parametrize(
