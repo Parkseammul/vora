@@ -200,8 +200,8 @@ def test_async_video_worker_completes_with_waiting_approval_and_sse_stages(sessi
     session.refresh(node)
     session.refresh(attempt)
     assert execution.status is WorkflowExecutionStatus.WAITING_APPROVAL
-    assert node.status is NodeExecutionStatus.WAITING_APPROVAL
-    assert attempt.status is NodeExecutionAttemptStatus.SUCCESS
+    assert node.status is NodeExecutionStatus.WAITING
+    assert attempt.status is NodeExecutionAttemptStatus.SUCCEEDED
     assert attempt.metadata_["queue_state"] == "COMPLETED"
     assert [event["stage"] for event in dispatcher.events] == [
         "QUEUED",
@@ -225,8 +225,8 @@ def test_enqueue_race_preserves_worker_completed_state(session: Session) -> None
     session.refresh(node)
     session.refresh(attempt)
     assert execution.status is WorkflowExecutionStatus.WAITING_APPROVAL
-    assert node.status is NodeExecutionStatus.WAITING_APPROVAL
-    assert attempt.status is NodeExecutionAttemptStatus.SUCCESS
+    assert node.status is NodeExecutionStatus.WAITING
+    assert attempt.status is NodeExecutionAttemptStatus.SUCCEEDED
     assert attempt.metadata_["queue_state"] == "COMPLETED"
     assert attempt.metadata_["celery_task_id"] == f"task-{attempt.id}"
     assert attempt.metadata_["queue"] == "video_generation"
@@ -257,9 +257,9 @@ def test_retryable_video_error_creates_one_new_attempt_then_succeeds(session: Se
     worker.execute(execution.id, node.id, attempts[1].id)
     assert [attempt.status for attempt in _attempts(session, node.id)] == [
         NodeExecutionAttemptStatus.FAILED,
-        NodeExecutionAttemptStatus.SUCCESS,
+        NodeExecutionAttemptStatus.SUCCEEDED,
     ]
-    assert node.status is NodeExecutionStatus.WAITING_APPROVAL
+    assert node.status is NodeExecutionStatus.WAITING
 
 
 def test_temporary_provider_error_is_retryable(session: Session) -> None:
@@ -362,14 +362,14 @@ def _approved_script(session: Session) -> tuple[WorkflowExecution, NodeExecution
     session.flush()
     planning = NodeExecution(
         workflow_execution_id=execution.id,
-        node_key="content_planning",
-        status=NodeExecutionStatus.SUCCESS,
+        node_type="content_planning",
+        status=NodeExecutionStatus.SUCCEEDED,
         output_data={"planning": "output"},
     )
     script = NodeExecution(
         workflow_execution_id=execution.id,
-        node_key="script_generation",
-        status=NodeExecutionStatus.WAITING_APPROVAL,
+        node_type="script_generation",
+        status=NodeExecutionStatus.WAITING,
         output_data={"script": "output"},
     )
     session.add_all([planning, script])
@@ -377,7 +377,7 @@ def _approved_script(session: Session) -> tuple[WorkflowExecution, NodeExecution
     session.add(
         UserApproval(
             node_execution_id=script.id,
-            user_id=user.id,
+            workflow_execution_id=execution.id,
             decision=ApprovalDecision.APPROVED,
         )
     )
@@ -391,7 +391,7 @@ def _video_node_and_attempt(
     node = session.scalar(
         select(NodeExecution).where(
             NodeExecution.workflow_execution_id == workflow_execution_id,
-            NodeExecution.node_key == "video_generation",
+            NodeExecution.node_type == "video_generation",
         )
     )
     assert node is not None

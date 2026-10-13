@@ -63,6 +63,7 @@ from app.social_providers import (
     YouTubeProvider,
     platform_from_string,
 )
+from app.v3_runtime import V3NodeExecutor
 from app.video_async import (
     CeleryVideoTaskDispatcher,
     RedisVideoProgressEvents,
@@ -221,7 +222,11 @@ def get_ai_workflow_services(session: Session) -> AIWorkflowServices:
     )
 
 
-def get_workflow_engine(session: Session, services: AIWorkflowServices) -> WorkflowEngine:
+def get_workflow_engine(
+    session: Session, services: AIWorkflowServices, workflow_version: int = 1
+) -> WorkflowEngine:
+    if workflow_version == 3:
+        return WorkflowEngine(session, workflow_registry, V3NodeExecutor(session=session))
     return WorkflowEngine(
         session,
         workflow_registry,
@@ -645,7 +650,9 @@ async def create_workflow_execution(
         content_type=source_image.content_type or "",
         content=await source_image.read(),
     )
-    workflow_engine = get_workflow_engine(session, get_ai_workflow_services(session))
+    workflow_engine = get_workflow_engine(
+        session, get_ai_workflow_services(session), workflow_version=3
+    )
     service = WorkflowExecutionService(session)
     try:
         result = service.create_and_start(

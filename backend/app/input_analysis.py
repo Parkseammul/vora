@@ -88,7 +88,7 @@ def analyze_input(input_data: dict[str, object]) -> InputAnalysisResult:
                 else AgeGroup.ALL
             )
         ),
-        source_asset_ids=input_data["source_asset_ids"],  # type: ignore[arg-type]
+        source_asset_ids=[int(str(input_data["source_asset_id"]))],
     )
 
 

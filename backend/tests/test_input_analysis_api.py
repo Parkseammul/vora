@@ -22,12 +22,11 @@ from app.input_analysis import (
 )
 from app.llm_provider import LLMMetadata, LLMProviderType, LLMResult
 from app.models import (
-    AssetType,
     ExecutionInputSnapshot,
     FileAsset,
-    InputType,
     NodeExecution,
     NodeExecutionStatus,
+    RulesVersion,
     User,
     WorkflowExecution,
     WorkflowExecutionStatus,
@@ -117,7 +116,9 @@ def client(
 ) -> Iterator[TestClient]:
     if session.scalar(select(User).where(User.email == DEV_USER_EMAIL)) is None:
         session.add(User(email=DEV_USER_EMAIL, name="VORA Dev"))
-        session.commit()
+    if session.scalar(select(RulesVersion).where(RulesVersion.version == 1)) is None:
+        session.add(RulesVersion(version=1, rules_data={}))
+    session.commit()
 
     def get_test_session() -> Iterator[Session]:
         yield session
@@ -140,10 +141,20 @@ def nodes_for(session: Session, workflow_execution_id: int) -> list[NodeExecutio
     )
 
 
-def test_text_input_is_reassembled_from_db_and_stops_for_content_approval(
+def test_source_image_input_is_reassembled_from_db_and_stops_for_content_approval(
     client: TestClient, session: Session
 ) -> None:
-    response = client.post("/workflow-executions", data={"request_text": "짧은 영상을 만들어줘"})
+    rules_version = session.scalar(select(RulesVersion).where(RulesVersion.version == 1))
+    assert rules_version is not None
+    response = client.post(
+        "/workflow-executions",
+        data={
+            "request_text": "짧은 영상을 만들어줘",
+            "marketing_info": "product information",
+            "rules_version_id": str(rules_version.id),
+        },
+        files={"source_image": ("source.png", b"source", "image/png")},
+    )
 
     assert response.status_code == 200
     body = response.json()
@@ -155,40 +166,41 @@ def test_text_input_is_reassembled_from_db_and_stops_for_content_approval(
         )
     )
     assert snapshot is not None
-    assert snapshot.input_type is InputType.TEXT
     assert snapshot.request_text == "짧은 영상을 만들어줘"
-    assert session.scalars(select(FileAsset).where(FileAsset.execution_input_snapshot_id == snapshot.id)).all() == []
+    assert snapshot.marketing_info == "product information"
+    source = session.get(FileAsset, snapshot.source_asset_id)
+    assert source is not None
+    assert source.created_by_node_execution_id is None
+    assert source.slide_no is None
 
-    input_analysis, content_planning = nodes_for(session, execution.id)
-    assert input_analysis.output_data == content_planning.input_data
-    assert input_analysis.output_data["request_text"] == "짧은 영상을 만들어줘"
-    assert input_analysis.input_data == {
-        "request_text": "짧은 영상을 만들어줘",
-        "input_type": "TEXT",
-        "source_asset_ids": [],
-    }
+    nodes = nodes_for(session, execution.id)
+    assert [node.node_type for node in nodes] == [
+        "CONTENT_PLAN", "TEXT_GENERATE", "TEXT_CHECK", "IMAGE_GENERATE", "IMAGE_CHECK", "HUMAN_APPROVAL"
+    ]
     assert execution.status is WorkflowExecutionStatus.WAITING_APPROVAL
-    assert content_planning.status is NodeExecutionStatus.WAITING_APPROVAL
+    assert nodes[-1].status is NodeExecutionStatus.WAITING
     assert body == {
         "workflow_execution_id": execution.id,
         "status": "WAITING_APPROVAL",
-        "current_node": "content_planning",
-        "current_node_execution_id": content_planning.id,
-        "result": content_planning.output_data,
+        "current_node": "HUMAN_APPROVAL",
+        "current_node_execution_id": nodes[-1].id,
+        "result": nodes[-1].output_data,
     }
 
 
-def test_images_preserve_db_sort_order_and_reach_input_analysis(
+def test_source_image_is_persisted_and_reaches_input_analysis(
     client: TestClient, session: Session, uploads_root: Path
 ) -> None:
+    rules_version = session.scalar(select(RulesVersion).where(RulesVersion.version == 1))
+    assert rules_version is not None
     response = client.post(
         "/workflow-executions",
-        data={"request_text": "이 화장품 사진으로 30초 광고 만들어줘"},
-        files=[
-            ("images", ("first.jpg", b"first", "image/jpeg")),
-            ("images", ("second.png", b"second", "image/png")),
-            ("images", ("third.jpg", b"third", "image/jpeg")),
-        ],
+        data={
+            "request_text": "request",
+            "marketing_info": "product information",
+            "rules_version_id": str(rules_version.id),
+        },
+        files={"source_image": ("source.jpg", b"source", "image/jpeg")},
     )
 
     assert response.status_code == 200
@@ -199,30 +211,17 @@ def test_images_preserve_db_sort_order_and_reach_input_analysis(
         )
     )
     assert snapshot is not None
-    assets = session.scalars(
-        select(FileAsset)
-        .where(
-            FileAsset.execution_input_snapshot_id == snapshot.id,
-            FileAsset.asset_type == AssetType.IMAGE,
-        )
-        .order_by(FileAsset.sort_order)
-    ).all()
-    assert snapshot.input_type is InputType.TEXT_IMAGE
-    assert [asset.sort_order for asset in assets] == [1, 2, 3]
-    assert [asset.file_name for asset in assets] == ["first.jpg", "second.png", "third.jpg"]
-    assert all(not asset.storage_key.startswith("C:") for asset in assets)
-    assert [(uploads_root / asset.storage_key).read_bytes() for asset in assets] == [
-        b"first",
-        b"second",
-        b"third",
-    ]
+    asset = session.get(FileAsset, snapshot.source_asset_id)
+    assert asset is not None
+    assert asset.file_name == "source.jpg"
+    assert asset.created_by_node_execution_id is None
+    assert asset.slide_no is None
+    assert not asset.storage_key.startswith("C:")
+    assert (uploads_root / asset.storage_key).read_bytes() == b"source"
 
-    input_analysis, content_planning = nodes_for(session, execution_id)
-    source_asset_ids = [asset.id for asset in assets]
-    assert input_analysis.input_data["source_asset_ids"] == source_asset_ids
-    assert input_analysis.output_data == content_planning.input_data
-    assert input_analysis.output_data["content_goal"] == "PRODUCT_AD"
-    assert input_analysis.output_data["source_asset_ids"] == source_asset_ids
+    nodes = nodes_for(session, execution_id)
+    assert nodes[-1].node_type == "HUMAN_APPROVAL"
+    assert nodes[-1].status is NodeExecutionStatus.WAITING
 
 
 @pytest.mark.parametrize(
@@ -232,25 +231,23 @@ def test_images_preserve_db_sort_order_and_reach_input_analysis(
         ({"request_text": ""}, None),
         ({"request_text": "   "}, None),
         (
-            {"request_text": "request"},
-            [("images", ("file.pdf", b"pdf", "application/pdf"))],
+            {"request_text": "request", "marketing_info": "info", "rules_version_id": "1"},
+            {"source_image": ("file.pdf", b"pdf", "application/pdf")},
         ),
         (
-            {"request_text": "request"},
-            [("images", ("file.gif", b"gif", "image/gif"))],
+            {"request_text": "request", "marketing_info": "info", "rules_version_id": "1"},
+            {"source_image": ("file.gif", b"gif", "image/gif")},
         ),
         (
-            {"request_text": "request"},
-            [("images", ("file.webp", b"webp", "image/webp"))],
-        ),
-        (
-            {"request_text": "request"},
-            [("images", (f"{index}.png", b"x", "image/png")) for index in range(7)],
+            {"request_text": "request", "marketing_info": "info", "rules_version_id": "1"},
+            {"source_image": ("file.webp", b"webp", "image/webp")},
         ),
     ],
 )
 def test_api_rejects_invalid_input(
-    client: TestClient, data: dict[str, str], files: list[tuple[str, tuple[str, bytes, str]]] | None
+    client: TestClient,
+    data: dict[str, str],
+    files: dict[str, tuple[str, bytes, str]] | None,
 ) -> None:
     response = client.post("/workflow-executions", data=data, files=files)
 
@@ -260,8 +257,8 @@ def test_api_rejects_invalid_input(
 def test_api_rejects_image_larger_than_10mb(client: TestClient) -> None:
     response = client.post(
         "/workflow-executions",
-        data={"request_text": "request"},
-        files={"images": ("large.png", b"x" * (10 * 1024 * 1024 + 1), "image/png")},
+        data={"request_text": "request", "marketing_info": "info", "rules_version_id": "1"},
+        files={"source_image": ("large.png", b"x" * (10 * 1024 * 1024 + 1), "image/png")},
     )
 
     assert response.status_code == 422
@@ -278,8 +275,8 @@ def test_database_failure_cleans_files_and_does_not_start_engine(
     monkeypatch.setattr(Session, "commit", fail_commit)
     response = client.post(
         "/workflow-executions",
-        data={"request_text": "request"},
-        files={"images": ("input.png", b"image", "image/png")},
+        data={"request_text": "request", "marketing_info": "info", "rules_version_id": "1"},
+        files={"source_image": ("input.png", b"image", "image/png")},
     )
 
     assert response.status_code == 500
@@ -315,7 +312,7 @@ def test_input_analysis_applies_revision_request_to_target_audience() -> None:
         {
             "request_text": "운동 영상을 만들어줘",
             "revision_request": "타깃을 20대로 바꿔줘",
-            "source_asset_ids": [],
+            "source_asset_id": 1,
         }
     )
 
@@ -335,7 +332,7 @@ def test_input_analysis_revision_preserves_unmodified_baseline_fields() -> None:
         {
             "request_text": "기존 요청",
             "revision_request": "타깃을 20대로 바꿔줘",
-            "source_asset_ids": [99],
+            "source_asset_id": 99,
             "previous_output": baseline.model_dump(mode="json"),
         }
     )
