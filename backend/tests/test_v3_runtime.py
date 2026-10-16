@@ -21,7 +21,7 @@ from app.models import (
     WorkflowExecution,
     WorkflowExecutionStatus,
 )
-from app.v3_runtime import ContentPlanOutput, V3NodeExecutor
+from app.v3_runtime import ContentPlanOutput, TextGenerateOutput, V3NodeExecutor
 from app.workflow_definitions import workflow_registry
 from app.workflow_engine import WorkflowEngine
 
@@ -57,6 +57,10 @@ PROMPT_TEMPLATE = (
     "Request: {request_text}\nMarketing: {marketing_info}\nTheme: {theme}\n"
     "Rules: {rules_data}\nOriginal input: {input_data}"
 )
+TEXT_GENERATE_PROMPT_TEMPLATE = (
+    "Message: {core_message}\nSlides: {slide_structure}\n"
+    "Rules: {rules_data}\nOriginal input: {input_data}"
+)
 
 
 def _content_plan_model(_: object) -> ContentPlanOutput:
@@ -70,10 +74,28 @@ def _failing_content_plan_model(_: object) -> ContentPlanOutput:
     raise RuntimeError("CONTENT_PLAN model unavailable")
 
 
+def _text_generate_model(_: object) -> TextGenerateOutput:
+    return TextGenerateOutput(
+        slides=[
+            {"slide_no": 1, "text": "Headline"},
+            {"slide_no": 2, "text": "Supporting copy"},
+        ]
+    )
+
+
+def _failing_text_generate_model(_: object) -> TextGenerateOutput:
+    raise RuntimeError("TEXT_GENERATE model unavailable")
+
+
 def _v3_input_contract(session: Session, execution: WorkflowExecution) -> None:
     rules = RulesVersion(version=1, rules_data={"tone": "clear"})
-    prompt = PromptVersion(node_type="CONTENT_PLAN", version=1, prompt_template=PROMPT_TEMPLATE)
-    session.add_all([rules, prompt])
+    content_plan_prompt = PromptVersion(
+        node_type="CONTENT_PLAN", version=1, prompt_template=PROMPT_TEMPLATE
+    )
+    text_generate_prompt = PromptVersion(
+        node_type="TEXT_GENERATE", version=1, prompt_template=TEXT_GENERATE_PROMPT_TEMPLATE
+    )
+    session.add_all([rules, content_plan_prompt, text_generate_prompt])
     session.flush()
     source_asset = FileAsset(
         workflow_execution_id=execution.id,
@@ -110,6 +132,8 @@ def test_v3_chain_reaches_human_approval_with_runnable_attempts(session: Session
             session=session,
             content_plan_model=RunnableLambda(_content_plan_model),
             content_plan_model_name="test-content-plan-model",
+            text_generate_model=RunnableLambda(_text_generate_model),
+            text_generate_model_name="test-text-generate-model",
         ),
     )
 
@@ -143,6 +167,9 @@ def test_v3_chain_reaches_human_approval_with_runnable_attempts(session: Session
     assert attempts[0].prompt_version_id is not None
     assert attempts[0].ai_company == "OPENAI"
     assert attempts[0].model == "test-content-plan-model"
+    assert attempts[1].prompt_version_id is not None
+    assert attempts[1].ai_company == "OPENAI"
+    assert attempts[1].model == "test-text-generate-model"
 
 
 def test_v3_chain_failure_marks_attempt_node_and_workflow_failed(session: Session) -> None:
@@ -245,6 +272,83 @@ def test_v3_content_plan_model_failure_marks_attempt_node_and_workflow_failed(
     assert content_plan.status is NodeExecutionStatus.FAILED
     attempt = session.scalar(
         select(NodeExecutionAttempt).where(NodeExecutionAttempt.node_execution_id == content_plan.id)
+    )
+    assert attempt is not None
+    assert attempt.status is NodeExecutionAttemptStatus.FAILED
+
+
+def test_v3_text_generate_uses_prompt_version_and_persists_structured_output(
+    session: Session,
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    engine_instance = WorkflowEngine(
+        session,
+        workflow_registry,
+        V3NodeExecutor(
+            session=session,
+            fail_node="TEXT_CHECK",
+            content_plan_model=RunnableLambda(_content_plan_model),
+            text_generate_model=RunnableLambda(_text_generate_model),
+            text_generate_model_name="test-text-generate-model",
+        ),
+    )
+
+    status = engine_instance.start_execution(execution.id, {"request_text": "ignored"})
+
+    assert status is WorkflowExecutionStatus.FAILED
+    text_generate = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "TEXT_GENERATE",
+        )
+    )
+    assert text_generate is not None
+    assert text_generate.output_data == {
+        "slides": [
+            {"slide_no": 1, "text": "Headline"},
+            {"slide_no": 2, "text": "Supporting copy"},
+        ]
+    }
+    attempt = session.scalar(
+        select(NodeExecutionAttempt).where(NodeExecutionAttempt.node_execution_id == text_generate.id)
+    )
+    assert attempt is not None
+    assert attempt.status is NodeExecutionAttemptStatus.SUCCEEDED
+    assert attempt.prompt_version_id is not None
+    assert attempt.ai_company == "OPENAI"
+    assert attempt.model == "test-text-generate-model"
+    assert attempt.metadata_ == {"runtime": "v3-langchain", "prompt_version": 1}
+
+
+def test_v3_text_generate_model_failure_marks_attempt_node_and_workflow_failed(
+    session: Session,
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    engine_instance = WorkflowEngine(
+        session,
+        workflow_registry,
+        V3NodeExecutor(
+            session=session,
+            content_plan_model=RunnableLambda(_content_plan_model),
+            text_generate_model=RunnableLambda(_failing_text_generate_model),
+        ),
+    )
+
+    status = engine_instance.start_execution(execution.id, {"request_text": "ignored"})
+
+    assert status is WorkflowExecutionStatus.FAILED
+    text_generate = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "TEXT_GENERATE",
+        )
+    )
+    assert text_generate is not None
+    assert text_generate.status is NodeExecutionStatus.FAILED
+    attempt = session.scalar(
+        select(NodeExecutionAttempt).where(NodeExecutionAttempt.node_execution_id == text_generate.id)
     )
     assert attempt is not None
     assert attempt.status is NodeExecutionAttemptStatus.FAILED

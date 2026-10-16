@@ -33,7 +33,7 @@ from app.models import (
     WorkflowExecution,
     WorkflowExecutionStatus,
 )
-from app.v3_runtime import ContentPlanOutput
+from app.v3_runtime import ContentPlanOutput, TextGenerateOutput
 from app.workflow_execution_service import DEV_USER_EMAIL
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
@@ -129,6 +129,14 @@ def client(
                 prompt_template="{request_text} {marketing_info} {theme} {rules_data} {input_data}",
             )
         )
+    if session.scalar(select(PromptVersion).where(PromptVersion.node_type == "TEXT_GENERATE")) is None:
+        session.add(
+            PromptVersion(
+                node_type="TEXT_GENERATE",
+                version=1,
+                prompt_template="{core_message} {slide_structure} {rules_data} {input_data}",
+            )
+        )
     session.commit()
 
     def get_test_session() -> Iterator[Session]:
@@ -141,6 +149,13 @@ def client(
         "get_content_plan_chat_model",
         lambda: RunnableLambda(
             lambda _: ContentPlanOutput(core_message="message", slide_structure=["hook"])
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "get_text_generate_chat_model",
+        lambda: RunnableLambda(
+            lambda _: TextGenerateOutput(slides=[{"slide_no": 1, "text": "copy"}])
         ),
     )
     main.app.dependency_overrides[main.get_session] = get_test_session

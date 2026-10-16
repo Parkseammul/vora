@@ -231,6 +231,14 @@ def get_content_plan_chat_model() -> ChatOpenAI:
     )
 
 
+def get_text_generate_chat_model() -> ChatOpenAI:
+    """Build the provider only when TEXT_GENERATE reaches its AI boundary."""
+    return ChatOpenAI(
+        model=settings.script_generation_model,
+        api_key=SecretStr(settings.openai_api_key) if settings.openai_api_key else None,
+    )
+
+
 def get_workflow_engine(
     session: Session, services: AIWorkflowServices, workflow_version: int = 1
 ) -> WorkflowEngine:
@@ -242,6 +250,8 @@ def get_workflow_engine(
                 session=session,
                 content_plan_model_factory=get_content_plan_chat_model,
                 content_plan_model_name=settings.content_planning_model,
+                text_generate_model_factory=get_text_generate_chat_model,
+                text_generate_model_name=settings.script_generation_model,
             ),
         )
     return WorkflowEngine(
