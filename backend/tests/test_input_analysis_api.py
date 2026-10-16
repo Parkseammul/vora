@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from langchain_core.runnables import RunnableLambda
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
@@ -26,11 +27,13 @@ from app.models import (
     FileAsset,
     NodeExecution,
     NodeExecutionStatus,
+    PromptVersion,
     RulesVersion,
     User,
     WorkflowExecution,
     WorkflowExecutionStatus,
 )
+from app.v3_runtime import ContentPlanOutput
 from app.workflow_execution_service import DEV_USER_EMAIL
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
@@ -118,6 +121,14 @@ def client(
         session.add(User(email=DEV_USER_EMAIL, name="VORA Dev"))
     if session.scalar(select(RulesVersion).where(RulesVersion.version == 1)) is None:
         session.add(RulesVersion(version=1, rules_data={}))
+    if session.scalar(select(PromptVersion).where(PromptVersion.node_type == "CONTENT_PLAN")) is None:
+        session.add(
+            PromptVersion(
+                node_type="CONTENT_PLAN",
+                version=1,
+                prompt_template="{request_text} {marketing_info} {theme} {rules_data} {input_data}",
+            )
+        )
     session.commit()
 
     def get_test_session() -> Iterator[Session]:
@@ -125,6 +136,13 @@ def client(
 
     monkeypatch.setattr("app.workflow_execution_service.UPLOADS_ROOT", uploads_root)
     monkeypatch.setattr(main, "get_llm_provider", lambda: DeterministicPlanningProvider())
+    monkeypatch.setattr(
+        main,
+        "get_content_plan_chat_model",
+        lambda: RunnableLambda(
+            lambda _: ContentPlanOutput(core_message="message", slide_structure=["hook"])
+        ),
+    )
     main.app.dependency_overrides[main.get_session] = get_test_session
     with TestClient(main.app) as test_client:
         yield test_client

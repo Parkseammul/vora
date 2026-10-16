@@ -17,6 +17,9 @@ class NodeExecutionResult:
 
     output_data: dict[str, Any]
     attempt_metadata: dict[str, Any]
+    ai_company: str | None = None
+    model: str | None = None
+    prompt_version_id: int | None = None
 
 
 class NodeExecutorConfigurationError(RuntimeError):

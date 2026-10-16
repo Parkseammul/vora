@@ -8,7 +8,8 @@ from urllib.parse import urlencode, urlsplit
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
-from pydantic import BaseModel, field_validator
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, SecretStr, field_validator
 
 # SQL 문자열을 안전하게 실행하기 위한 SQLAlchemy 함수
 from sqlalchemy import select, text
@@ -222,11 +223,27 @@ def get_ai_workflow_services(session: Session) -> AIWorkflowServices:
     )
 
 
+def get_content_plan_chat_model() -> ChatOpenAI:
+    """Build the provider only when CONTENT_PLAN actually reaches its AI boundary."""
+    return ChatOpenAI(
+        model=settings.content_planning_model,
+        api_key=SecretStr(settings.openai_api_key) if settings.openai_api_key else None,
+    )
+
+
 def get_workflow_engine(
     session: Session, services: AIWorkflowServices, workflow_version: int = 1
 ) -> WorkflowEngine:
     if workflow_version == 3:
-        return WorkflowEngine(session, workflow_registry, V3NodeExecutor(session=session))
+        return WorkflowEngine(
+            session,
+            workflow_registry,
+            V3NodeExecutor(
+                session=session,
+                content_plan_model_factory=get_content_plan_chat_model,
+                content_plan_model_name=settings.content_planning_model,
+            ),
+        )
     return WorkflowEngine(
         session,
         workflow_registry,

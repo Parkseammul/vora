@@ -209,6 +209,7 @@ class WorkflowEngine:
         if isinstance(execution_result, NodeExecutionResult):
             node_execution.output_data = execution_result.output_data
             attempt.metadata_ = {**attempt.metadata_, **execution_result.attempt_metadata}
+            self._record_attempt_execution_details(attempt, execution_result)
         else:
             node_execution.output_data = execution_result
         if node_definition.requires_approval:
@@ -295,6 +296,7 @@ class WorkflowEngine:
             if isinstance(execution_result, NodeExecutionResult):
                 output_data = execution_result.output_data
                 attempt.metadata_ = execution_result.attempt_metadata
+                self._record_attempt_execution_details(attempt, execution_result)
             else:
                 output_data = execution_result
             node_execution.output_data = output_data
@@ -316,6 +318,15 @@ class WorkflowEngine:
         execution.completed_at = self._now()
         self._session.commit()
         return execution.status
+
+    @staticmethod
+    def _record_attempt_execution_details(
+        attempt: NodeExecutionAttempt, result: NodeExecutionResult
+    ) -> None:
+        """Persist only executor-supplied AI provenance; state remains Engine-owned."""
+        attempt.ai_company = result.ai_company
+        attempt.model = result.model
+        attempt.prompt_version_id = result.prompt_version_id
 
     def complete_video_attempt_success(
         self, node_execution_id: int, attempt_id: int, execution_result: NodeExecutionResult
