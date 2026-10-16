@@ -28,8 +28,17 @@ class ContentPlanOutput(BaseModel):
     slide_structure: list[str] = Field(min_length=1)
 
 
+class SlideText(BaseModel):
+    slide_no: int
+    text: str
+
+
+class TextGenerateOutput(BaseModel):
+    slides: list[SlideText] = Field(min_length=1)
+
+
 class V3NodeExecutor:
-    """Runs V3 nodes, with an injected real ChatModel for CONTENT_PLAN."""
+    """Runs V3 nodes, with injected real ChatModels for connected AI nodes."""
 
     def __init__(
         self,
@@ -38,14 +47,19 @@ class V3NodeExecutor:
         content_plan_model: BaseChatModel | Runnable[dict[str, Any], ContentPlanOutput] | None = None,
         content_plan_model_name: str | None = None,
         content_plan_model_factory: Callable[[], BaseChatModel] | None = None,
+        text_generate_model: BaseChatModel | Runnable[dict[str, Any], TextGenerateOutput] | None = None,
+        text_generate_model_name: str | None = None,
+        text_generate_model_factory: Callable[[], BaseChatModel] | None = None,
     ) -> None:
         self._session = session
         self._fail_node = fail_node
         self._content_plan_model = content_plan_model
         self._content_plan_model_name = content_plan_model_name
         self._content_plan_model_factory = content_plan_model_factory
+        self._text_generate_model = text_generate_model
+        self._text_generate_model_name = text_generate_model_name
+        self._text_generate_model_factory = text_generate_model_factory
         self._runnables = {
-            "TEXT_GENERATE": RunnableLambda(self._text_generate),
             "TEXT_CHECK": RunnableLambda(self._text_check),
             "IMAGE_CHECK": RunnableLambda(self._image_check),
         }
@@ -60,8 +74,12 @@ class V3NodeExecutor:
         video_progress_callback: Callable[[str, str], None] | None = None,
     ) -> NodeExecutionResult | dict[str, Any]:
         del video_progress_callback
+        if node_key == self._fail_node:
+            raise RuntimeError(f"Fake V3 executor failure for {node_key}")
         if node_key == "CONTENT_PLAN":
             return self._content_plan(dict(input_data), workflow_execution_id)
+        if node_key == "TEXT_GENERATE":
+            return self._text_generate(dict(input_data), workflow_execution_id)
         if node_key == "IMAGE_GENERATE":
             return self._image_generate(dict(input_data), workflow_execution_id, node_execution_id)
         if node_key == "HUMAN_APPROVAL":
@@ -69,8 +87,6 @@ class V3NodeExecutor:
         runnable = self._runnables.get(node_key)
         if runnable is None:
             raise ValueError(f"Unsupported V3 node: {node_key}")
-        if node_key == self._fail_node:
-            raise RuntimeError(f"Fake V3 executor failure for {node_key}")
         return NodeExecutionResult(
             output_data=runnable.invoke(dict(input_data)),
             attempt_metadata={"runtime": "v3-fake-runnable"},
@@ -138,10 +154,60 @@ class V3NodeExecutor:
             prompt_version_id=prompt_version.id,
         )
 
-    @staticmethod
-    def _text_generate(input_data: dict[str, Any]) -> dict[str, Any]:
-        plan = input_data["slides"]
-        return {"slides": [{"slide_no": slide["slide_no"], "text": "Fake headline" if slide["slide_no"] == 1 else "Fake body"} for slide in plan]}
+    def _text_generate(
+        self, input_data: dict[str, Any], workflow_execution_id: int | None
+    ) -> NodeExecutionResult:
+        if self._session is None or workflow_execution_id is None:
+            raise NodeExecutorConfigurationError("TEXT_GENERATE requires session and workflow execution")
+        text_generate_model = self._text_generate_model
+        if text_generate_model is None and self._text_generate_model_factory is not None:
+            # Match CONTENT_PLAN: provider setup belongs at the AI execution boundary.
+            text_generate_model = self._text_generate_model_factory()
+        if text_generate_model is None:
+            raise NodeExecutorConfigurationError("TEXT_GENERATE chat model is not configured")
+
+        prompt_version = self._session.scalar(
+            select(PromptVersion)
+            .where(PromptVersion.node_type == "TEXT_GENERATE")
+            .order_by(PromptVersion.version.desc())
+            .limit(1)
+        )
+        if prompt_version is None:
+            raise NodeExecutorConfigurationError("No PromptVersion is configured for TEXT_GENERATE")
+        snapshot = self._session.scalar(
+            select(ExecutionInputSnapshot).where(
+                ExecutionInputSnapshot.workflow_execution_id == workflow_execution_id
+            )
+        )
+        if snapshot is None:
+            raise NodeExecutorConfigurationError("TEXT_GENERATE input snapshot does not exist")
+        rules = self._session.get(RulesVersion, snapshot.rules_version_id)
+        if rules is None:
+            raise NodeExecutorConfigurationError("TEXT_GENERATE rules version does not exist")
+
+        prompt = PromptTemplate.from_template(prompt_version.prompt_template)
+        chain_input = {
+            "core_message": input_data.get("core_message", ""),
+            "slide_structure": json.dumps(input_data.get("slide_structure", []), ensure_ascii=False),
+            "rules_data": json.dumps(rules.rules_data, ensure_ascii=False),
+            "input_data": json.dumps(input_data, ensure_ascii=False),
+        }
+        structured_model: Runnable[Any, Any]
+        if isinstance(text_generate_model, BaseChatModel):
+            structured_model = cast(
+                Runnable[Any, Any],
+                text_generate_model.with_structured_output(TextGenerateOutput),
+            )
+        else:
+            structured_model = cast(Runnable[Any, Any], text_generate_model)
+        result = TextGenerateOutput.model_validate((prompt | structured_model).invoke(chain_input))
+        return NodeExecutionResult(
+            output_data=result.model_dump(mode="json"),
+            attempt_metadata={"runtime": "v3-langchain", "prompt_version": prompt_version.version},
+            ai_company="OPENAI",
+            model=self._text_generate_model_name,
+            prompt_version_id=prompt_version.id,
+        )
 
     @staticmethod
     def _text_check(input_data: dict[str, Any]) -> dict[str, Any]:
