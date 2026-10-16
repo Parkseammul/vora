@@ -37,6 +37,12 @@ class TextGenerateOutput(BaseModel):
     slides: list[SlideText] = Field(min_length=1)
 
 
+class TextCheckOutput(BaseModel):
+    passed: bool
+    violations: list[str]
+    feedback: str | None
+
+
 class V3NodeExecutor:
     """Runs V3 nodes, with injected real ChatModels for connected AI nodes."""
 
@@ -50,6 +56,9 @@ class V3NodeExecutor:
         text_generate_model: BaseChatModel | Runnable[dict[str, Any], TextGenerateOutput] | None = None,
         text_generate_model_name: str | None = None,
         text_generate_model_factory: Callable[[], BaseChatModel] | None = None,
+        text_check_model: BaseChatModel | Runnable[dict[str, Any], TextCheckOutput] | None = None,
+        text_check_model_name: str | None = None,
+        text_check_model_factory: Callable[[], BaseChatModel] | None = None,
     ) -> None:
         self._session = session
         self._fail_node = fail_node
@@ -59,8 +68,10 @@ class V3NodeExecutor:
         self._text_generate_model = text_generate_model
         self._text_generate_model_name = text_generate_model_name
         self._text_generate_model_factory = text_generate_model_factory
+        self._text_check_model = text_check_model
+        self._text_check_model_name = text_check_model_name
+        self._text_check_model_factory = text_check_model_factory
         self._runnables = {
-            "TEXT_CHECK": RunnableLambda(self._text_check),
             "IMAGE_CHECK": RunnableLambda(self._image_check),
         }
 
@@ -80,6 +91,8 @@ class V3NodeExecutor:
             return self._content_plan(dict(input_data), workflow_execution_id)
         if node_key == "TEXT_GENERATE":
             return self._text_generate(dict(input_data), workflow_execution_id)
+        if node_key == "TEXT_CHECK":
+            return self._text_check(dict(input_data), workflow_execution_id)
         if node_key == "IMAGE_GENERATE":
             return self._image_generate(dict(input_data), workflow_execution_id, node_execution_id)
         if node_key == "HUMAN_APPROVAL":
@@ -209,9 +222,58 @@ class V3NodeExecutor:
             prompt_version_id=prompt_version.id,
         )
 
-    @staticmethod
-    def _text_check(input_data: dict[str, Any]) -> dict[str, Any]:
-        return {"slides": input_data["slides"], "passed": True, "violations": [], "feedback": None}
+    def _text_check(
+        self, input_data: dict[str, Any], workflow_execution_id: int | None
+    ) -> NodeExecutionResult:
+        if self._session is None or workflow_execution_id is None:
+            raise NodeExecutorConfigurationError("TEXT_CHECK requires session and workflow execution")
+        text_check_model = self._text_check_model
+        if text_check_model is None and self._text_check_model_factory is not None:
+            # Model construction is intentionally deferred until the AI node executes.
+            text_check_model = self._text_check_model_factory()
+        if text_check_model is None:
+            raise NodeExecutorConfigurationError("TEXT_CHECK chat model is not configured")
+
+        prompt_version = self._session.scalar(
+            select(PromptVersion)
+            .where(PromptVersion.node_type == "TEXT_CHECK")
+            .order_by(PromptVersion.version.desc())
+            .limit(1)
+        )
+        if prompt_version is None:
+            raise NodeExecutorConfigurationError("No PromptVersion is configured for TEXT_CHECK")
+        snapshot = self._session.scalar(
+            select(ExecutionInputSnapshot).where(
+                ExecutionInputSnapshot.workflow_execution_id == workflow_execution_id
+            )
+        )
+        if snapshot is None:
+            raise NodeExecutorConfigurationError("TEXT_CHECK input snapshot does not exist")
+        rules = self._session.get(RulesVersion, snapshot.rules_version_id)
+        if rules is None:
+            raise NodeExecutorConfigurationError("TEXT_CHECK rules version does not exist")
+
+        prompt = PromptTemplate.from_template(prompt_version.prompt_template)
+        chain_input = {
+            "slides": json.dumps(input_data.get("slides", []), ensure_ascii=False),
+            "rules_data": json.dumps(rules.rules_data, ensure_ascii=False),
+            "input_data": json.dumps(input_data, ensure_ascii=False),
+        }
+        structured_model: Runnable[Any, Any]
+        if isinstance(text_check_model, BaseChatModel):
+            structured_model = cast(
+                Runnable[Any, Any], text_check_model.with_structured_output(TextCheckOutput)
+            )
+        else:
+            structured_model = cast(Runnable[Any, Any], text_check_model)
+        result = TextCheckOutput.model_validate((prompt | structured_model).invoke(chain_input))
+        return NodeExecutionResult(
+            output_data={"slides": input_data["slides"], **result.model_dump(mode="json")},
+            attempt_metadata={"runtime": "v3-langchain", "prompt_version": prompt_version.version},
+            ai_company="OPENAI",
+            model=self._text_check_model_name,
+            prompt_version_id=prompt_version.id,
+        )
 
     def _image_generate(
         self,

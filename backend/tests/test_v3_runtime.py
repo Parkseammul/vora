@@ -21,7 +21,12 @@ from app.models import (
     WorkflowExecution,
     WorkflowExecutionStatus,
 )
-from app.v3_runtime import ContentPlanOutput, TextGenerateOutput, V3NodeExecutor
+from app.v3_runtime import (
+    ContentPlanOutput,
+    TextCheckOutput,
+    TextGenerateOutput,
+    V3NodeExecutor,
+)
 from app.workflow_definitions import workflow_registry
 from app.workflow_engine import WorkflowEngine
 
@@ -61,6 +66,7 @@ TEXT_GENERATE_PROMPT_TEMPLATE = (
     "Message: {core_message}\nSlides: {slide_structure}\n"
     "Rules: {rules_data}\nOriginal input: {input_data}"
 )
+TEXT_CHECK_PROMPT_TEMPLATE = "Slides: {slides}\nRules: {rules_data}\nInput: {input_data}"
 
 
 def _content_plan_model(_: object) -> ContentPlanOutput:
@@ -87,6 +93,22 @@ def _failing_text_generate_model(_: object) -> TextGenerateOutput:
     raise RuntimeError("TEXT_GENERATE model unavailable")
 
 
+def _text_check_model(_: object) -> TextCheckOutput:
+    return TextCheckOutput(passed=True, violations=[], feedback=None)
+
+
+def _failed_text_check_model(_: object) -> TextCheckOutput:
+    return TextCheckOutput(
+        passed=False,
+        violations=["Forbidden word used"],
+        feedback="Remove the forbidden word.",
+    )
+
+
+def _failing_text_check_model(_: object) -> TextCheckOutput:
+    raise RuntimeError("TEXT_CHECK model unavailable")
+
+
 def _v3_input_contract(session: Session, execution: WorkflowExecution) -> None:
     rules = RulesVersion(version=1, rules_data={"tone": "clear"})
     content_plan_prompt = PromptVersion(
@@ -95,7 +117,10 @@ def _v3_input_contract(session: Session, execution: WorkflowExecution) -> None:
     text_generate_prompt = PromptVersion(
         node_type="TEXT_GENERATE", version=1, prompt_template=TEXT_GENERATE_PROMPT_TEMPLATE
     )
-    session.add_all([rules, content_plan_prompt, text_generate_prompt])
+    text_check_prompt = PromptVersion(
+        node_type="TEXT_CHECK", version=1, prompt_template=TEXT_CHECK_PROMPT_TEMPLATE
+    )
+    session.add_all([rules, content_plan_prompt, text_generate_prompt, text_check_prompt])
     session.flush()
     source_asset = FileAsset(
         workflow_execution_id=execution.id,
@@ -134,6 +159,8 @@ def test_v3_chain_reaches_human_approval_with_runnable_attempts(session: Session
             content_plan_model_name="test-content-plan-model",
             text_generate_model=RunnableLambda(_text_generate_model),
             text_generate_model_name="test-text-generate-model",
+            text_check_model=RunnableLambda(_text_check_model),
+            text_check_model_name="test-text-check-model",
         ),
     )
 
@@ -170,6 +197,9 @@ def test_v3_chain_reaches_human_approval_with_runnable_attempts(session: Session
     assert attempts[1].prompt_version_id is not None
     assert attempts[1].ai_company == "OPENAI"
     assert attempts[1].model == "test-text-generate-model"
+    assert attempts[2].prompt_version_id is not None
+    assert attempts[2].ai_company == "OPENAI"
+    assert attempts[2].model == "test-text-check-model"
 
 
 def test_v3_chain_failure_marks_attempt_node_and_workflow_failed(session: Session) -> None:
@@ -349,6 +379,121 @@ def test_v3_text_generate_model_failure_marks_attempt_node_and_workflow_failed(
     assert text_generate.status is NodeExecutionStatus.FAILED
     attempt = session.scalar(
         select(NodeExecutionAttempt).where(NodeExecutionAttempt.node_execution_id == text_generate.id)
+    )
+    assert attempt is not None
+    assert attempt.status is NodeExecutionAttemptStatus.FAILED
+
+
+def test_v3_text_check_persists_passed_result_and_attempt_provenance(session: Session) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    engine_instance = WorkflowEngine(
+        session,
+        workflow_registry,
+        V3NodeExecutor(
+            session=session,
+            fail_node="IMAGE_GENERATE",
+            content_plan_model=RunnableLambda(_content_plan_model),
+            text_generate_model=RunnableLambda(_text_generate_model),
+            text_check_model=RunnableLambda(_text_check_model),
+            text_check_model_name="test-text-check-model",
+        ),
+    )
+
+    status = engine_instance.start_execution(execution.id, {"request_text": "ignored"})
+
+    assert status is WorkflowExecutionStatus.FAILED
+    text_check = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "TEXT_CHECK",
+        )
+    )
+    assert text_check is not None
+    assert text_check.output_data == {
+        "slides": [
+            {"slide_no": 1, "text": "Headline"},
+            {"slide_no": 2, "text": "Supporting copy"},
+        ],
+        "passed": True,
+        "violations": [],
+        "feedback": None,
+    }
+    attempt = session.scalar(
+        select(NodeExecutionAttempt).where(NodeExecutionAttempt.node_execution_id == text_check.id)
+    )
+    assert attempt is not None
+    assert attempt.status is NodeExecutionAttemptStatus.SUCCEEDED
+    assert attempt.prompt_version_id is not None
+    assert attempt.ai_company == "OPENAI"
+    assert attempt.model == "test-text-check-model"
+
+
+def test_v3_text_check_failed_review_is_a_successful_node_execution(session: Session) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    engine_instance = WorkflowEngine(
+        session,
+        workflow_registry,
+        V3NodeExecutor(
+            session=session,
+            fail_node="IMAGE_GENERATE",
+            content_plan_model=RunnableLambda(_content_plan_model),
+            text_generate_model=RunnableLambda(_text_generate_model),
+            text_check_model=RunnableLambda(_failed_text_check_model),
+        ),
+    )
+
+    status = engine_instance.start_execution(execution.id, {"request_text": "ignored"})
+
+    assert status is WorkflowExecutionStatus.FAILED
+    text_check = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "TEXT_CHECK",
+        )
+    )
+    assert text_check is not None
+    assert text_check.status is NodeExecutionStatus.SUCCEEDED
+    assert text_check.output_data is not None
+    assert text_check.output_data["passed"] is False
+    assert text_check.output_data["violations"] == ["Forbidden word used"]
+    attempt = session.scalar(
+        select(NodeExecutionAttempt).where(NodeExecutionAttempt.node_execution_id == text_check.id)
+    )
+    assert attempt is not None
+    assert attempt.status is NodeExecutionAttemptStatus.SUCCEEDED
+
+
+def test_v3_text_check_model_failure_marks_attempt_node_and_workflow_failed(
+    session: Session,
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    engine_instance = WorkflowEngine(
+        session,
+        workflow_registry,
+        V3NodeExecutor(
+            session=session,
+            content_plan_model=RunnableLambda(_content_plan_model),
+            text_generate_model=RunnableLambda(_text_generate_model),
+            text_check_model=RunnableLambda(_failing_text_check_model),
+        ),
+    )
+
+    status = engine_instance.start_execution(execution.id, {"request_text": "ignored"})
+
+    assert status is WorkflowExecutionStatus.FAILED
+    text_check = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "TEXT_CHECK",
+        )
+    )
+    assert text_check is not None
+    assert text_check.status is NodeExecutionStatus.FAILED
+    attempt = session.scalar(
+        select(NodeExecutionAttempt).where(NodeExecutionAttempt.node_execution_id == text_check.id)
     )
     assert attempt is not None
     assert attempt.status is NodeExecutionAttemptStatus.FAILED

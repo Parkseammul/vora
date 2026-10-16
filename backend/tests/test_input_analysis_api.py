@@ -33,7 +33,7 @@ from app.models import (
     WorkflowExecution,
     WorkflowExecutionStatus,
 )
-from app.v3_runtime import ContentPlanOutput, TextGenerateOutput
+from app.v3_runtime import ContentPlanOutput, TextCheckOutput, TextGenerateOutput
 from app.workflow_execution_service import DEV_USER_EMAIL
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
@@ -137,6 +137,14 @@ def client(
                 prompt_template="{core_message} {slide_structure} {rules_data} {input_data}",
             )
         )
+    if session.scalar(select(PromptVersion).where(PromptVersion.node_type == "TEXT_CHECK")) is None:
+        session.add(
+            PromptVersion(
+                node_type="TEXT_CHECK",
+                version=1,
+                prompt_template="{slides} {rules_data} {input_data}",
+            )
+        )
     session.commit()
 
     def get_test_session() -> Iterator[Session]:
@@ -149,6 +157,13 @@ def client(
         "get_content_plan_chat_model",
         lambda: RunnableLambda(
             lambda _: ContentPlanOutput(core_message="message", slide_structure=["hook"])
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "get_text_check_chat_model",
+        lambda: RunnableLambda(
+            lambda _: TextCheckOutput(passed=True, violations=[], feedback=None)
         ),
     )
     monkeypatch.setattr(
