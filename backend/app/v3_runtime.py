@@ -1,23 +1,50 @@
-"""Small V3 fake node runtime used until provider-backed nodes are connected."""
+"""V3 node runtime; only CONTENT_PLAN currently uses a provider-backed LangChain path."""
 
+import json
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, cast
 
-from langchain_core.runnables import RunnableLambda
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import Runnable, RunnableLambda
+from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import AssetType, FileAsset
-from app.node_executors import NodeExecutionResult
+from app.models import (
+    AssetType,
+    ExecutionInputSnapshot,
+    FileAsset,
+    PromptVersion,
+    RulesVersion,
+)
+from app.node_executors import NodeExecutionResult, NodeExecutorConfigurationError
+
+
+class ContentPlanOutput(BaseModel):
+    """The structured response required from the CONTENT_PLAN chat model."""
+
+    core_message: str
+    slide_structure: list[str] = Field(min_length=1)
 
 
 class V3NodeExecutor:
-    """Runs the V3 AI nodes through deterministic Runnable pipelines."""
+    """Runs V3 nodes, with an injected real ChatModel for CONTENT_PLAN."""
 
-    def __init__(self, session: Session | None = None, fail_node: str | None = None) -> None:
+    def __init__(
+        self,
+        session: Session | None = None,
+        fail_node: str | None = None,
+        content_plan_model: BaseChatModel | Runnable[dict[str, Any], ContentPlanOutput] | None = None,
+        content_plan_model_name: str | None = None,
+        content_plan_model_factory: Callable[[], BaseChatModel] | None = None,
+    ) -> None:
         self._session = session
         self._fail_node = fail_node
+        self._content_plan_model = content_plan_model
+        self._content_plan_model_name = content_plan_model_name
+        self._content_plan_model_factory = content_plan_model_factory
         self._runnables = {
-            "CONTENT_PLAN": RunnableLambda(self._content_plan),
             "TEXT_GENERATE": RunnableLambda(self._text_generate),
             "TEXT_CHECK": RunnableLambda(self._text_check),
             "IMAGE_CHECK": RunnableLambda(self._image_check),
@@ -33,6 +60,8 @@ class V3NodeExecutor:
         video_progress_callback: Callable[[str, str], None] | None = None,
     ) -> NodeExecutionResult | dict[str, Any]:
         del video_progress_callback
+        if node_key == "CONTENT_PLAN":
+            return self._content_plan(dict(input_data), workflow_execution_id)
         if node_key == "IMAGE_GENERATE":
             return self._image_generate(dict(input_data), workflow_execution_id, node_execution_id)
         if node_key == "HUMAN_APPROVAL":
@@ -47,9 +76,67 @@ class V3NodeExecutor:
             attempt_metadata={"runtime": "v3-fake-runnable"},
         )
 
-    @staticmethod
-    def _content_plan(_: dict[str, Any]) -> dict[str, Any]:
-        return {"slides": [{"slide_no": 1, "purpose": "hook"}, {"slide_no": 2, "purpose": "message"}]}
+    def _content_plan(
+        self, input_data: dict[str, Any], workflow_execution_id: int | None
+    ) -> NodeExecutionResult:
+        if self._session is None or workflow_execution_id is None:
+            raise NodeExecutorConfigurationError("CONTENT_PLAN requires session and workflow execution")
+        content_plan_model = self._content_plan_model
+        if content_plan_model is None and self._content_plan_model_factory is not None:
+            # Defer provider construction until the CONTENT_PLAN execution boundary.
+            content_plan_model = self._content_plan_model_factory()
+        if content_plan_model is None:
+            raise NodeExecutorConfigurationError("CONTENT_PLAN chat model is not configured")
+
+        prompt_version = self._session.scalar(
+            select(PromptVersion)
+            .where(PromptVersion.node_type == "CONTENT_PLAN")
+            .order_by(PromptVersion.version.desc())
+            .limit(1)
+        )
+        if prompt_version is None:
+            raise NodeExecutorConfigurationError("No PromptVersion is configured for CONTENT_PLAN")
+        snapshot = self._session.scalar(
+            select(ExecutionInputSnapshot).where(
+                ExecutionInputSnapshot.workflow_execution_id == workflow_execution_id
+            )
+        )
+        if snapshot is None:
+            raise NodeExecutorConfigurationError("CONTENT_PLAN input snapshot does not exist")
+        rules = self._session.get(RulesVersion, snapshot.rules_version_id)
+        if rules is None:
+            raise NodeExecutorConfigurationError("CONTENT_PLAN rules version does not exist")
+
+        prompt = PromptTemplate.from_template(prompt_version.prompt_template)
+        chain_input = {
+            "request_text": snapshot.request_text,
+            "marketing_info": snapshot.marketing_info,
+            "theme": snapshot.theme or "",
+            "rules_data": json.dumps(rules.rules_data, ensure_ascii=False),
+            "input_data": json.dumps(input_data, ensure_ascii=False),
+        }
+        structured_model: Runnable[Any, Any]
+        if isinstance(content_plan_model, BaseChatModel):
+            structured_model = cast(
+                Runnable[Any, Any],
+                content_plan_model.with_structured_output(ContentPlanOutput),
+            )
+        else:
+            structured_model = cast(Runnable[Any, Any], content_plan_model)
+        result = ContentPlanOutput.model_validate((prompt | structured_model).invoke(chain_input))
+        output_data = result.model_dump(mode="json")
+        # TEXT_GENERATE already consumes slides; retain that downstream contract.
+        output_data["slides"] = [
+            {"slide_no": index, "purpose": purpose}
+            for index, purpose in enumerate(result.slide_structure, start=1)
+        ]
+        return NodeExecutionResult(
+            output_data=output_data,
+            attempt_metadata={"runtime": "v3-langchain", "prompt_version": prompt_version.version},
+            ai_company="OPENAI",
+            model=self._content_plan_model_name,
+            prompt_version_id=prompt_version.id,
+        )
 
     @staticmethod
     def _text_generate(input_data: dict[str, Any]) -> dict[str, Any]:
