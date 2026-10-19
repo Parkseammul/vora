@@ -22,6 +22,7 @@ pytest
 httpx
 langchain-core
 langchain-openai
+openai
 boto3
 mcp==2.2.0
 ruff

@@ -136,22 +136,13 @@ def test_delivery_unknown_stops_after_one_attempt() -> None:
 
     session.get.side_effect = get
     publisher = Mock()
-    publisher.publish.side_effect = SocialProviderError(
-        "YouTube upload result is unknown after transport error (ReadTimeout)",
-        code="delivery_unknown",
-    )
     events = Mock()
     service = PublicationService(session, Mock(), events, lambda _platform: publisher)
 
     service.execute(111)
 
-    assert publisher.publish.call_count == 1
-    assert publication.status is SocialPublicationStatus.FAILED
-    assert publication.error_message.startswith("YouTube upload result is unknown")
-    attempts = [
-        call.args[0]
-        for call in session.add.call_args_list
-        if call.args and call.args[0].__class__.__name__ == "SocialPublicationAttempt"
-    ]
-    assert len(attempts) == 1
-    assert attempts[0].error_code == "delivery_unknown"
+    # V3 stores a Carousel intent only. No legacy YouTube/Reels provider can
+    # consume its image list, so the worker must not change PENDING state.
+    publisher.publish.assert_not_called()
+    assert publication.status is SocialPublicationStatus.PENDING
+    session.add.assert_not_called()

@@ -4,15 +4,18 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from secrets import token_urlsafe
+from typing import Literal
 from urllib.parse import urlencode, urlsplit
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, SecretStr, field_validator
+from pydantic import BaseModel, SecretStr, field_validator, model_validator
 
 # SQL 문자열을 안전하게 실행하기 위한 SQLAlchemy 함수
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.celery_app import celery_app
@@ -22,10 +25,12 @@ from app.content_planning import ContentPlanningService
 # database.py에서 만든 PostgreSQL 연결 Engine 가져오기
 from app.database import engine
 from app.e2e_providers import (
+    DeterministicE2EImageProvider,
     DeterministicE2ELLMProvider,
     FFmpegE2ETTSProvider,
     FFmpegE2EVideoProvider,
 )
+from app.image_provider import OpenAIImageProvider
 from app.llm_provider import LLMProvider, LLMProviderType, MultiVendorLLMProvider
 from app.media_providers import (
     ElevenLabsHTTPClient,
@@ -54,7 +59,7 @@ from app.models import (
 from app.node_executors import RuleBasedNodeExecutor
 from app.openai_client import OpenAIStructuredClient
 from app.publication import PublicationDraft, RedisPublicationEvents
-from app.publication_runtime import get_publication_service
+from app.publication_runtime import get_publication_service, get_storage_provider
 from app.revision_impact import CoreNodeKey, RevisionImpactService
 from app.script_generation import ScriptGenerationService
 from app.social_providers import (
@@ -64,7 +69,7 @@ from app.social_providers import (
     YouTubeProvider,
     platform_from_string,
 )
-from app.v3_runtime import V3NodeExecutor
+from app.v3_runtime import ImageCheckOutput, V3NodeExecutor
 from app.video_async import (
     CeleryVideoTaskDispatcher,
     RedisVideoProgressEvents,
@@ -104,6 +109,21 @@ class RevisionRequest(BaseModel):
 
 class ApprovalRequest(BaseModel):
     node_execution_id: int
+    decision: ApprovalDecision = ApprovalDecision.APPROVED
+    revision_target: Literal["IMAGE"] | None = None
+    revision_request: str | None = None
+
+    @model_validator(mode="after")
+    def rejected_image_revision_must_be_complete(self) -> "ApprovalRequest":
+        if self.decision is ApprovalDecision.REJECTED and (
+            self.revision_target != "IMAGE"
+            or self.revision_request is None
+            or not self.revision_request.strip()
+        ):
+            raise ValueError(
+                "REJECTED requires revision_target=IMAGE and a non-blank revision_request"
+            )
+        return self
 
 
 class PublishRequest(BaseModel):
@@ -247,10 +267,34 @@ def get_text_check_chat_model() -> ChatOpenAI:
     )
 
 
+def get_image_check_chat_model() -> ChatOpenAI:
+    """Build the Vision-capable model only when IMAGE_CHECK executes."""
+    return ChatOpenAI(
+        model=settings.script_generation_model,
+        api_key=SecretStr(settings.openai_api_key) if settings.openai_api_key else None,
+    )
+
+
 def get_workflow_engine(
     session: Session, services: AIWorkflowServices, workflow_version: int = 1
 ) -> WorkflowEngine:
     if workflow_version == 3:
+        image_provider = (
+            DeterministicE2EImageProvider()
+            if settings.e2e_fake_providers
+            else (
+                OpenAIImageProvider(settings.openai_api_key, settings.image_generation_model)
+                if settings.openai_api_key
+                else None
+            )
+        )
+        image_check_model: Runnable[dict[str, object], ImageCheckOutput] | None = (
+            RunnableLambda(
+                lambda _: ImageCheckOutput(passed=True, violations=[], feedback=None)
+            )
+            if settings.e2e_fake_providers
+            else None
+        )
         return WorkflowEngine(
             session,
             workflow_registry,
@@ -262,6 +306,14 @@ def get_workflow_engine(
                 text_generate_model_name=settings.script_generation_model,
                 text_check_model_factory=get_text_check_chat_model,
                 text_check_model_name=settings.script_generation_model,
+                image_provider=image_provider,
+                image_model_name=settings.image_generation_model,
+                storage=get_storage_provider(),
+                image_check_model=image_check_model,
+                image_check_model_factory=(
+                    None if settings.e2e_fake_providers else get_image_check_chat_model
+                ),
+                image_check_model_name=settings.script_generation_model,
             ),
         )
     return WorkflowEngine(
@@ -770,17 +822,44 @@ def approve_workflow_node(
         or node.status is not NodeExecutionStatus.WAITING
     ):
         raise HTTPException(status_code=422, detail="Node is not waiting for approval")
+    latest_waiting_node = session.scalar(
+        select(NodeExecution)
+        .where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.status == NodeExecutionStatus.WAITING,
+        )
+        .order_by(NodeExecution.revision_no.desc(), NodeExecution.id.desc())
+        .limit(1)
+    )
+    if latest_waiting_node is None or latest_waiting_node.id != node.id:
+        raise HTTPException(status_code=422, detail="Node is not the latest approval request")
     if session.scalar(select(UserApproval).where(UserApproval.node_execution_id == node.id)) is not None:
         raise HTTPException(status_code=422, detail="Node already has a user decision")
+    if request.decision is ApprovalDecision.APPROVED:
+        _ensure_v3_image_check_passed(session, execution, node)
 
     session.add(
         UserApproval(
             workflow_execution_id=execution.id,
             node_execution_id=node.id,
-            decision=ApprovalDecision.APPROVED,
+            decision=request.decision,
         )
     )
-    session.commit()
+    if request.decision is ApprovalDecision.REJECTED:
+        try:
+            status = get_workflow_engine(
+                session, get_ai_workflow_services(session)
+            ).start_rejected_image_revision(execution.id, request.revision_request or "")
+        except (IntegrityError, ValueError) as exc:
+            session.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"workflow_execution_id": execution.id, "status": status.value}
+
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=422, detail="Node already has a user decision") from exc
     try:
         status = get_workflow_engine(session, get_ai_workflow_services(session)).resume_after_approval(
             execution.id
@@ -788,6 +867,31 @@ def approve_workflow_node(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"workflow_execution_id": execution.id, "status": status.value}
+
+
+def _ensure_v3_image_check_passed(
+    session: Session, execution: WorkflowExecution, approval_node: NodeExecution
+) -> None:
+    if execution.workflow_version != 3 or approval_node.node_type != "HUMAN_APPROVAL":
+        return
+    image_check = session.scalar(
+        select(NodeExecution)
+        .where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "IMAGE_CHECK",
+            NodeExecution.revision_no == approval_node.revision_no,
+            NodeExecution.status == NodeExecutionStatus.SUCCEEDED,
+        )
+        .order_by(NodeExecution.id.desc())
+        .limit(1)
+    )
+    output_data = image_check.output_data if image_check is not None else None
+    if output_data is None or output_data.get("passed") is not True:
+        feedback = output_data.get("feedback") if output_data else None
+        detail = "IMAGE_CHECK must pass before approval"
+        if isinstance(feedback, str) and feedback:
+            detail = f"{detail}: {feedback}"
+        raise HTTPException(status_code=422, detail=detail)
 
 
 @app.post("/workflow-executions/{workflow_execution_id}/retry")

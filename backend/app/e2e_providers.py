@@ -19,6 +19,21 @@ from app.video_generation import GeneratedSceneVideo, GeneratedSpeech
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
 
 
+class DeterministicE2EImageProvider:
+    """Offline image provider for E2E runs; production never uses this adapter."""
+
+    _PNG = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0dIDAT\x08\xd7c\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99\x1d\x1d\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    def generate(self, *, prompt: str, source_image: Path) -> bytes:
+        del prompt
+        if not source_image.is_file():
+            raise FileNotFoundError("E2E source image was not found")
+        return self._PNG
+
+
 class DeterministicE2ELLMProvider:
     """Produces contract-valid, local data without sending a request to an LLM vendor."""
 

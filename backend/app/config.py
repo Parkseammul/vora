@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     revision_impact_model: str = "gpt-4o-mini"
     publication_copy_model: str = "gpt-4o-mini"
     openai_api_key: str | None = None
+    image_generation_model: str = "gpt-image-2.5-sunburst"
     fixed_bgm_asset_id: int | None = None
     uploads_root: Path = Path("uploads")
     runway_api_key: str | None = None

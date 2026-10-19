@@ -21,6 +21,8 @@ def test_s3_storage_uploads_without_public_acl_and_generates_presigned_url(
 
     storage = S3StorageProvider("private-bucket", "ap-northeast-2")
     storage.upload_private("final/asset.mp4", source, "video/mp4")
+    destination = tmp_path / "source.png"
+    storage.materialize_private("source/asset.png", destination)
     url = storage.presigned_get_url("final/asset.mp4", 900)
 
     client.upload_file.assert_called_once_with(
@@ -33,6 +35,9 @@ def test_s3_storage_uploads_without_public_acl_and_generates_presigned_url(
         "get_object",
         Params={"Bucket": "private-bucket", "Key": "final/asset.mp4"},
         ExpiresIn=900,
+    )
+    client.download_file.assert_called_once_with(
+        "private-bucket", "source/asset.png", str(destination)
     )
     assert url == "https://example.test/presigned"
     boto3_client.assert_called_once()
@@ -48,6 +53,8 @@ def test_local_storage_behavior_is_unchanged(tmp_path: Path) -> None:
     storage = LocalStorageProvider(tmp_path)
 
     storage.upload_private("final.mp4", source, "video/mp4")
+    storage.materialize_private("final.mp4", tmp_path / "copy.mp4")
 
     assert storage.local_path("final.mp4") == source
     assert storage.local_path("../outside.mp4") is None
+    assert (tmp_path / "copy.mp4").read_bytes() == b"video"
