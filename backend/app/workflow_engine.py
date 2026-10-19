@@ -137,6 +137,105 @@ class WorkflowEngine:
             next_revision_no,
         )
 
+    def start_rejected_image_revision(
+        self, workflow_execution_id: int, revision_request: str
+    ) -> WorkflowExecutionStatus:
+        """Durably prepare an IMAGE_GENERATE revision before invoking external AI."""
+        try:
+            if not revision_request.strip():
+                raise ValueError("revision_request must not be blank")
+            execution = self._get_execution(workflow_execution_id)
+            if execution.status is not WorkflowExecutionStatus.WAITING_APPROVAL:
+                raise ValueError("Only a WAITING_APPROVAL workflow execution can be revised")
+            definition = self._definition_for(execution)
+            target_node_key = "IMAGE_GENERATE"
+            definition.node(target_node_key)
+            waiting_node = self._latest_waiting_node(execution.id)
+            if waiting_node is None:
+                raise ValueError("No node execution is waiting for approval")
+            revision_input = self._revision_input(
+                execution, definition, target_node_key, revision_request
+            )
+            revision_no = self._next_revision_no(execution.id)
+            started_at = self._now()
+            node_execution = NodeExecution(
+                workflow_execution_id=execution.id,
+                node_type=target_node_key,
+                revision_no=revision_no,
+                input_data=revision_input,
+                status=NodeExecutionStatus.RUNNING,
+                started_at=started_at,
+            )
+            self._session.add(node_execution)
+            self._session.flush()
+            attempt = NodeExecutionAttempt(
+                node_execution_id=node_execution.id,
+                attempt_no=1,
+                status=NodeExecutionAttemptStatus.RUNNING,
+                started_at=started_at,
+                metadata_={"retry_kind": "USER_REQUESTED"},
+            )
+            self._session.add(attempt)
+            execution.status = WorkflowExecutionStatus.RUNNING
+            execution.current_node_type = target_node_key
+            execution.completed_at = None
+            # Commit user rejection, revision intent, node, and attempt before external work.
+            self._session.commit()
+        except Exception:
+            self._session.rollback()
+            raise
+        return self._execute_prepared_node(execution, definition, node_execution, attempt)
+
+    def recover_prepared_revision(
+        self, workflow_execution_id: int, *, force: bool = False
+    ) -> WorkflowExecutionStatus:
+        """Resume a committed-but-unfinished revision after a process restart."""
+        execution = self._session.scalar(
+            select(WorkflowExecution)
+            .where(WorkflowExecution.id == workflow_execution_id)
+            .with_for_update(skip_locked=True)
+        )
+        if execution is None:
+            raise ValueError("Workflow execution is unavailable or another recovery is in progress")
+        if execution.status is not WorkflowExecutionStatus.RUNNING:
+            raise ValueError("Workflow execution is not running")
+        node_execution = self._session.scalar(
+            select(NodeExecution)
+            .where(
+                NodeExecution.workflow_execution_id == execution.id,
+                NodeExecution.status == NodeExecutionStatus.RUNNING,
+            )
+            .order_by(NodeExecution.revision_no.desc(), NodeExecution.id.desc())
+            .limit(1)
+        )
+        if node_execution is None:
+            raise ValueError("No prepared revision node is available")
+        attempt = self._session.scalar(
+            select(NodeExecutionAttempt)
+            .where(
+                NodeExecutionAttempt.node_execution_id == node_execution.id,
+                NodeExecutionAttempt.status == NodeExecutionAttemptStatus.RUNNING,
+            )
+            .order_by(NodeExecutionAttempt.attempt_no.desc())
+            .limit(1)
+        )
+        if attempt is None:
+            raise ValueError("Prepared revision node has no running attempt")
+        if attempt.metadata_.get("manual_recovery_claimed_at") and not force:
+            raise ValueError(
+                "Prepared revision is already claimed for manual recovery; verify it is not running"
+            )
+        # Claim is committed before provider execution. It prevents a second operator from
+        # invoking the same RUNNING attempt, without holding a DB transaction during AI work.
+        attempt.metadata_ = {
+            **attempt.metadata_,
+            "manual_recovery_claimed_at": self._now().isoformat(),
+        }
+        self._session.commit()
+        return self._execute_prepared_node(
+            execution, self._definition_for(execution), node_execution, attempt
+        )
+
     def retry_failed_execution(self, workflow_execution_id: int) -> WorkflowExecutionStatus:
         """Retries the latest failed node without creating a user revision version."""
         execution = self._get_execution(workflow_execution_id)
@@ -250,6 +349,9 @@ class WorkflowEngine:
             execution.current_node_type = node_execution.node_type
             node_execution.started_at = started_at
             if node_definition.requires_approval and not node_definition.creates_attempt:
+                # HUMAN_APPROVAL has no executor. Preserve the verified upstream
+                # result so the approved PUBLICATION node can consume it later.
+                node_execution.output_data = current_input
                 node_execution.status = NodeExecutionStatus.WAITING
                 execution.status = WorkflowExecutionStatus.WAITING_APPROVAL
                 execution.current_node_type = node_execution.node_type
@@ -318,6 +420,70 @@ class WorkflowEngine:
         execution.completed_at = self._now()
         self._session.commit()
         return execution.status
+
+    def _execute_prepared_node(
+        self,
+        execution: WorkflowExecution,
+        definition: WorkflowDefinition,
+        node_execution: NodeExecution,
+        attempt: NodeExecutionAttempt,
+    ) -> WorkflowExecutionStatus:
+        """Execute an already-committed node intent without opening a long DB transaction."""
+        node_definition = definition.node(node_execution.node_type)
+        try:
+            execution_result = self._executor.execute(
+                node_execution.node_type,
+                node_execution.input_data,
+                workflow_execution_id=execution.id,
+                node_execution_id=node_execution.id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            finished_at = self._now()
+            attempt.status = NodeExecutionAttemptStatus.FAILED
+            attempt.error_message = str(exc)
+            attempt.completed_at = finished_at
+            node_execution.status = NodeExecutionStatus.FAILED
+            node_execution.completed_at = finished_at
+            execution.status = WorkflowExecutionStatus.FAILED
+            execution.current_node_type = None
+            execution.completed_at = finished_at
+            self._session.commit()
+            return execution.status
+
+        finished_at = self._now()
+        attempt.status = NodeExecutionAttemptStatus.SUCCEEDED
+        attempt.completed_at = finished_at
+        if isinstance(execution_result, NodeExecutionResult):
+            output_data = execution_result.output_data
+            attempt.metadata_ = {**attempt.metadata_, **execution_result.attempt_metadata}
+            self._record_attempt_execution_details(attempt, execution_result)
+        else:
+            output_data = execution_result
+        node_execution.output_data = output_data
+        node_execution.completed_at = finished_at
+        if node_definition.requires_approval:
+            node_execution.status = NodeExecutionStatus.WAITING
+            execution.status = WorkflowExecutionStatus.WAITING_APPROVAL
+            execution.current_node_type = node_execution.node_type
+            self._session.commit()
+            return execution.status
+
+        node_execution.status = NodeExecutionStatus.SUCCEEDED
+        self._session.commit()
+        next_node_key = definition.next_node_key(node_execution.node_type)
+        if next_node_key is None:
+            execution.status = WorkflowExecutionStatus.SUCCEEDED
+            execution.current_node_type = None
+            execution.completed_at = self._now()
+            self._session.commit()
+            return execution.status
+        return self._run_nodes(
+            execution,
+            definition,
+            next_node_key,
+            output_data,
+            node_execution.revision_no,
+        )
 
     @staticmethod
     def _record_attempt_execution_details(

@@ -1,7 +1,6 @@
 """Composition root for publication workers; it does not involve WorkflowEngine."""
 
 from pathlib import Path
-from urllib.parse import urlparse
 
 from sqlalchemy.orm import Session
 
@@ -36,44 +35,28 @@ class RuntimePublisher:
         self._platform, self._storage, self._session = platform, storage, session
 
     def publish(self, connection, asset, publication, attempt, persist_progress) -> PublishedPost:  # type: ignore[no-untyped-def]
-        local_path = (Path(settings.uploads_root) / asset.storage_key).resolve()
+        del attempt, persist_progress
+        # Kept only for the legacy video worker contract. V3 PublicationService
+        # rejects YOUTUBE before this boundary and never calls a provider.
         if self._platform is SocialPlatform.YOUTUBE:
             provider = YouTubeProvider(
-                settings.youtube_client_id, settings.youtube_client_secret, settings.youtube_redirect_uri
+                settings.youtube_client_id,
+                settings.youtube_client_secret,
+                settings.youtube_redirect_uri,
             )
-            access_token = YouTubeTokenService(self._session, provider).valid_access_token(connection.id)
-            return provider.publish(access_token, str(local_path), publication.youtube_title or "VORA video", publication.youtube_description or "")
-        # Instagram receives only a short-lived S3 URL; source video remains private.
-        if self._storage is None:
-            raise SocialProviderError("Instagram publishing requires S3 storage", code="configuration")
-        if asset.mime_type != "video/mp4":
-            raise SocialProviderError("Instagram Reels publishing requires video/mp4", code="invalid_video")
-        if not local_path.is_file() or local_path.stat().st_size > 1_000_000_000:
-            raise SocialProviderError(
-                "Instagram Reels video file is unavailable or exceeds 1 GB", code="invalid_video"
+            access_token = YouTubeTokenService(self._session, provider).valid_access_token(
+                connection.id
             )
-        if settings.instagram_presigned_url_ttl_seconds <= 0:
-            raise SocialProviderError("Instagram Reels presigned URL TTL must be positive", code="configuration")
-        self._storage.upload_private(asset.storage_key, local_path, asset.mime_type)
-        url = self._storage.presigned_get_url(
-            asset.storage_key, settings.instagram_presigned_url_ttl_seconds
-        )
-        if urlparse(url).scheme != "https":
-            raise SocialProviderError("Instagram Reels requires an HTTPS video URL", code="configuration")
-        return InstagramProvider(
-            settings.instagram_client_id,
-            settings.instagram_client_secret,
-            settings.instagram_redirect_uri,
-            settings.instagram_graph_api_version,
-            settings.instagram_container_poll_interval_seconds,
-            settings.instagram_container_poll_max_attempts,
-        ).publish(
-            connection.access_token,
-            connection.external_account_id,
-            url,
-            publication.instagram_caption or "",
-            attempt.metadata_,
-            persist_progress,
+            local_path = (Path(settings.uploads_root) / asset.storage_key).resolve()
+            return provider.publish(
+                access_token,
+                str(local_path),
+                publication.youtube_title or "VORA video",
+                publication.youtube_description or "",
+            )
+        raise SocialProviderError(
+            "Instagram Carousel provider is not implemented; publication remains PENDING",
+            code="not_implemented",
         )
 
     def reconcile(self, connection, attempt, persist_progress) -> PublishedPost | None:  # type: ignore[no-untyped-def]

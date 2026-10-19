@@ -81,7 +81,12 @@ def uploads_root() -> Iterator[Path]:
 def test_fake_provider_workflow_reaches_final_video_approval_without_http(
     session: Session, monkeypatch: pytest.MonkeyPatch, uploads_root: Path
 ) -> None:
-    assert main.settings.e2e_fake_providers is True
+    # This test owns its offline bootstrap instead of depending on a shell
+    # variable left behind by a developer or another test process.
+    previous_llm = getattr(main.app.state, "llm_provider", None)
+    previous_media = getattr(main.app.state, "media_providers", None)
+    monkeypatch.setattr(main.settings, "e2e_fake_providers", True)
+    main._configure_default_providers()
     assert isinstance(main.get_llm_provider(), DeterministicE2ELLMProvider)
     media = main.app.state.media_providers
     assert isinstance(media[0], FFmpegE2EVideoProvider)
@@ -101,6 +106,8 @@ def test_fake_provider_workflow_reaches_final_video_approval_without_http(
     if user is None:
         session.add(User(email=DEV_USER_EMAIL, name="VORA Dev"))
         session.commit()
+        user = session.scalar(select(User).where(User.email == DEV_USER_EMAIL))
+    assert user is not None
 
     def get_test_session() -> Iterator[Session]:
         yield session
@@ -108,24 +115,45 @@ def test_fake_provider_workflow_reaches_final_video_approval_without_http(
     main.app.dependency_overrides[main.get_session] = get_test_session
     try:
         with TestClient(main.app) as client:
-            created = client.post("/workflow-executions", data={"request_text": "제품 소개 영상"})
-            assert created.status_code == 200
-            execution_id = created.json()["workflow_execution_id"]
-
-            execution = session.get(WorkflowExecution, execution_id)
+            # The public creation API is V3 and requires a source image. This
+            # test covers the retained V1 approval-to-video workflow directly.
+            execution = WorkflowExecution(
+                user_id=user.id,
+                workflow_key="vora_content_creation",
+                workflow_version=1,
+            )
+            session.add(execution)
+            session.flush()
+            source_asset = FileAsset(
+                workflow_execution_id=execution.id,
+                created_by_node_execution_id=None,
+                asset_type=AssetType.IMAGE,
+                storage_key=f"inputs/{execution.id}/source.png",
+                file_name="source.png",
+                mime_type="image/png",
+                file_size=1,
+            )
+            session.add(source_asset)
+            session.commit()
+            services = main.get_ai_workflow_services(session)
+            assert main.get_workflow_engine(session, services).start_execution(
+                execution.id,
+                {"request_text": "offline fake request", "source_asset_id": source_asset.id},
+            ) is WorkflowExecutionStatus.WAITING_APPROVAL
+            execution_id = execution.id
             snapshot = session.scalar(
                 select(ExecutionInputSnapshot).where(
                     ExecutionInputSnapshot.workflow_execution_id == execution_id
                 )
             )
-            assert execution is not None and snapshot is not None
+            assert snapshot is None
             content_plan = _node(session, execution_id, "content_planning")
             assert execution.status is WorkflowExecutionStatus.WAITING_APPROVAL
-            assert content_plan.status is NodeExecutionStatus.WAITING_APPROVAL
+            assert content_plan.status is NodeExecutionStatus.WAITING
 
             bgm = FileAsset(
                 workflow_execution_id=execution_id,
-                execution_input_snapshot_id=snapshot.id,
+                created_by_node_execution_id=None,
                 asset_type=AssetType.AUDIO,
                 storage_key=f"bgm/{uuid4()}.mp3",
                 file_name="fake-bgm.mp3",
@@ -147,7 +175,7 @@ def test_fake_provider_workflow_reaches_final_video_approval_without_http(
             )
             assert script_approval.status_code == 200
             script = _node(session, execution_id, "script_generation")
-            assert script.status is NodeExecutionStatus.WAITING_APPROVAL
+            assert script.status is NodeExecutionStatus.WAITING
 
             video_enqueue = client.post(
                 f"/workflow-executions/{execution_id}/approvals",
@@ -181,8 +209,8 @@ def test_fake_provider_workflow_reaches_final_video_approval_without_http(
             session.refresh(video)
             session.refresh(attempt)
             assert execution.status is WorkflowExecutionStatus.WAITING_APPROVAL
-            assert video.status is NodeExecutionStatus.WAITING_APPROVAL
-            assert attempt.status is NodeExecutionAttemptStatus.SUCCESS
+            assert video.status is NodeExecutionStatus.WAITING
+            assert attempt.status is NodeExecutionAttemptStatus.SUCCEEDED
             assert (uploads_root / "generated" / str(execution_id) / "final_video.mp4").is_file()
             assert dispatcher.stages == [
                 "QUEUED",
@@ -198,22 +226,26 @@ def test_fake_provider_workflow_reaches_final_video_approval_without_http(
             )
             assert final_approval.status_code == 200
             session.refresh(execution)
-            assert execution.status is WorkflowExecutionStatus.SUCCESS
+            assert execution.status is WorkflowExecutionStatus.SUCCEEDED
             assert [node.status for node in _nodes(session, execution_id)] == [
-                NodeExecutionStatus.SUCCESS,
-                NodeExecutionStatus.SUCCESS,
-                NodeExecutionStatus.SUCCESS,
-                NodeExecutionStatus.SUCCESS,
+                NodeExecutionStatus.SUCCEEDED,
+                NodeExecutionStatus.SUCCEEDED,
+                NodeExecutionStatus.SUCCEEDED,
+                NodeExecutionStatus.SUCCEEDED,
             ]
     finally:
         main.app.dependency_overrides.clear()
+        if previous_llm is not None:
+            main.configure_llm_provider(previous_llm)
+        if previous_media is not None:
+            main.configure_media_providers(*previous_media)
 
 
 def _node(session: Session, execution_id: int, key: str) -> NodeExecution:
     node = session.scalar(
         select(NodeExecution).where(
             NodeExecution.workflow_execution_id == execution_id,
-            NodeExecution.node_key == key,
+            NodeExecution.node_type == key,
         )
     )
     assert node is not None

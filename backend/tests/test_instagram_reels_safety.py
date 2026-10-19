@@ -11,6 +11,7 @@ from app.models import (
     SocialPublication,
     SocialPublicationAttemptStatus,
     SocialPublicationStatus,
+    WorkflowExecutionStatus,
 )
 from app.publication import PublicationService
 from app.social_providers import InstagramProvider, PublishedPost, SocialProviderError
@@ -240,20 +241,13 @@ def test_delivery_unknown_stops_publication_after_one_attempt() -> None:
 
     session.get.side_effect = get
     publisher = Mock()
-    publisher.publish.side_effect = SocialProviderError("unknown", code="delivery_unknown")
     service = PublicationService(session, Mock(), Mock(), lambda _platform: publisher)
 
     service.execute(1)
 
-    attempts = [
-        call.args[0]
-        for call in session.add.call_args_list
-        if call.args and call.args[0].__class__.__name__ == "SocialPublicationAttempt"
-    ]
-    assert publisher.publish.call_count == 1
-    assert publication.status is SocialPublicationStatus.FAILED
-    assert len(attempts) == 1
-    assert attempts[0].status is SocialPublicationAttemptStatus.FAILED
+    publisher.publish.assert_not_called()
+    assert publication.status is SocialPublicationStatus.PENDING
+    session.add.assert_not_called()
 
 
 def test_publishing_instagram_attempt_resumes_without_creating_another_attempt() -> None:
@@ -288,40 +282,25 @@ def test_publishing_instagram_attempt_resumes_without_creating_another_attempt()
     session.get.side_effect = get
     session.scalar.return_value = resumed
     publisher = Mock()
-    publisher.publish.return_value = PublishedPost("media-1", "https://instagram.com/reel/1")
     service = PublicationService(session, Mock(), Mock(), lambda _platform: publisher)
 
     service.execute(1)
 
-    publisher.publish.assert_called_once()
-    assert publication.status is SocialPublicationStatus.SUCCESS
-    assert not any(
-        call.args and call.args[0].__class__.__name__ == "SocialPublicationAttempt"
-        for call in session.add.call_args_list
-    )
+    publisher.publish.assert_not_called()
+    assert publication.status is SocialPublicationStatus.PUBLISHING
+    session.add.assert_not_called()
 
 
-def test_unresolved_historical_delivery_blocks_force_republish() -> None:
-    asset = SimpleNamespace(id=847)
-    connection = SimpleNamespace(id=10, platform=SocialPlatform.INSTAGRAM)
-    previous_publication = SimpleNamespace(status=SocialPublicationStatus.FAILED)
-    previous_attempt = SimpleNamespace(metadata_={"instagram_publish_requested_at": "saved"})
+def test_publish_request_requires_a_prepared_publication_node() -> None:
     session = Mock()
-    session.scalar.return_value = connection
-    session.execute.return_value.all.return_value = [(previous_publication, previous_attempt)]
-    publisher = Mock()
-    publisher.reconcile.return_value = None
-    service = PublicationService(session, Mock(), Mock(), lambda _platform: publisher)
-    service._approved_video_asset = Mock(return_value=asset)  # type: ignore[method-assign]
-    execution = SimpleNamespace(user_id=1)
+    session.scalar.return_value = None
+    service = PublicationService(session, Mock(), Mock(), lambda _platform: Mock())
+    execution = SimpleNamespace(id=1, user_id=1, status=WorkflowExecutionStatus.SUCCEEDED)
 
-    with pytest.raises(ValueError, match="unresolved delivery result"):
+    with pytest.raises(ValueError, match="Approved image publication"):
         service.request_publish(
             execution,
             [SocialPlatform.INSTAGRAM],
             SimpleNamespace(youtube_title="title", youtube_description="", instagram_caption="caption"),
             force_republish=True,
         )
-
-    publisher.reconcile.assert_called_once()
-    session.add.assert_not_called()

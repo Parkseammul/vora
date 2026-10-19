@@ -1,5 +1,6 @@
 """Private video storage adapters; database keys never expose local filesystem paths."""
 
+import shutil
 from pathlib import Path
 from typing import Protocol
 
@@ -8,6 +9,8 @@ class StorageProvider(Protocol):
     def local_path(self, storage_key: str) -> Path | None: ...
 
     def upload_private(self, storage_key: str, source: Path, content_type: str) -> None: ...
+
+    def materialize_private(self, storage_key: str, destination: Path) -> None: ...
 
     def presigned_get_url(self, storage_key: str, expires_seconds: int = 3600) -> str: ...
 
@@ -27,9 +30,23 @@ class LocalStorageProvider:
         return candidate if candidate.is_file() else None
 
     def upload_private(self, storage_key: str, source: Path, content_type: str) -> None:
-        # Local generation already owns the canonical file; no duplicate copy is required.
-        if self.local_path(storage_key) is None and not source.is_file():
+        if not source.is_file():
             raise FileNotFoundError("Video file was not found")
+        destination = (self._uploads_root / storage_key).resolve()
+        try:
+            destination.relative_to(self._uploads_root)
+        except ValueError as exc:
+            raise ValueError("Storage key escapes uploads root") from exc
+        if destination != source.resolve():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+
+    def materialize_private(self, storage_key: str, destination: Path) -> None:
+        source = self.local_path(storage_key)
+        if source is None:
+            raise FileNotFoundError("Private storage file was not found")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
 
     def presigned_get_url(self, storage_key: str, expires_seconds: int = 3600) -> str:
         raise RuntimeError("Instagram publishing requires S3 private storage")
@@ -61,6 +78,10 @@ class S3StorageProvider:
         self._client.upload_file(
             str(source), self._bucket, storage_key, ExtraArgs={"ContentType": content_type}
         )
+
+    def materialize_private(self, storage_key: str, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self._client.download_file(self._bucket, storage_key, str(destination))
 
     def presigned_get_url(self, storage_key: str, expires_seconds: int = 3600) -> str:
         return str(

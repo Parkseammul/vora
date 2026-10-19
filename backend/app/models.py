@@ -321,7 +321,7 @@ class SocialPublication(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     node_execution_id: Mapped[int] = mapped_column(
-        ForeignKey("node_executions.id"), nullable=False, unique=True
+        ForeignKey("node_executions.id"), nullable=False
     )
     social_account_connection_id: Mapped[int] = mapped_column(
         ForeignKey("social_account_connections.id"), nullable=False

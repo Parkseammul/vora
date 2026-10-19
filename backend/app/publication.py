@@ -2,19 +2,15 @@
 
 import hashlib
 import json
-import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Protocol
 from uuid import uuid4
 
 from celery import Celery  # type: ignore[import-untyped]
 from redis import Redis
-from redis.exceptions import RedisError
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
-from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import (
     FileAsset,
@@ -24,17 +20,11 @@ from app.models import (
     SocialPlatform,
     SocialPublication,
     SocialPublicationAttempt,
-    SocialPublicationAttemptStatus,
-    SocialPublicationStatus,
-    UserApproval,
     WorkflowExecution,
     WorkflowExecutionStatus,
 )
 from app.publication_copy import PublicationCopyService
-from app.social_providers import PublishedPost, SocialProviderError
-
-MAX_PUBLICATION_ATTEMPTS = 3
-RETRY_DELAY_SECONDS = 3
+from app.social_providers import PublishedPost
 
 
 class PublicationEvents(Protocol):
@@ -110,183 +100,103 @@ class PublicationDraft:
 
 
 class PublicationService:
-    def __init__(self, session: Session, dispatcher: PublicationDispatcher, events: PublicationEvents, publisher_factory: Callable[[SocialPlatform], SocialPublisher], copy_service: PublicationCopyService | None = None) -> None:
-        self._session, self._dispatcher, self._events, self._publisher_factory = session, dispatcher, events, publisher_factory
+    """Creates durable Instagram Carousel intents; this MVP never calls Instagram."""
+
+    def __init__(
+        self,
+        session: Session,
+        dispatcher: PublicationDispatcher,
+        events: PublicationEvents,
+        publisher_factory: Callable[[SocialPlatform], SocialPublisher],
+        copy_service: PublicationCopyService | None = None,
+    ) -> None:
+        self._session = session
+        self._dispatcher = dispatcher
+        self._events = events
+        self._publisher_factory = publisher_factory
         self._copy_service = copy_service
 
     def draft(self, execution: WorkflowExecution) -> PublicationDraft:
-        plan = self._session.scalar(select(NodeExecution).where(NodeExecution.workflow_execution_id == execution.id, NodeExecution.node_type == "content_planning").order_by(NodeExecution.revision_no.desc()))
+        plan = self._latest_node(execution.id, "CONTENT_PLAN")
         planning = plan.output_data if plan and isinstance(plan.output_data, dict) else {}
-        script_node = self._session.scalar(select(NodeExecution).where(NodeExecution.workflow_execution_id == execution.id, NodeExecution.node_type == "script_generation").order_by(NodeExecution.revision_no.desc()))
-        script = script_node.output_data if script_node and isinstance(script_node.output_data, dict) else {}
-        copy = self._copy_service.generate(planning, script) if self._copy_service else PublicationCopyService.fallback(planning)
+        copy = self._copy_service.generate(planning, {}) if self._copy_service else PublicationCopyService.fallback(planning)
         return PublicationDraft(copy.youtube_title, copy.youtube_description, copy.instagram_caption)
 
-    def request_publish(self, execution: WorkflowExecution, platforms: list[SocialPlatform], draft: PublicationDraft, force_republish: bool = False) -> list[SocialPublication]:
-        asset = self._approved_video_asset(execution)
-        publications: list[SocialPublication] = []
-        for platform in platforms:
-            connection = self._session.scalar(select(SocialAccountConnection).where(SocialAccountConnection.user_id == execution.user_id, SocialAccountConnection.platform == platform))
-            if connection is None:
-                raise ValueError(f"{platform.value} account is not connected")
-            if platform is SocialPlatform.INSTAGRAM:
-                self._reconcile_unresolved_instagram_publications(connection, asset)
-            key = self._idempotency_key(asset.id, connection.id, platform, draft)
-            if force_republish:
-                key = f"{key}:{uuid4()}"
-            existing = self._session.scalar(select(SocialPublication).where(SocialPublication.idempotency_key == key))
-            if existing is not None:
-                publications.append(existing)
-                continue
-            publication = SocialPublication(social_account_connection_id=connection.id, file_asset_id=asset.id, idempotency_key=key)
-            self._session.add(publication)
-            self._session.flush()
-            publications.append(publication)
+    def request_publish(
+        self,
+        execution: WorkflowExecution,
+        platforms: list[SocialPlatform],
+        draft: PublicationDraft,
+        force_republish: bool = False,
+    ) -> list[SocialPublication]:
+        if platforms != [SocialPlatform.INSTAGRAM]:
+            raise ValueError("V3 card-news publication currently supports INSTAGRAM only")
+        publication_node, asset_ids = self._approved_publication_node(execution)
+        connection = self._session.scalar(
+            select(SocialAccountConnection).where(
+                SocialAccountConnection.user_id == execution.user_id,
+                SocialAccountConnection.platform == SocialPlatform.INSTAGRAM,
+            )
+        )
+        if connection is None:
+            raise ValueError("INSTAGRAM account is not connected")
+        key = self._idempotency_key(publication_node.id, asset_ids, connection.id, draft)
+        if force_republish:
+            key = f"{key}:{uuid4()}"
+        existing = self._session.scalar(
+            select(SocialPublication).where(SocialPublication.idempotency_key == key)
+        )
+        if existing is not None:
+            return [existing]
+        publication = SocialPublication(
+            node_execution_id=publication_node.id,
+            social_account_connection_id=connection.id,
+            idempotency_key=key,
+        )
+        self._session.add(publication)
         self._session.commit()
-        for publication in publications:
-            if publication.status is SocialPublicationStatus.PENDING:
-                self._dispatcher.enqueue(publication.id)
-        return publications
-
-    def _reconcile_unresolved_instagram_publications(
-        self, connection: SocialAccountConnection, asset: FileAsset
-    ) -> None:
-        """Block a new POST until an ambiguous predecessor is read-only reconciled."""
-        records = self._session.execute(
-            select(SocialPublication, SocialPublicationAttempt)
-            .join(
-                SocialPublicationAttempt,
-                SocialPublicationAttempt.social_publication_id == SocialPublication.id,
-            )
-            .where(
-                SocialPublication.social_account_connection_id == connection.id,
-                SocialPublication.file_asset_id == asset.id,
-                SocialPublication.status != SocialPublicationStatus.PUBLISHED,
-                or_(
-                    SocialPublicationAttempt.error_code.in_(
-                        ("delivery_unknown", "instagram_media_verification_pending")
-                    ),
-                    # A worker can have died after persisting publish intent but
-                    # before recording an error. Treat every active predecessor
-                    # for this account/asset as unresolved until reconciled.
-                    SocialPublicationAttempt.status == SocialPublicationAttemptStatus.RUNNING,
-                ),
-            )
-            .order_by(SocialPublication.id.desc(), SocialPublicationAttempt.attempt_no.desc())
-        ).all()
-        publisher = self._publisher_factory(SocialPlatform.INSTAGRAM)
-        for previous_publication, previous_attempt in records:
-            def persist_progress(
-                attempt: SocialPublicationAttempt = previous_attempt,
-            ) -> None:
-                flag_modified(attempt, "metadata_")
-                self._session.commit()
-
-            post = publisher.reconcile(connection, previous_attempt, persist_progress)
-            if post is None:
-                raise ValueError(
-                    "An earlier Instagram publication has an unresolved delivery result; "
-                    "reconciliation is required before republishing"
-                )
-            previous_attempt.status = SocialPublicationAttemptStatus.SUCCESS
-            previous_publication.status = SocialPublicationStatus.PUBLISHED
-            previous_publication.external_post_id = post.external_post_id
-            previous_publication.external_post_url = post.external_post_url
-            previous_publication.published_at = datetime.now(UTC)
-            self._session.commit()
+        # Carousel provider work is intentionally deferred. PENDING means ready,
+        # not published; no dispatcher/provider call occurs in this MVP.
+        return [publication]
 
     def execute(self, publication_id: int) -> None:
-        publication = self._session.get(SocialPublication, publication_id)
-        if publication is None:
-            return
-        connection = self._session.get(SocialAccountConnection, publication.social_account_connection_id)
-        asset = self._session.get(FileAsset, publication.file_asset_id)
-        if connection is None or asset is None:
-            self._fail(publication, "Publication dependencies were not found", "dependency")
-            return
-        resumed_attempt: SocialPublicationAttempt | None = None
-        if publication.status is SocialPublicationStatus.PUBLISHING and connection.platform is SocialPlatform.INSTAGRAM:
-            resumed_attempt = self._session.scalar(
-                select(SocialPublicationAttempt)
-                .where(
-                    SocialPublicationAttempt.social_publication_id == publication.id,
-                    SocialPublicationAttempt.status == SocialPublicationAttemptStatus.RUNNING,
-                )
-                .order_by(SocialPublicationAttempt.attempt_no.desc())
+        """Do not dispatch external publishing before the Carousel provider WBS."""
+        del publication_id
+
+    def _approved_publication_node(
+        self, execution: WorkflowExecution
+    ) -> tuple[NodeExecution, list[int]]:
+        node = self._latest_node(execution.id, "PUBLICATION")
+        if (
+            execution.status is not WorkflowExecutionStatus.SUCCEEDED
+            or node is None
+            or node.status is not NodeExecutionStatus.SUCCEEDED
+            or not isinstance(node.output_data, dict)
+        ):
+            raise ValueError("Approved image publication is required before publishing")
+        asset_ids = node.output_data.get("asset_ids")
+        if not isinstance(asset_ids, list) or len(asset_ids) != 5 or not all(
+            isinstance(asset_id, int) for asset_id in asset_ids
+        ):
+            raise ValueError("Publication node does not contain five approved image assets")
+        return node, asset_ids
+
+    def _latest_node(self, workflow_execution_id: int, node_type: str) -> NodeExecution | None:
+        return self._session.scalar(
+            select(NodeExecution)
+            .where(
+                NodeExecution.workflow_execution_id == workflow_execution_id,
+                NodeExecution.node_type == node_type,
             )
-            if resumed_attempt is None:
-                return
-        elif publication.status is not SocialPublicationStatus.PENDING:
-            return
-        else:
-            publication.status = SocialPublicationStatus.PUBLISHING
-            self._session.commit()
-
-        start_attempt = resumed_attempt.attempt_no if resumed_attempt is not None else 1
-        for attempt_no in range(start_attempt, MAX_PUBLICATION_ATTEMPTS + 1):
-            if resumed_attempt is not None and attempt_no == start_attempt:
-                attempt = resumed_attempt
-            else:
-                attempt = SocialPublicationAttempt(
-                    social_publication_id=publication.id,
-                    attempt_no=attempt_no,
-                    status=SocialPublicationAttemptStatus.RUNNING,
-                    started_at=datetime.now(UTC),
-                )
-                self._session.add(attempt)
-            self._session.commit()
-            self._emit(publication, connection.platform, "PUBLISHING", "Publishing started", attempt_no)
-            try:
-                def persist_progress(current_attempt: SocialPublicationAttempt = attempt) -> None:
-                    # JSONB is not mutable-tracked; make each external boundary durable.
-                    flag_modified(current_attempt, "metadata_")
-                    self._session.commit()
-
-                post = self._publisher_factory(connection.platform).publish(
-                    connection, asset, publication, attempt, persist_progress
-                )
-            except SocialProviderError as exc:
-                attempt.status, attempt.error_code, attempt.error_message, attempt.finished_at = SocialPublicationAttemptStatus.FAILED, exc.code, str(exc), datetime.now(UTC)
-                self._session.commit()
-                if exc.retryable and attempt_no < MAX_PUBLICATION_ATTEMPTS:
-                    self._emit(publication, connection.platform, "RETRYING", "Temporary provider error; retrying", attempt_no)
-                    time.sleep(RETRY_DELAY_SECONDS)
-                    continue
-                self._fail(publication, str(exc), exc.code, attempt_no, connection.platform)
-                return
-            attempt.status, attempt.finished_at = SocialPublicationAttemptStatus.SUCCESS, datetime.now(UTC)
-            publication.status, publication.external_post_id, publication.external_post_url, publication.published_at = SocialPublicationStatus.PUBLISHED, post.external_post_id, post.external_post_url, datetime.now(UTC)
-            self._session.commit()
-            self._emit(publication, connection.platform, "SUCCESS", "Publishing completed", attempt_no)
-            return
-
-    def _approved_video_asset(self, execution: WorkflowExecution) -> FileAsset:
-        node = self._session.scalar(select(NodeExecution).where(NodeExecution.workflow_execution_id == execution.id, NodeExecution.node_type == "video_generation").order_by(NodeExecution.revision_no.desc()))
-        if execution.status is not WorkflowExecutionStatus.SUCCEEDED or node is None or node.status is not NodeExecutionStatus.SUCCEEDED:
-            raise ValueError("Final video approval is required before publishing")
-        if self._session.scalar(select(UserApproval).where(UserApproval.node_execution_id == node.id)) is None:
-            raise ValueError("Final video approval is required before publishing")
-        asset_id = node.output_data.get("video_asset_id") if isinstance(node.output_data, dict) else None
-        asset = self._session.get(FileAsset, asset_id) if isinstance(asset_id, int) else None
-        if asset is None:
-            raise ValueError("Generated video was not found")
-        return asset
+            .order_by(NodeExecution.revision_no.desc(), NodeExecution.id.desc())
+        )
 
     @staticmethod
-    def _idempotency_key(asset_id: int, connection_id: int, platform: SocialPlatform, draft: PublicationDraft) -> str:
-        raw = f"{asset_id}:{connection_id}:{platform.value}:{draft.youtube_title}:{draft.youtube_description}:{draft.instagram_caption}"
+    def _idempotency_key(
+        node_execution_id: int,
+        asset_ids: list[int],
+        connection_id: int,
+        draft: PublicationDraft,
+    ) -> str:
+        raw = f"{node_execution_id}:{asset_ids}:{connection_id}:INSTAGRAM:{draft.instagram_caption}"
         return hashlib.sha256(raw.encode()).hexdigest()
-
-    def _fail(self, publication: SocialPublication, message: str, code: str, attempt_no: int = 0, platform: SocialPlatform | None = None) -> None:
-        publication.status = SocialPublicationStatus.FAILED
-        self._session.commit()
-        connection = self._session.get(SocialAccountConnection, publication.social_account_connection_id)
-        self._emit(publication, platform or (connection.platform if connection else SocialPlatform.YOUTUBE), "FAILED", message, attempt_no)
-
-    def _emit(self, publication: SocialPublication, platform: SocialPlatform, stage: str, message: str, attempt_no: int) -> None:
-        try:
-            node = self._session.get(NodeExecution, publication.node_execution_id)
-            if node:
-                self._events.publish(node.workflow_execution_id, publication.id, platform.value, stage, message, attempt_no)
-        except (OSError, RedisError):
-            return

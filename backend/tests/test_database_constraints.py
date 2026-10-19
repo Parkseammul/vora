@@ -351,3 +351,38 @@ def test_publication_idempotency_key_is_unique(session: Session) -> None:
             idempotency_key="publish-once",
         ),
     )
+
+
+def test_publication_node_allows_multiple_platform_intents(session: Session) -> None:
+    user = create_user(session)
+    workflow = create_workflow(session, user)
+    node = create_node(session, workflow)
+    first_account = SocialAccountConnection(
+        user_id=user.id,
+        platform=SocialPlatform.INSTAGRAM,
+        external_account_id="account-1",
+        access_token="secret",
+    )
+    second_account = SocialAccountConnection(
+        user_id=user.id,
+        platform=SocialPlatform.YOUTUBE,
+        external_account_id="account-2",
+        access_token="secret",
+    )
+    session.add_all([first_account, second_account])
+    session.flush()
+    session.add_all(
+        [
+            SocialPublication(
+                node_execution_id=node.id,
+                social_account_connection_id=first_account.id,
+                idempotency_key="instagram-intent",
+            ),
+            SocialPublication(
+                node_execution_id=node.id,
+                social_account_connection_id=second_account.id,
+                idempotency_key="youtube-intent",
+            ),
+        ]
+    )
+    session.flush()

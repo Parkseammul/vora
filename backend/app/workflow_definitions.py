@@ -83,6 +83,7 @@ VORA_CONTENT_CREATION_V3 = WorkflowDefinition(
         NodeDefinition(key="IMAGE_GENERATE", requires_approval=False),
         NodeDefinition(key="IMAGE_CHECK", requires_approval=False),
         NodeDefinition(key="HUMAN_APPROVAL", requires_approval=True, creates_attempt=False),
+        NodeDefinition(key="PUBLICATION", requires_approval=False),
     ),
     transitions=(
         Transition("CONTENT_PLAN", "TEXT_GENERATE"),
@@ -90,6 +91,7 @@ VORA_CONTENT_CREATION_V3 = WorkflowDefinition(
         Transition("TEXT_CHECK", "IMAGE_GENERATE"),
         Transition("IMAGE_GENERATE", "IMAGE_CHECK"),
         Transition("IMAGE_CHECK", "HUMAN_APPROVAL"),
+        Transition("HUMAN_APPROVAL", "PUBLICATION"),
     ),
 )
 

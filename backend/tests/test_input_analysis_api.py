@@ -145,11 +145,27 @@ def client(
                 prompt_template="{slides} {rules_data} {input_data}",
             )
         )
+    if session.scalar(select(PromptVersion).where(PromptVersion.node_type == "IMAGE_CHECK")) is None:
+        session.add(
+            PromptVersion(
+                node_type="IMAGE_CHECK",
+                version=1,
+                prompt_template="{slides} {rules_data} {input_data} {asset_ids}",
+            )
+        )
     session.commit()
 
     def get_test_session() -> Iterator[Session]:
         yield session
 
+    previous_llm = getattr(main.app.state, "llm_provider", None)
+    previous_media = getattr(main.app.state, "media_providers", None)
+    # V3 now includes image generation/checking, so the API fixture must own an
+    # explicit offline provider configuration rather than falling through to a
+    # production provider that is intentionally absent from test settings.
+    monkeypatch.setattr(main.settings, "e2e_fake_providers", True)
+    monkeypatch.setattr(main.settings, "uploads_root", uploads_root)
+    main._configure_default_providers()
     monkeypatch.setattr("app.workflow_execution_service.UPLOADS_ROOT", uploads_root)
     monkeypatch.setattr(main, "get_llm_provider", lambda: DeterministicPlanningProvider())
     monkeypatch.setattr(
@@ -174,9 +190,15 @@ def client(
         ),
     )
     main.app.dependency_overrides[main.get_session] = get_test_session
-    with TestClient(main.app) as test_client:
-        yield test_client
-    main.app.dependency_overrides.clear()
+    try:
+        with TestClient(main.app) as test_client:
+            yield test_client
+    finally:
+        main.app.dependency_overrides.clear()
+        if previous_llm is not None:
+            main.configure_llm_provider(previous_llm)
+        if previous_media is not None:
+            main.configure_media_providers(*previous_media)
 
 
 def nodes_for(session: Session, workflow_execution_id: int) -> list[NodeExecution]:
