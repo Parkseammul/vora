@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from itertools import pairwise
 from pathlib import Path
 from uuid import uuid4
 
@@ -20,6 +21,7 @@ from app.models import (
     NodeExecutionAttemptStatus,
     NodeExecutionStatus,
     PromptVersion,
+    Revision,
     RulesVersion,
     User,
     UserApproval,
@@ -1026,6 +1028,113 @@ def test_image_rejection_rechecks_then_allows_approval_after_pass(
     assert revised_image_check.output_data["passed"] is True
 
 
+@pytest.mark.parametrize(
+    ("revision_target", "start_node", "expected_nodes", "reused_nodes"),
+    [
+        (
+            "PLAN",
+            "CONTENT_PLAN",
+            [
+                "CONTENT_PLAN",
+                "TEXT_GENERATE",
+                "TEXT_CHECK",
+                "IMAGE_GENERATE",
+                "IMAGE_CHECK",
+                "HUMAN_APPROVAL",
+            ],
+            [],
+        ),
+        (
+            "TEXT",
+            "TEXT_GENERATE",
+            ["TEXT_GENERATE", "TEXT_CHECK", "IMAGE_GENERATE", "IMAGE_CHECK", "HUMAN_APPROVAL"],
+            ["CONTENT_PLAN"],
+        ),
+        (
+            "IMAGE",
+            "IMAGE_GENERATE",
+            ["IMAGE_GENERATE", "IMAGE_CHECK", "HUMAN_APPROVAL"],
+            ["CONTENT_PLAN", "TEXT_GENERATE", "TEXT_CHECK"],
+        ),
+    ],
+)
+def test_rejected_revision_starts_at_target_and_preserves_unaffected_history(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    revision_target: str,
+    start_node: str,
+    expected_nodes: list[str],
+    reused_nodes: list[str],
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    workflow_engine = _v3_engine_with_image_check(session, RunnableLambda(_image_check_model))
+    assert workflow_engine.start_execution(execution.id, {"request_text": "fake"}) is WorkflowExecutionStatus.WAITING_APPROVAL
+    waiting_node = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "HUMAN_APPROVAL",
+            NodeExecution.revision_no == 0,
+        )
+    )
+    assert waiting_node is not None
+
+    with _approval_client(session, workflow_engine, monkeypatch) as client:
+        response = client.post(
+            f"/workflow-executions/{execution.id}/approvals",
+            json={
+                "node_execution_id": waiting_node.id,
+                "decision": "REJECTED",
+                "revision_target": revision_target,
+                "revision_request": "Please revise this card news.",
+            },
+        )
+    main.app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "WAITING_APPROVAL"
+    revision = session.scalar(
+        select(Revision).where(Revision.workflow_execution_id == execution.id)
+    )
+    assert revision is not None
+    assert revision.revision_no == 1
+    assert revision.start_node_type == start_node
+    assert revision.request_text == "Please revise this card news."
+    revised_nodes = list(
+        session.scalars(
+            select(NodeExecution)
+            .where(
+                NodeExecution.workflow_execution_id == execution.id,
+                NodeExecution.revision_no == 1,
+            )
+            .order_by(NodeExecution.id)
+        )
+    )
+    assert [node.node_type for node in revised_nodes] == expected_nodes
+    assert all(node.status is not NodeExecutionStatus.PENDING for node in revised_nodes)
+    assert revised_nodes[0].input_data["revision_request"] == "Please revise this card news."
+    for upstream, downstream in pairwise(revised_nodes):
+        assert downstream.input_data == upstream.output_data
+    for node_type in reused_nodes:
+        reused_node = session.scalar(
+            select(NodeExecution).where(
+                NodeExecution.workflow_execution_id == execution.id,
+                NodeExecution.node_type == node_type,
+                NodeExecution.revision_no == 0,
+                NodeExecution.status == NodeExecutionStatus.SUCCEEDED,
+            )
+        )
+        assert reused_node is not None
+        reused_attempt = session.scalar(
+            select(NodeExecutionAttempt).where(
+                NodeExecutionAttempt.node_execution_id == reused_node.id,
+                NodeExecutionAttempt.attempt_no == 1,
+            )
+        )
+        assert reused_attempt is not None
+        assert reused_attempt.status is NodeExecutionAttemptStatus.SUCCEEDED
+
+
 def test_image_rejection_recheck_failure_and_duplicate_request_are_rejected(
     session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1081,8 +1190,9 @@ def test_image_rejection_recheck_failure_and_duplicate_request_are_rejected(
     assert "IMAGE_CHECK must pass" in blocked.json()["detail"]
 
 
-def test_rejected_image_revision_commit_failure_rolls_back_all_prepared_state(
-    session: Session, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("revision_target", ["PLAN", "TEXT", "IMAGE"])
+def test_rejected_revision_commit_failure_rolls_back_all_prepared_state(
+    session: Session, monkeypatch: pytest.MonkeyPatch, revision_target: str
 ) -> None:
     execution = _execution(session)
     _v3_input_contract(session, execution)
@@ -1111,7 +1221,7 @@ def test_rejected_image_revision_commit_failure_rolls_back_all_prepared_state(
             main.ApprovalRequest(
                 node_execution_id=waiting_node.id,
                 decision=ApprovalDecision.REJECTED,
-                revision_target="IMAGE",
+                revision_target=revision_target,
                 revision_request="제품 이미지를 수정해 주세요.",
             ),
             session,
@@ -1130,6 +1240,7 @@ def test_rejected_image_revision_commit_failure_rolls_back_all_prepared_state(
             NodeExecution.revision_no == 1,
         )
     ) is None
+    assert session.scalar(select(Revision).where(Revision.workflow_execution_id == execution.id)) is None
 
 
 def test_rejected_image_revision_execution_failure_marks_prepared_state_failed(
@@ -1179,6 +1290,65 @@ def test_rejected_image_revision_execution_failure_marks_prepared_state_failed(
     assert attempt is not None
     assert attempt.status is NodeExecutionAttemptStatus.FAILED
     assert session.get(WorkflowExecution, execution.id).status is WorkflowExecutionStatus.FAILED  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("target_node_key", "revision_target"),
+    [("CONTENT_PLAN", "PLAN"), ("TEXT_GENERATE", "TEXT")],
+)
+def test_recover_prepared_plan_or_text_revision_reuses_committed_attempt(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    target_node_key: str,
+    revision_target: str,
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    workflow_engine = _v3_engine_with_image_check(session, RunnableLambda(_image_check_model))
+    assert workflow_engine.start_execution(execution.id, {"request_text": "fake"}) is WorkflowExecutionStatus.WAITING_APPROVAL
+    waiting_node = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "HUMAN_APPROVAL",
+            NodeExecution.revision_no == 0,
+        )
+    )
+    assert waiting_node is not None
+    approval = UserApproval(
+        workflow_execution_id=execution.id,
+        node_execution_id=waiting_node.id,
+        decision=ApprovalDecision.REJECTED,
+    )
+    session.add(approval)
+    session.flush()
+    original_execute = workflow_engine._execute_prepared_node
+
+    def simulate_process_exit(*args: object, **kwargs: object) -> WorkflowExecutionStatus:
+        del args, kwargs
+        raise RuntimeError("simulated process exit after commit")
+
+    monkeypatch.setattr(workflow_engine, "_execute_prepared_node", simulate_process_exit)
+    with pytest.raises(RuntimeError, match="simulated process exit"):
+        workflow_engine.start_rejected_revision(
+            execution.id,
+            target_node_key,
+            f"Revise {revision_target}.",
+            user_approval_id=approval.id,
+        )
+    monkeypatch.setattr(workflow_engine, "_execute_prepared_node", original_execute)
+
+    prepared = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == target_node_key,
+            NodeExecution.revision_no == 1,
+        )
+    )
+    assert prepared is not None
+    assert prepared.status is NodeExecutionStatus.RUNNING
+    assert workflow_engine.recover_prepared_revision(execution.id) is WorkflowExecutionStatus.WAITING_APPROVAL
+    session.refresh(prepared)
+    assert prepared.status is NodeExecutionStatus.SUCCEEDED
 
 
 def test_recover_prepared_image_revision_reuses_committed_node_and_attempt(

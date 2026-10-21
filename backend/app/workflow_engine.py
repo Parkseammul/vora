@@ -12,6 +12,7 @@ from app.models import (
     NodeExecutionAttempt,
     NodeExecutionAttemptStatus,
     NodeExecutionStatus,
+    Revision,
     UserApproval,
     WorkflowExecution,
     WorkflowExecutionStatus,
@@ -137,10 +138,15 @@ class WorkflowEngine:
             next_revision_no,
         )
 
-    def start_rejected_image_revision(
-        self, workflow_execution_id: int, revision_request: str
+    def start_rejected_revision(
+        self,
+        workflow_execution_id: int,
+        target_node_key: str,
+        revision_request: str,
+        *,
+        user_approval_id: int,
     ) -> WorkflowExecutionStatus:
-        """Durably prepare an IMAGE_GENERATE revision before invoking external AI."""
+        """Commit a user revision intent before executing its first external node."""
         try:
             if not revision_request.strip():
                 raise ValueError("revision_request must not be blank")
@@ -148,16 +154,35 @@ class WorkflowEngine:
             if execution.status is not WorkflowExecutionStatus.WAITING_APPROVAL:
                 raise ValueError("Only a WAITING_APPROVAL workflow execution can be revised")
             definition = self._definition_for(execution)
-            target_node_key = "IMAGE_GENERATE"
             definition.node(target_node_key)
             waiting_node = self._latest_waiting_node(execution.id)
             if waiting_node is None:
                 raise ValueError("No node execution is waiting for approval")
+            node_keys = [node.key for node in definition.nodes]
+            if node_keys.index(target_node_key) > node_keys.index(waiting_node.node_type):
+                raise ValueError("Revision target cannot be downstream of the current approval node")
+            approval = self._session.get(UserApproval, user_approval_id)
+            if (
+                approval is None
+                or approval.workflow_execution_id != execution.id
+                or approval.node_execution_id != waiting_node.id
+                or approval.decision is not ApprovalDecision.REJECTED
+            ):
+                raise ValueError("Rejected approval does not match the current approval node")
             revision_input = self._revision_input(
                 execution, definition, target_node_key, revision_request
             )
             revision_no = self._next_revision_no(execution.id)
             started_at = self._now()
+            self._session.add(
+                Revision(
+                    workflow_execution_id=execution.id,
+                    user_approval_id=approval.id,
+                    revision_no=revision_no,
+                    start_node_type=target_node_key,
+                    request_text=revision_request,
+                )
+            )
             node_execution = NodeExecution(
                 workflow_execution_id=execution.id,
                 node_type=target_node_key,
@@ -179,12 +204,34 @@ class WorkflowEngine:
             execution.status = WorkflowExecutionStatus.RUNNING
             execution.current_node_type = target_node_key
             execution.completed_at = None
-            # Commit user rejection, revision intent, node, and attempt before external work.
+            # Commit the rejection, revision intent, node, and attempt before external work.
             self._session.commit()
         except Exception:
             self._session.rollback()
             raise
         return self._execute_prepared_node(execution, definition, node_execution, attempt)
+
+    def start_rejected_image_revision(
+        self, workflow_execution_id: int, revision_request: str
+    ) -> WorkflowExecutionStatus:
+        """Backward-compatible IMAGE-only entry point for manual recovery callers."""
+        approval = self._session.scalar(
+            select(UserApproval)
+            .where(
+                UserApproval.workflow_execution_id == workflow_execution_id,
+                UserApproval.decision == ApprovalDecision.REJECTED,
+            )
+            .order_by(UserApproval.id.desc())
+            .limit(1)
+        )
+        if approval is None:
+            raise ValueError("No rejected approval is available for IMAGE revision")
+        return self.start_rejected_revision(
+            workflow_execution_id,
+            "IMAGE_GENERATE",
+            revision_request,
+            user_approval_id=approval.id,
+        )
 
     def recover_prepared_revision(
         self, workflow_execution_id: int, *, force: bool = False

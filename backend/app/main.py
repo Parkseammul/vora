@@ -110,18 +110,18 @@ class RevisionRequest(BaseModel):
 class ApprovalRequest(BaseModel):
     node_execution_id: int
     decision: ApprovalDecision = ApprovalDecision.APPROVED
-    revision_target: Literal["IMAGE"] | None = None
+    revision_target: Literal["PLAN", "TEXT", "IMAGE"] | None = None
     revision_request: str | None = None
 
     @model_validator(mode="after")
-    def rejected_image_revision_must_be_complete(self) -> "ApprovalRequest":
+    def rejected_revision_must_be_complete(self) -> "ApprovalRequest":
         if self.decision is ApprovalDecision.REJECTED and (
-            self.revision_target != "IMAGE"
+            self.revision_target is None
             or self.revision_request is None
             or not self.revision_request.strip()
         ):
             raise ValueError(
-                "REJECTED requires revision_target=IMAGE and a non-blank revision_request"
+                "REJECTED requires revision_target and a non-blank revision_request"
             )
         return self
 
@@ -838,18 +838,30 @@ def approve_workflow_node(
     if request.decision is ApprovalDecision.APPROVED:
         _ensure_v3_image_check_passed(session, execution, node)
 
-    session.add(
-        UserApproval(
-            workflow_execution_id=execution.id,
-            node_execution_id=node.id,
-            decision=request.decision,
-        )
+    approval = UserApproval(
+        workflow_execution_id=execution.id,
+        node_execution_id=node.id,
+        decision=request.decision,
     )
+    session.add(approval)
     if request.decision is ApprovalDecision.REJECTED:
         try:
+            # Flush only assigns the approval id. The engine commits this row together
+            # with Revision, NodeExecution, and Attempt before provider execution.
+            session.flush()
+            target_node_key = {
+                "PLAN": "CONTENT_PLAN",
+                "TEXT": "TEXT_GENERATE",
+                "IMAGE": "IMAGE_GENERATE",
+            }[request.revision_target or ""]
             status = get_workflow_engine(
                 session, get_ai_workflow_services(session)
-            ).start_rejected_image_revision(execution.id, request.revision_request or "")
+            ).start_rejected_revision(
+                execution.id,
+                target_node_key,
+                request.revision_request or "",
+                user_approval_id=approval.id,
+            )
         except (IntegrityError, ValueError) as exc:
             session.rollback()
             raise HTTPException(status_code=422, detail=str(exc)) from exc
