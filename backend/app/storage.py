@@ -14,6 +14,8 @@ class StorageProvider(Protocol):
 
     def presigned_get_url(self, storage_key: str, expires_seconds: int = 3600) -> str: ...
 
+    def exists(self, storage_key: str) -> bool: ...
+
 
 class LocalStorageProvider:
     """Keeps existing local development and E2E files where video generation writes them."""
@@ -50,6 +52,9 @@ class LocalStorageProvider:
 
     def presigned_get_url(self, storage_key: str, expires_seconds: int = 3600) -> str:
         raise RuntimeError("Instagram publishing requires S3 private storage")
+
+    def exists(self, storage_key: str) -> bool:
+        return self.local_path(storage_key) is not None
 
 
 class S3StorageProvider:
@@ -91,3 +96,13 @@ class S3StorageProvider:
                 ExpiresIn=expires_seconds,
             )
         )
+
+    def exists(self, storage_key: str) -> bool:
+        try:
+            self._client.head_object(Bucket=self._bucket, Key=storage_key)
+        except self._client.exceptions.ClientError as exc:  # type: ignore[union-attr]
+            code = exc.response.get("Error", {}).get("Code")
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                return False
+            raise
+        return True

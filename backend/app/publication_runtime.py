@@ -1,11 +1,13 @@
 """Composition root for publication workers; it does not involve WorkflowEngine."""
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy.orm import Session
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.instagram_carousel import CarouselImagePreparer
 from app.llm_provider import LLMProvider
 from app.publication import (
     CeleryPublicationDispatcher,
@@ -14,7 +16,7 @@ from app.publication import (
 )
 from app.publication_copy import PublicationCopyService
 from app.social_providers import (
-    InstagramProvider,
+    InstagramCarouselProvider,
     PublishedPost,
     SocialPlatform,
     SocialProviderError,
@@ -34,8 +36,7 @@ class RuntimePublisher:
     def __init__(self, platform: SocialPlatform, storage: StorageProvider | None, session: Session) -> None:
         self._platform, self._storage, self._session = platform, storage, session
 
-    def publish(self, connection, asset, publication, attempt, persist_progress) -> PublishedPost:  # type: ignore[no-untyped-def]
-        del attempt, persist_progress
+    def publish(self, connection, assets, publication, attempt, persist_progress) -> PublishedPost:  # type: ignore[no-untyped-def]
         # Kept only for the legacy video worker contract. V3 PublicationService
         # rejects YOUTUBE before this boundary and never calls a provider.
         if self._platform is SocialPlatform.YOUTUBE:
@@ -47,6 +48,7 @@ class RuntimePublisher:
             access_token = YouTubeTokenService(self._session, provider).valid_access_token(
                 connection.id
             )
+            asset = assets[0] if isinstance(assets, list) else assets
             local_path = (Path(settings.uploads_root) / asset.storage_key).resolve()
             return provider.publish(
                 access_token,
@@ -54,15 +56,31 @@ class RuntimePublisher:
                 publication.youtube_title or "VORA video",
                 publication.youtube_description or "",
             )
-        raise SocialProviderError(
-            "Instagram Carousel provider is not implemented; publication remains PENDING",
-            code="not_implemented",
+        if self._platform is not SocialPlatform.INSTAGRAM or self._storage is None:
+            raise SocialProviderError("Publication platform is not configured", code="configuration")
+        if connection.token_expires_at is not None and connection.token_expires_at <= datetime.now(UTC):
+            raise SocialProviderError("Instagram access token has expired; reconnect the account", code="authorization")
+        urls = CarouselImagePreparer(self._storage).prepare(publication.id, assets)
+        return InstagramCarouselProvider(
+            settings.instagram_client_id,
+            settings.instagram_client_secret,
+            settings.instagram_redirect_uri,
+            settings.instagram_graph_api_version,
+            settings.instagram_container_poll_interval_seconds,
+            settings.instagram_container_poll_max_attempts,
+        ).publish_carousel(
+            connection.access_token,
+            connection.external_account_id,
+            urls,
+            publication.instagram_caption or "",
+            attempt.metadata_,
+            persist_progress,
         )
 
     def reconcile(self, connection, attempt, persist_progress) -> PublishedPost | None:  # type: ignore[no-untyped-def]
         if self._platform is not SocialPlatform.INSTAGRAM:
             return None
-        return InstagramProvider(
+        return InstagramCarouselProvider(
             settings.instagram_client_id,
             settings.instagram_client_secret,
             settings.instagram_redirect_uri,

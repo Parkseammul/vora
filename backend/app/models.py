@@ -332,6 +332,7 @@ class SocialPublication(Base):
         server_default=SocialPublicationStatus.PENDING.value,
     )
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    instagram_caption: Mapped[str | None] = mapped_column(Text)
     external_post_id: Mapped[str | None] = mapped_column(String(255))
     external_post_url: Mapped[str | None] = mapped_column(Text)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
