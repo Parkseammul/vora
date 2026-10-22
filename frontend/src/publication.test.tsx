@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { BrowserRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "./api";
-import { PublicationPanel, SocialConnectButton } from "./publication";
+import { LegacyPublicationPanel as PublicationPanel, SocialConnectButton } from "./publication";
 import { ApprovalActions } from "./components";
 import type { PublicationDetail, Publication } from "./types";
 import { WorkflowProvider } from "./WorkflowContext";
@@ -53,7 +53,7 @@ describe("publication UI", () => {
     pending.unmount();
     vi.mocked(api.getWorkflow).mockResolvedValueOnce({ id: 1, status: "SUCCESS", nodes: { input_analysis: null, content_planning: null, script_generation: null, video_generation: { id: 4, node_key: "video_generation", user_requested_version: 1, status: "SUCCESS", attempt: { current: 1, automatic_max: 3 } } } });
     render(<BrowserRouter><WorkflowProvider workflowExecutionId={1}><ApprovalActions nodeKey="video_generation" /></WorkflowProvider></BrowserRouter>);
-    expect(await screen.findByText("SNS 게시")).toBeInTheDocument();
+    expect(await screen.findByText("Instagram publication")).toBeInTheDocument();
   });
 
   it("does not publish until the confirmation modal is accepted", async () => {
