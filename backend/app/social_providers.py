@@ -555,6 +555,128 @@ class InstagramProvider:
         return PublishedPost(media_id, permalink)
 
 
+class InstagramCarouselProvider(InstagramProvider):
+    """Instagram Login Carousel adapter; intentionally separate from the Reel adapter."""
+
+    def publish_carousel(
+        self,
+        access_token: str,
+        account_id: str,
+        image_urls: list[str],
+        caption: str,
+        metadata: dict[str, object],
+        persist_progress: Callable[[], None],
+    ) -> PublishedPost:
+        if len(image_urls) != 5 or any(not item.startswith("https://") for item in image_urls):
+            raise SocialProviderError("Instagram Carousel requires five HTTPS image URLs", code="invalid_carousel")
+        base, headers = f"https://graph.instagram.com/{self._graph_api_version}", {"Authorization": f"Bearer {access_token}"}
+        child_ids = metadata.get("instagram_carousel_child_ids")
+        if not isinstance(child_ids, list):
+            child_ids = []
+        if child_ids and (len(child_ids) > 5 or not all(isinstance(item, str) and item for item in child_ids)):
+            raise SocialProviderError("Instagram Carousel child state is invalid", code="invalid_carousel_state")
+        pending_child = metadata.get("instagram_carousel_child_create_requested")
+        if isinstance(pending_child, int) and pending_child > len(child_ids):
+            metadata["instagram_reconciliation_required"] = True
+            persist_progress()
+            raise SocialProviderError("Instagram carousel child creation delivery is unknown", code="delivery_unknown")
+        # Each identifier is committed before the next non-idempotent POST.
+        for image_url in image_urls[len(child_ids):]:
+            metadata["instagram_carousel_child_create_requested"] = len(child_ids) + 1
+            persist_progress()
+            try:
+                response = httpx.post(f"{base}/{account_id}/media", data={"image_url": image_url, "is_carousel_item": "true"}, headers=headers, timeout=60.0)
+            except httpx.HTTPError as exc:
+                metadata["instagram_reconciliation_required"] = True
+                persist_progress()
+                raise SocialProviderError("Instagram carousel child creation delivery is unknown", code="delivery_unknown") from exc
+            if response.is_error:
+                if response.status_code == 429 or response.status_code >= 500:
+                    metadata["instagram_reconciliation_required"] = True
+                    persist_progress()
+                raise _instagram_error(response, "carousel child creation")
+            try:
+                child_id = response.json().get("id")
+            except (json.JSONDecodeError, ValueError):
+                child_id = None
+            if not isinstance(child_id, str) or not child_id:
+                metadata["instagram_reconciliation_required"] = True
+                persist_progress()
+                raise SocialProviderError("Instagram carousel child creation delivery is unknown", code="delivery_unknown")
+            child_ids.append(child_id)
+            metadata["instagram_carousel_child_ids"] = child_ids
+            persist_progress()
+        if len(child_ids) != 5:
+            raise SocialProviderError("Instagram carousel child creation is incomplete", code="delivery_unknown")
+
+        parent_id = metadata.get("instagram_carousel_parent_id")
+        if not isinstance(parent_id, str):
+            if isinstance(metadata.get("instagram_carousel_parent_create_requested_at"), str):
+                metadata["instagram_reconciliation_required"] = True
+                persist_progress()
+                raise SocialProviderError("Instagram carousel parent creation delivery is unknown", code="delivery_unknown")
+            metadata["instagram_carousel_parent_create_requested_at"] = datetime.now(UTC).isoformat()
+            persist_progress()
+            try:
+                response = httpx.post(f"{base}/{account_id}/media", data={"media_type": "CAROUSEL", "children": ",".join(child_ids), "caption": caption}, headers=headers, timeout=60.0)
+            except httpx.HTTPError as exc:
+                metadata["instagram_reconciliation_required"] = True
+                persist_progress()
+                raise SocialProviderError("Instagram carousel parent creation delivery is unknown", code="delivery_unknown") from exc
+            if response.is_error:
+                if response.status_code == 429 or response.status_code >= 500:
+                    metadata["instagram_reconciliation_required"] = True
+                    persist_progress()
+                raise _instagram_error(response, "carousel parent creation")
+            try:
+                parent_id = response.json().get("id")
+            except (json.JSONDecodeError, ValueError):
+                parent_id = None
+            if not isinstance(parent_id, str) or not parent_id:
+                metadata["instagram_reconciliation_required"] = True
+                persist_progress()
+                raise SocialProviderError("Instagram carousel parent creation delivery is unknown", code="delivery_unknown")
+            metadata["instagram_carousel_parent_id"] = parent_id
+            metadata["instagram_container_id"] = parent_id
+            persist_progress()
+
+        status = self._wait_for_container(access_token, base, parent_id, metadata, persist_progress)
+        if status != "FINISHED":
+            raise SocialProviderError(f"Instagram carousel parent processing ended with {status}", code="instagram_container_failed")
+        media_id = metadata.get("instagram_media_id")
+        if not isinstance(media_id, str) and isinstance(metadata.get("instagram_publish_requested_at"), str):
+            metadata["instagram_reconciliation_required"] = True
+            persist_progress()
+            raise SocialProviderError("Instagram carousel publish delivery is unknown; reconciliation is required", code="delivery_unknown")
+        if not isinstance(media_id, str):
+            metadata["instagram_publish_requested_at"] = datetime.now(UTC).isoformat()
+            persist_progress()
+            try:
+                response = httpx.post(f"{base}/{account_id}/media_publish", data={"creation_id": parent_id}, headers=headers, timeout=60.0)
+            except httpx.HTTPError as exc:
+                metadata["instagram_reconciliation_required"] = True
+                persist_progress()
+                raise SocialProviderError("Instagram carousel publish delivery is unknown", code="delivery_unknown") from exc
+            if response.is_error:
+                if response.status_code == 429 or response.status_code >= 500:
+                    metadata["instagram_reconciliation_required"] = True
+                    persist_progress()
+                raise _instagram_error(response, "carousel media publish")
+            try:
+                media_id = response.json().get("id")
+            except (json.JSONDecodeError, ValueError):
+                media_id = None
+            if not isinstance(media_id, str) or not media_id:
+                metadata["instagram_reconciliation_required"] = True
+                persist_progress()
+                raise SocialProviderError("Instagram carousel publish delivery is unknown", code="delivery_unknown")
+            metadata["instagram_media_id"] = media_id
+            persist_progress()
+        # _verify_media only requires a container identifier; use the parent in its existing contract.
+        metadata["instagram_container_id"] = parent_id
+        return self._verify_media(access_token, base, media_id, metadata, persist_progress)
+
+
 def platform_from_string(value: str) -> SocialPlatform:
     try:
         return SocialPlatform(value.upper())

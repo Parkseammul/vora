@@ -4,13 +4,15 @@ import hashlib
 import json
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Protocol
 from uuid import uuid4
 
 from celery import Celery  # type: ignore[import-untyped]
 from redis import Redis
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import (
     FileAsset,
@@ -20,11 +22,13 @@ from app.models import (
     SocialPlatform,
     SocialPublication,
     SocialPublicationAttempt,
+    SocialPublicationAttemptStatus,
+    SocialPublicationStatus,
     WorkflowExecution,
     WorkflowExecutionStatus,
 )
 from app.publication_copy import PublicationCopyService
-from app.social_providers import PublishedPost
+from app.social_providers import PublishedPost, SocialProviderError
 
 
 class PublicationEvents(Protocol):
@@ -41,7 +45,7 @@ class SocialPublisher(Protocol):
     def publish(
         self,
         connection: SocialAccountConnection,
-        asset: FileAsset,
+        assets: list[FileAsset],
         publication: SocialPublication,
         attempt: SocialPublicationAttempt,
         persist_progress: Callable[[], None],
@@ -100,7 +104,7 @@ class PublicationDraft:
 
 
 class PublicationService:
-    """Creates durable Instagram Carousel intents; this MVP never calls Instagram."""
+    """Creates and executes durable Instagram Carousel publication intents."""
 
     def __init__(
         self,
@@ -152,16 +156,138 @@ class PublicationService:
             node_execution_id=publication_node.id,
             social_account_connection_id=connection.id,
             idempotency_key=key,
+            instagram_caption=draft.instagram_caption,
         )
         self._session.add(publication)
         self._session.commit()
-        # Carousel provider work is intentionally deferred. PENDING means ready,
-        # not published; no dispatcher/provider call occurs in this MVP.
+        try:
+            self._dispatcher.enqueue(publication.id)
+        except Exception as exc:  # noqa: BLE001 - broker client implementations vary
+            # The intent is durable even if the broker is unavailable. It can be
+            # re-enqueued later without changing its idempotency key.
+            self._record_enqueue_failure(publication, exc)
         return [publication]
 
     def execute(self, publication_id: int) -> None:
-        """Do not dispatch external publishing before the Carousel provider WBS."""
-        del publication_id
+        """Claim briefly, call providers outside a DB transaction, then finalize."""
+        claimed = self._claim(publication_id)
+        if claimed is None:
+            return
+        publication, attempt, connection, assets = claimed
+
+        def persist_progress() -> None:
+            flag_modified(attempt, "metadata_")
+            self._session.commit()
+
+        try:
+            publisher = self._publisher_factory(connection.platform)
+        except Exception as exc:  # noqa: BLE001 - plugin/provider construction varies
+            attempt.error_code, attempt.error_message = "publisher_initialization_failed", type(exc).__name__
+            attempt.status, attempt.finished_at = SocialPublicationAttemptStatus.FAILED, datetime.now(UTC)
+            publication.status = SocialPublicationStatus.FAILED
+            self._session.commit()
+            return
+        try:
+            result = publisher.publish(connection, assets, publication, attempt, persist_progress)
+        except SocialProviderError as exc:
+            attempt.error_code, attempt.error_message = exc.code, str(exc)
+            if exc.code == "delivery_unknown":
+                self._preserve_for_reconciliation(attempt)
+            else:
+                attempt.status, attempt.finished_at = SocialPublicationAttemptStatus.FAILED, datetime.now(UTC)
+                publication.status = SocialPublicationStatus.FAILED
+            self._session.commit()
+            return
+        except Exception as exc:  # noqa: BLE001 - a provider may have POSTed before raising
+            attempt.error_code, attempt.error_message = "publication_internal_error", type(exc).__name__
+            # Publishing may have crossed a non-idempotent Meta boundary. Never
+            # convert that uncertainty into an automatic retryable FAILED state.
+            self._preserve_for_reconciliation(attempt)
+            self._session.commit()
+            return
+        attempt.status, attempt.finished_at = SocialPublicationAttemptStatus.SUCCESS, datetime.now(UTC)
+        publication.status = SocialPublicationStatus.PUBLISHED
+        publication.external_post_id, publication.external_post_url = result.external_post_id, result.external_post_url
+        publication.published_at = datetime.now(UTC)
+        self._session.commit()
+
+    def reconcile(self, publication_id: int) -> bool:
+        """Read-only provider recovery. This deliberately never calls publish()."""
+        publication = self._session.get(SocialPublication, publication_id)
+        if publication is None or publication.status is not SocialPublicationStatus.PUBLISHING:
+            return False
+        connection = self._session.get(SocialAccountConnection, publication.social_account_connection_id)
+        attempt = self._session.scalar(select(SocialPublicationAttempt).where(SocialPublicationAttempt.social_publication_id == publication.id).order_by(SocialPublicationAttempt.attempt_no.desc()))
+        if connection is None or connection.platform is not SocialPlatform.INSTAGRAM or attempt is None:
+            return False
+        result = self._publisher_factory(connection.platform).reconcile(connection, attempt, lambda: self._session.commit())
+        if result is None:
+            return False
+        publication.status, publication.external_post_id, publication.external_post_url = SocialPublicationStatus.PUBLISHED, result.external_post_id, result.external_post_url
+        publication.published_at = datetime.now(UTC)
+        attempt.status, attempt.finished_at = SocialPublicationAttemptStatus.SUCCESS, datetime.now(UTC)
+        self._session.commit()
+        return True
+
+    def _claim(self, publication_id: int) -> tuple[SocialPublication, SocialPublicationAttempt, SocialAccountConnection, list[FileAsset]] | None:
+        publication = self._session.scalar(select(SocialPublication).where(SocialPublication.id == publication_id).with_for_update())
+        if publication is None or publication.status is not SocialPublicationStatus.PENDING:
+            self._session.rollback()
+            return None
+        connection = self._session.get(SocialAccountConnection, publication.social_account_connection_id)
+        node = self._session.get(NodeExecution, publication.node_execution_id)
+        if connection is None or node is None:
+            publication.status = SocialPublicationStatus.FAILED
+            self._session.commit()
+            return None
+        # V3 card-news publication is Instagram-only. Legacy YouTube rows and
+        # providers remain isolated from this worker boundary.
+        if connection.platform is not SocialPlatform.INSTAGRAM:
+            publication.status = SocialPublicationStatus.FAILED
+            self._session.commit()
+            return None
+        asset_ids = node.output_data.get("asset_ids") if isinstance(node.output_data, dict) else None
+        assets = list(self._session.scalars(select(FileAsset).where(FileAsset.id.in_(asset_ids or []))))
+        by_id = {asset.id: asset for asset in assets}
+        try:
+            ordered = self._validated_assets(node, asset_ids, by_id)
+        except ValueError:
+            publication.status = SocialPublicationStatus.FAILED
+            self._session.commit()
+            return None
+        last_attempt = self._session.scalar(select(func.max(SocialPublicationAttempt.attempt_no)).where(SocialPublicationAttempt.social_publication_id == publication.id)) or 0
+        attempt = SocialPublicationAttempt(social_publication_id=publication.id, attempt_no=last_attempt + 1, status=SocialPublicationAttemptStatus.RUNNING, started_at=datetime.now(UTC), metadata_={"publication_intent_recorded_at": datetime.now(UTC).isoformat()})
+        publication.status = SocialPublicationStatus.PUBLISHING
+        self._session.add(attempt)
+        self._session.commit()
+        return publication, attempt, connection, ordered
+
+    def _validated_assets(self, publication_node: NodeExecution, asset_ids: object, by_id: dict[int, FileAsset]) -> list[FileAsset]:
+        if not isinstance(asset_ids, list) or len(asset_ids) != 5 or not all(isinstance(item, int) for item in asset_ids):
+            raise ValueError("Publication assets are invalid")
+        image_node = self._session.scalar(select(NodeExecution).where(NodeExecution.workflow_execution_id == publication_node.workflow_execution_id, NodeExecution.node_type == "IMAGE_GENERATE", NodeExecution.status == NodeExecutionStatus.SUCCEEDED).order_by(NodeExecution.revision_no.desc(), NodeExecution.id.desc()))
+        if image_node is None or image_node.output_data is None or image_node.output_data.get("asset_ids") != asset_ids:
+            raise ValueError("Publication images do not match the latest IMAGE_GENERATE revision")
+        ordered = sorted(by_id.values(), key=lambda asset: asset.slide_no or 0)
+        if len(ordered) != 5 or [asset.slide_no for asset in ordered] != [1, 2, 3, 4, 5] or any(asset.asset_type.value != "IMAGE" or asset.workflow_execution_id != publication_node.workflow_execution_id or asset.created_by_node_execution_id != image_node.id for asset in ordered):
+            raise ValueError("Publication images are not the approved five slides")
+        return ordered
+
+    def _record_enqueue_failure(self, publication: SocialPublication, exc: Exception) -> None:
+        last_attempt = self._session.scalar(
+            select(func.max(SocialPublicationAttempt.attempt_no)).where(
+                SocialPublicationAttempt.social_publication_id == publication.id
+            )
+        ) or 0
+        attempt = SocialPublicationAttempt(social_publication_id=publication.id, attempt_no=last_attempt + 1, status=SocialPublicationAttemptStatus.FAILED, error_code="enqueue_failed", error_message=type(exc).__name__, finished_at=datetime.now(UTC), metadata_={"reenqueue_required": True})
+        self._session.add(attempt)
+        self._session.commit()
+
+    def _preserve_for_reconciliation(self, attempt: SocialPublicationAttempt) -> None:
+        """A running attempt has no terminal result while Meta delivery is unknown."""
+        attempt.status, attempt.finished_at = SocialPublicationAttemptStatus.RUNNING, None
+        attempt.metadata_["reconciliation_required"] = True
+        flag_modified(attempt, "metadata_")
 
     def _approved_publication_node(
         self, execution: WorkflowExecution

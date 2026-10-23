@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { api } from "./api";
 import { useWorkflow } from "./WorkflowContext";
-import type { PublicationDetail, SocialPlatform } from "./types";
+import type { Publication, PublicationDetail, SocialPlatform } from "./types";
 
 const platforms: SocialPlatform[] = ["YOUTUBE", "INSTAGRAM"];
 
@@ -14,6 +14,77 @@ export function SocialConnectButton({ platform }: { platform: SocialPlatform }) 
 }
 
 export function PublicationPanel() {
+  const { workflowExecutionId } = useWorkflow();
+  const [detail, setDetail] = useState<PublicationDetail | null>(null);
+  const [connections, setConnections] = useState<SocialPlatform[]>([]);
+  const [caption, setCaption] = useState("");
+  const [confirm, setConfirm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const requestInFlight = useRef(false);
+  const load = useCallback(async () => {
+    const [publication, accounts] = await Promise.all([
+      api.getPublications(workflowExecutionId), api.connections(),
+    ]);
+    setDetail(publication);
+    setConnections(accounts.connections.map((item) => item.platform));
+    setCaption((value) => value || publication.draft.instagram_caption);
+  }, [workflowExecutionId]);
+  useEffect(() => {
+    queueMicrotask(() => void load().catch((cause) => setError(cause instanceof Error ? cause.message : "Could not load publication status.")));
+    const source = new EventSource(api.publicationEventUrl(workflowExecutionId));
+    source.onmessage = () => void load();
+    source.onerror = () => source.close();
+    return () => source.close();
+  }, [load, workflowExecutionId]);
+
+  const publication = detail?.publications.find((item) => item.platform === "INSTAGRAM");
+  const blocked = ["PENDING", "PUBLISHING", "PUBLISHED"].includes(publication?.status ?? "");
+  const requestPublication = async () => {
+    if (requestInFlight.current || blocked) return;
+    requestInFlight.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      await api.publishInstagram(workflowExecutionId, {
+        platforms: ["INSTAGRAM"], instagram_caption: caption, force_republish: false,
+      });
+      await load();
+      setConfirm(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not request Instagram publication.");
+    } finally {
+      requestInFlight.current = false;
+      setBusy(false);
+    }
+  };
+
+  return <section className="publication">
+    <h2>Instagram publication</h2>
+    <p>Approval prepares the carousel. Publication starts only after your confirmation.</p>
+    {!connections.includes("INSTAGRAM") && <SocialConnectButton platform="INSTAGRAM" />}
+    <label>Instagram caption<textarea value={caption} onChange={(event) => setCaption(event.target.value)} /></label>
+    {publication && <InstagramPublicationState publication={publication} />}
+    {publication?.status === "FAILED" && <p className="notice">Automatic republishing is disabled. Review the failure before a new publication decision.</p>}
+    {error && <p className="error">{error}</p>}
+    <button className="primary" disabled={!detail || blocked || busy} onClick={() => setConfirm(true)}>Request Instagram publication</button>
+    {confirm && <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <section className="modal"><h2>Request this Instagram Carousel publication?</h2>
+        <button onClick={() => setConfirm(false)}>Cancel</button>
+        <button className="primary" disabled={busy} onClick={() => void requestPublication()}>{busy ? "Requesting…" : "Confirm Instagram publication"}</button>
+      </section>
+    </div>}
+  </section>;
+}
+
+function InstagramPublicationState({ publication }: { publication: Publication }) {
+  if (publication.status === "PUBLISHED") return <p>Instagram: PUBLISHED {publication.external_post_url && <a href={publication.external_post_url} target="_blank" rel="noreferrer">View post</a>}</p>;
+  if (publication.status === "PUBLISHING") return <p>Instagram: PUBLISHING — awaiting result; no automatic retry.</p>;
+  if (publication.status === "PENDING") return <p>Instagram: PENDING — publication request accepted.</p>;
+  return <p>Instagram: FAILED {publication.error_message}</p>;
+}
+
+export function LegacyPublicationPanel() {
   const { workflowExecutionId } = useWorkflow();
   const [detail, setDetail] = useState<PublicationDetail | null>(null);
   const [connections, setConnections] = useState<SocialPlatform[]>([]);

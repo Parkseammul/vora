@@ -39,6 +39,7 @@ export interface VideoDetail extends Detail<VideoOutput> {
 }
 
 export type SocialPlatform = "YOUTUBE" | "INSTAGRAM";
-export interface Publication { id: number; platform: SocialPlatform; status: "PENDING" | "PUBLISHING" | "SUCCESS" | "FAILED"; external_post_url: string | null; error_message: string | null; attempt: { current: number; max: number }; }
+export interface Publication { id: number; platform: SocialPlatform; status: "PENDING" | "PUBLISHING" | "PUBLISHED" | "SUCCESS" | "FAILED"; external_post_url: string | null; error_message: string | null; attempt: { current: number; max: number }; }
 export interface PublicationDetail { draft: { youtube_title: string; youtube_description: string; instagram_caption: string }; publications: Publication[]; }
 export interface SocialConnection { platform: SocialPlatform; account_name: string | null; status: string; }
+export interface InstagramPublicationRequest { platforms: ["INSTAGRAM"]; instagram_caption: string; force_republish: false; }

@@ -31,3 +31,4 @@ mypy
 # Video generation asynchronous queue and progress events
 celery
 redis
+Pillow
