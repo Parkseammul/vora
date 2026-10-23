@@ -8,6 +8,7 @@ from typing import Literal
 from urllib.parse import urlencode, urlsplit
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_openai import ChatOpenAI
@@ -93,6 +94,13 @@ from app.workflow_execution_service import (
 
 # VORA Backend의 FastAPI 애플리케이션 객체 생성
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[settings.frontend_url],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class RevisionRequest(BaseModel):
