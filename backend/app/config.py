@@ -29,7 +29,11 @@ class Settings(BaseSettings):
     elevenlabs_model: str = "eleven_multilingual_v2"
     redis_url: str = "redis://localhost:6379/0"
     video_generation_queue: str = "video_generation"
+    generation_queue: str = "generation"
     publication_queue: str = "publication"
+    generation_dispatch_lease_seconds: int = Field(
+        900, ge=1, validation_alias="VORA_GENERATION_DISPATCH_LEASE_SECONDS"
+    )
     storage_provider: str = "local"
     s3_bucket: str | None = None
     s3_region: str | None = None

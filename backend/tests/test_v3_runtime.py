@@ -1,16 +1,30 @@
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from langchain_core.runnables import RunnableLambda
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app import main
 from app.database import engine
+from app.generation_dispatch import (
+    ACTION_RESUME,
+    ACTION_REVISION,
+    ACTION_START,
+    CLAIMED,
+    COMPLETED,
+    PENDING,
+    QUEUED,
+    GenerationDispatchService,
+    execute_claimed_intent,
+)
 from app.models import (
     ApprovalDecision,
     AssetType,
@@ -23,8 +37,10 @@ from app.models import (
     PromptVersion,
     Revision,
     RulesVersion,
+    SocialPublication,
     User,
     UserApproval,
+    WorkflowDispatchIntent,
     WorkflowExecution,
     WorkflowExecutionStatus,
 )
@@ -186,19 +202,21 @@ def _failing_image_check_model(_: object) -> ImageCheckOutput:
     raise RuntimeError("IMAGE_CHECK model unavailable")
 
 
-def _v3_input_contract(session: Session, execution: WorkflowExecution) -> None:
-    rules = RulesVersion(version=1, rules_data={"tone": "clear"})
+def _v3_input_contract(
+    session: Session, execution: WorkflowExecution, version: int = 1
+) -> None:
+    rules = RulesVersion(version=version, rules_data={"tone": "clear"})
     content_plan_prompt = PromptVersion(
-        node_type="CONTENT_PLAN", version=1, prompt_template=PROMPT_TEMPLATE
+        node_type="CONTENT_PLAN", version=version, prompt_template=PROMPT_TEMPLATE
     )
     text_generate_prompt = PromptVersion(
-        node_type="TEXT_GENERATE", version=1, prompt_template=TEXT_GENERATE_PROMPT_TEMPLATE
+        node_type="TEXT_GENERATE", version=version, prompt_template=TEXT_GENERATE_PROMPT_TEMPLATE
     )
     text_check_prompt = PromptVersion(
-        node_type="TEXT_CHECK", version=1, prompt_template=TEXT_CHECK_PROMPT_TEMPLATE
+        node_type="TEXT_CHECK", version=version, prompt_template=TEXT_CHECK_PROMPT_TEMPLATE
     )
     image_check_prompt = PromptVersion(
-        node_type="IMAGE_CHECK", version=1, prompt_template=IMAGE_CHECK_PROMPT_TEMPLATE
+        node_type="IMAGE_CHECK", version=version, prompt_template=IMAGE_CHECK_PROMPT_TEMPLATE
     )
     session.add_all(
         [rules, content_plan_prompt, text_generate_prompt, text_check_prompt, image_check_prompt]
@@ -258,8 +276,59 @@ def _approval_client(
 
     main.app.dependency_overrides[main.get_session] = get_test_session
     monkeypatch.setattr(main, "get_ai_workflow_services", lambda _: object())
-    monkeypatch.setattr(main, "get_workflow_engine", lambda _session, _services: workflow_engine)
+    monkeypatch.setattr(main, "get_workflow_engine", lambda *_args: workflow_engine)
+    monkeypatch.setattr(
+        main.celery_app,
+        "send_task",
+        lambda *_args, **_kwargs: SimpleNamespace(id="test-generation-task"),
+    )
     return TestClient(main.app)
+
+
+def _consume_latest_v3_dispatch(
+    session: Session, workflow_engine: WorkflowEngine, workflow_execution_id: int
+) -> WorkflowDispatchIntent:
+    """Consume the persisted intent through the production dispatch boundary."""
+    intent = session.scalar(
+        select(WorkflowDispatchIntent)
+        .where(WorkflowDispatchIntent.workflow_execution_id == workflow_execution_id)
+        .order_by(WorkflowDispatchIntent.id.desc())
+    )
+    assert intent is not None
+    dispatcher = GenerationDispatchService(session, Mock(), "test_generation")
+    claimed = dispatcher.claim(intent.id)
+    assert claimed is not None
+    execute_claimed_intent(session, claimed, workflow_engine, lambda _id: {})
+    assert claimed.claim_token is not None
+    assert dispatcher.complete(claimed.id, claimed.claim_token, claimed.claim_generation)
+    session.refresh(intent)
+    assert intent.status == COMPLETED
+    return intent
+
+
+def _cleanup_independent_v3_fixture(workflow_execution_id: int, version: int) -> None:
+    """Remove only rows owned by an independently committed visibility test."""
+    with Session(engine) as cleanup:
+        node_ids = select(NodeExecution.id).where(
+            NodeExecution.workflow_execution_id == workflow_execution_id
+        )
+        cleanup.execute(delete(NodeExecutionAttempt).where(NodeExecutionAttempt.node_execution_id.in_(node_ids)))
+        approval_ids = select(UserApproval.id).where(
+            UserApproval.workflow_execution_id == workflow_execution_id
+        )
+        cleanup.execute(delete(Revision).where(Revision.user_approval_id.in_(approval_ids)))
+        cleanup.execute(delete(UserApproval).where(UserApproval.workflow_execution_id == workflow_execution_id))
+        cleanup.execute(delete(WorkflowDispatchIntent).where(WorkflowDispatchIntent.workflow_execution_id == workflow_execution_id))
+        cleanup.execute(delete(ExecutionInputSnapshot).where(ExecutionInputSnapshot.workflow_execution_id == workflow_execution_id))
+        cleanup.execute(delete(FileAsset).where(FileAsset.workflow_execution_id == workflow_execution_id))
+        cleanup.execute(delete(NodeExecution).where(NodeExecution.workflow_execution_id == workflow_execution_id))
+        user_id = cleanup.scalar(select(WorkflowExecution.user_id).where(WorkflowExecution.id == workflow_execution_id))
+        cleanup.execute(delete(WorkflowExecution).where(WorkflowExecution.id == workflow_execution_id))
+        if user_id is not None:
+            cleanup.execute(delete(User).where(User.id == user_id))
+        cleanup.execute(delete(PromptVersion).where(PromptVersion.version == version))
+        cleanup.execute(delete(RulesVersion).where(RulesVersion.version == version))
+        cleanup.commit()
 
 
 def test_v3_chain_reaches_human_approval_with_runnable_attempts(session: Session) -> None:
@@ -307,6 +376,8 @@ def test_v3_chain_reaches_human_approval_with_runnable_attempts(session: Session
     assert len(attempts) == 5
     assert all(attempt.attempt_no == 1 for attempt in attempts)
     assert all(attempt.status is NodeExecutionAttemptStatus.SUCCEEDED for attempt in attempts)
+    assert all(attempt.error_code is None for attempt in attempts)
+    assert all(attempt.latency_ms is not None for attempt in attempts)
     assert attempts[0].prompt_version_id is not None
     assert attempts[0].ai_company == "OPENAI"
     assert attempts[0].model == "test-content-plan-model"
@@ -351,6 +422,8 @@ def test_v3_chain_failure_marks_attempt_node_and_workflow_failed(session: Sessio
     )
     assert attempt is not None
     assert attempt.status is NodeExecutionAttemptStatus.FAILED
+    assert attempt.error_code == "INTERNAL_ERROR"
+    assert attempt.latency_ms is not None
 
 
 def test_v3_content_plan_uses_prompt_version_and_persists_structured_output(session: Session) -> None:
@@ -969,8 +1042,10 @@ def test_image_rejection_rechecks_then_allows_approval_after_pass(
                 "revision_request": "제품 로고를 원본과 일치시켜 주세요.",
             },
         )
-        assert rejected.status_code == 200
-        assert rejected.json()["status"] == "WAITING_APPROVAL"
+        assert rejected.status_code == 202
+        assert rejected.json()["status"] == "RUNNING"
+        revision_intent = _consume_latest_v3_dispatch(session, workflow_engine, execution.id)
+        assert revision_intent.action == ACTION_REVISION
         revised_waiting_node = session.scalar(
             select(NodeExecution)
             .where(
@@ -985,10 +1060,12 @@ def test_image_rejection_rechecks_then_allows_approval_after_pass(
             f"/workflow-executions/{execution.id}/approvals",
             json={"node_execution_id": revised_waiting_node.id},
         )
+        assert approved.status_code == 202
+        resume_intent = _consume_latest_v3_dispatch(session, workflow_engine, execution.id)
+        assert resume_intent.action == ACTION_RESUME
     main.app.dependency_overrides.clear()
 
-    assert approved.status_code == 200
-    assert approved.json()["status"] == "SUCCEEDED"
+    assert approved.json()["status"] == "WAITING_APPROVAL"
     publication_node = session.scalar(
         select(NodeExecution).where(
             NodeExecution.workflow_execution_id == execution.id,
@@ -1091,8 +1168,10 @@ def test_rejected_revision_starts_at_target_and_preserves_unaffected_history(
         )
     main.app.dependency_overrides.clear()
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "WAITING_APPROVAL"
+    assert response.status_code == 202
+    assert response.json()["status"] == "RUNNING"
+    intent = _consume_latest_v3_dispatch(session, workflow_engine, execution.id)
+    assert intent.action == ACTION_REVISION
     revision = session.scalar(
         select(Revision).where(Revision.workflow_execution_id == execution.id)
     )
@@ -1169,6 +1248,9 @@ def test_image_rejection_recheck_failure_and_duplicate_request_are_rejected(
         )
         first = client.post(f"/workflow-executions/{execution.id}/approvals", json=rejection)
         duplicate = client.post(f"/workflow-executions/{execution.id}/approvals", json=rejection)
+        assert first.status_code == 202
+        revision_intent = _consume_latest_v3_dispatch(session, workflow_engine, execution.id)
+        assert revision_intent.action == ACTION_REVISION
         revised_waiting_node = session.scalar(
             select(NodeExecution).where(
                 NodeExecution.workflow_execution_id == execution.id,
@@ -1184,10 +1266,806 @@ def test_image_rejection_recheck_failure_and_duplicate_request_are_rejected(
     main.app.dependency_overrides.clear()
 
     assert invalid_rejection.status_code == 422
-    assert first.status_code == 200
     assert duplicate.status_code == 422
     assert blocked.status_code == 422
     assert "IMAGE_CHECK must pass" in blocked.json()["detail"]
+
+
+def test_rejected_api_commits_approval_revision_prepared_attempt_and_intent_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second Session observes the complete committed revision boundary before a worker runs."""
+    # Keep independently committed test fixtures below normal prompt version 1
+    # so they cannot become the default "latest" prompt for rollback fixtures.
+    version = -int(uuid4().hex[:7], 16)
+    with Session(engine) as api_session:
+        execution = _execution(api_session)
+        _v3_input_contract(api_session, execution, version)
+        workflow_engine = _v3_engine_with_image_check(
+            api_session, RunnableLambda(_image_check_model)
+        )
+        assert (
+            workflow_engine.start_execution(execution.id, {"request_text": "fake"})
+            is WorkflowExecutionStatus.WAITING_APPROVAL
+        )
+        waiting_node = api_session.scalar(
+            select(NodeExecution).where(
+                NodeExecution.workflow_execution_id == execution.id,
+                NodeExecution.node_type == "HUMAN_APPROVAL",
+                NodeExecution.revision_no == 0,
+            )
+        )
+        assert waiting_node is not None
+
+        def get_api_session() -> Iterator[Session]:
+            yield api_session
+
+        main.app.dependency_overrides[main.get_session] = get_api_session
+        monkeypatch.setattr(main, "get_ai_workflow_services", lambda _: object())
+        monkeypatch.setattr(main, "get_workflow_engine", lambda *_args: workflow_engine)
+        monkeypatch.setattr(
+            main.celery_app,
+            "send_task",
+            lambda *_args, **_kwargs: SimpleNamespace(id="atomic-revision-task"),
+        )
+        try:
+            with TestClient(main.app) as client:
+                response = client.post(
+                    f"/workflow-executions/{execution.id}/approvals",
+                    json={
+                        "node_execution_id": waiting_node.id,
+                        "decision": "REJECTED",
+                        "revision_target": "IMAGE",
+                        "revision_request": "Use the current product color.",
+                    },
+                )
+            assert response.status_code == 202
+            assert response.json()["status"] == "RUNNING"
+
+            # No worker/AI execution occurs before this separate-session read.
+            with Session(engine) as observed:
+                approval = observed.scalar(
+                    select(UserApproval).where(UserApproval.node_execution_id == waiting_node.id)
+                )
+                assert approval is not None
+                assert approval.decision is ApprovalDecision.REJECTED
+                revision = observed.scalar(
+                    select(Revision).where(Revision.user_approval_id == approval.id)
+                )
+                assert revision is not None
+                assert revision.revision_no == 1
+                assert revision.start_node_type == "IMAGE_GENERATE"
+                prepared = observed.scalar(
+                    select(NodeExecution).where(
+                        NodeExecution.workflow_execution_id == execution.id,
+                        NodeExecution.node_type == "IMAGE_GENERATE",
+                        NodeExecution.revision_no == revision.revision_no,
+                    )
+                )
+                assert prepared is not None
+                assert prepared.status is NodeExecutionStatus.RUNNING
+                attempt = observed.scalar(
+                    select(NodeExecutionAttempt).where(
+                        NodeExecutionAttempt.node_execution_id == prepared.id,
+                        NodeExecutionAttempt.attempt_no == 1,
+                    )
+                )
+                assert attempt is not None
+                assert attempt.status is NodeExecutionAttemptStatus.RUNNING
+                assert attempt.metadata_["retry_kind"] == "USER_REQUESTED"
+                intent = observed.scalar(
+                    select(WorkflowDispatchIntent).where(
+                        WorkflowDispatchIntent.workflow_execution_id == execution.id,
+                        WorkflowDispatchIntent.action == ACTION_REVISION,
+                    )
+                )
+                assert intent is not None
+                assert intent.revision_target == "IMAGE_GENERATE"
+                assert intent.revision_request == revision.request_text
+                observed_execution = observed.get(WorkflowExecution, execution.id)
+                assert observed_execution is not None
+                assert observed_execution.status is WorkflowExecutionStatus.RUNNING
+                assert observed_execution.current_node_type == prepared.node_type
+        finally:
+            main.app.dependency_overrides.clear()
+            _cleanup_independent_v3_fixture(execution.id, version)
+
+
+def test_rejected_enqueue_failure_keeps_revision_intent_for_relay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Broker failure is post-commit: relay may enqueue the exact same durable intent."""
+    version = -int(uuid4().hex[:7], 16)
+    with Session(engine) as api_session:
+        execution = _execution(api_session)
+        _v3_input_contract(api_session, execution, version)
+        workflow_engine = _v3_engine_with_image_check(
+            api_session, RunnableLambda(_image_check_model)
+        )
+        assert (
+            workflow_engine.start_execution(execution.id, {"request_text": "fake"})
+            is WorkflowExecutionStatus.WAITING_APPROVAL
+        )
+        waiting_node = api_session.scalar(
+            select(NodeExecution).where(
+                NodeExecution.workflow_execution_id == execution.id,
+                NodeExecution.node_type == "HUMAN_APPROVAL",
+            )
+        )
+        assert waiting_node is not None
+
+        def get_api_session() -> Iterator[Session]:
+            yield api_session
+
+        main.app.dependency_overrides[main.get_session] = get_api_session
+        monkeypatch.setattr(main, "get_ai_workflow_services", lambda _: object())
+        monkeypatch.setattr(main, "get_workflow_engine", lambda *_args: workflow_engine)
+        monkeypatch.setattr(
+            main.celery_app,
+            "send_task",
+            Mock(side_effect=ConnectionError("test Redis unavailable")),
+        )
+        try:
+            with TestClient(main.app) as client:
+                response = client.post(
+                    f"/workflow-executions/{execution.id}/approvals",
+                    json={
+                        "node_execution_id": waiting_node.id,
+                        "decision": "REJECTED",
+                        "revision_target": "IMAGE",
+                        "revision_request": "Keep the source product color.",
+                    },
+                )
+            assert response.status_code == 202
+            assert response.json()["status"] == "RUNNING"
+
+            with Session(engine) as observed:
+                revision = observed.scalar(
+                    select(Revision).where(Revision.workflow_execution_id == execution.id)
+                )
+                prepared = observed.scalar(
+                    select(NodeExecution).where(
+                        NodeExecution.workflow_execution_id == execution.id,
+                        NodeExecution.revision_no == 1,
+                    )
+                )
+                attempt = (
+                    observed.scalar(
+                        select(NodeExecutionAttempt).where(
+                            NodeExecutionAttempt.node_execution_id == prepared.id  # type: ignore[union-attr]
+                        )
+                    )
+                    if prepared is not None
+                    else None
+                )
+                intent = observed.scalar(
+                    select(WorkflowDispatchIntent).where(
+                        WorkflowDispatchIntent.workflow_execution_id == execution.id,
+                        WorkflowDispatchIntent.action == ACTION_REVISION,
+                    )
+                )
+                assert revision is not None and prepared is not None and attempt is not None
+                assert intent is not None
+                assert intent.status == PENDING
+                assert intent.last_error == "ConnectionError"
+                assert prepared.status is NodeExecutionStatus.RUNNING
+                assert attempt.attempt_no == 1
+
+                relay_celery = Mock()
+                relay_celery.send_task.return_value = SimpleNamespace(id="relay-task")
+                relayed = GenerationDispatchService(observed, relay_celery, "test_generation").relay_pending()
+                assert relayed == 1
+                observed.refresh(intent)
+                assert intent.status == QUEUED
+                assert intent.dispatch_count == 1
+                assert observed.scalar(
+                    select(Revision).where(Revision.workflow_execution_id == execution.id)
+                ).id == revision.id  # type: ignore[union-attr]
+                assert observed.scalar(
+                    select(NodeExecution).where(
+                        NodeExecution.workflow_execution_id == execution.id,
+                        NodeExecution.revision_no == 1,
+                    )
+                ).id == prepared.id  # type: ignore[union-attr]
+                assert observed.scalar(
+                    select(NodeExecutionAttempt).where(
+                        NodeExecutionAttempt.node_execution_id == prepared.id
+                    )
+                ).id == attempt.id  # type: ignore[union-attr]
+        finally:
+            main.app.dependency_overrides.clear()
+            _cleanup_independent_v3_fixture(execution.id, version)
+
+
+def test_duplicate_revision_dispatch_delivery_reuses_prepared_state_and_completed_intent_noops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sequential duplicate delivery may not create a second user revision or attempt."""
+    version = -int(uuid4().hex[:7], 16)
+    with Session(engine) as api_session:
+        execution = _execution(api_session)
+        _v3_input_contract(api_session, execution, version)
+        workflow_engine = _v3_engine_with_image_check(
+            api_session, RunnableLambda(_image_check_model)
+        )
+        assert (
+            workflow_engine.start_execution(execution.id, {"request_text": "fake"})
+            is WorkflowExecutionStatus.WAITING_APPROVAL
+        )
+        waiting_node = api_session.scalar(
+            select(NodeExecution).where(
+                NodeExecution.workflow_execution_id == execution.id,
+                NodeExecution.node_type == "HUMAN_APPROVAL",
+            )
+        )
+        assert waiting_node is not None
+
+        def get_api_session() -> Iterator[Session]:
+            yield api_session
+
+        main.app.dependency_overrides[main.get_session] = get_api_session
+        monkeypatch.setattr(main, "get_ai_workflow_services", lambda _: object())
+        monkeypatch.setattr(main, "get_workflow_engine", lambda *_args: workflow_engine)
+        monkeypatch.setattr(
+            main.celery_app,
+            "send_task",
+            lambda *_args, **_kwargs: SimpleNamespace(id="duplicate-revision-task"),
+        )
+        try:
+            with TestClient(main.app) as client:
+                response = client.post(
+                    f"/workflow-executions/{execution.id}/approvals",
+                    json={
+                        "node_execution_id": waiting_node.id,
+                        "decision": "REJECTED",
+                        "revision_target": "IMAGE",
+                        "revision_request": "Keep the current product color.",
+                    },
+                )
+            assert response.status_code == 202
+
+            with Session(engine) as observed:
+                intent = observed.scalar(
+                    select(WorkflowDispatchIntent).where(
+                        WorkflowDispatchIntent.workflow_execution_id == execution.id,
+                        WorkflowDispatchIntent.action == ACTION_REVISION,
+                    )
+                )
+                revision = observed.scalar(
+                    select(Revision).where(Revision.workflow_execution_id == execution.id)
+                )
+                prepared = observed.scalar(
+                    select(NodeExecution).where(
+                        NodeExecution.workflow_execution_id == execution.id,
+                        NodeExecution.revision_no == 1,
+                    )
+                )
+                attempt = (
+                    observed.scalar(
+                        select(NodeExecutionAttempt).where(
+                            NodeExecutionAttempt.node_execution_id == prepared.id  # type: ignore[union-attr]
+                        )
+                    )
+                    if prepared is not None
+                    else None
+                )
+                assert intent is not None and revision is not None
+                assert prepared is not None and attempt is not None
+                intent_id, revision_id, node_id, attempt_id = (
+                    intent.id,
+                    revision.id,
+                    prepared.id,
+                    attempt.id,
+                )
+
+            with Session(engine) as worker_session:
+                worker_engine = _v3_engine_with_image_check(
+                    worker_session, RunnableLambda(_image_check_model)
+                )
+                dispatch = GenerationDispatchService(worker_session, Mock(), "test_generation")
+                claimed = dispatch.claim(intent_id)
+                assert claimed is not None
+                execute_claimed_intent(worker_session, claimed, worker_engine, lambda _id: {})
+                assert claimed.claim_token is not None
+                assert dispatch.complete(intent_id, claimed.claim_token, claimed.claim_generation)
+                # The same broker delivery after completion cannot reacquire the intent.
+                assert dispatch.claim(intent_id) is None
+
+            with Session(engine) as observed:
+                completed = observed.get(WorkflowDispatchIntent, intent_id)
+                assert completed is not None
+                assert completed.status == COMPLETED
+                assert [row.id for row in observed.scalars(
+                    select(Revision).where(Revision.workflow_execution_id == execution.id)
+                )] == [revision_id]
+                assert [row.id for row in observed.scalars(
+                    select(NodeExecution).where(
+                        NodeExecution.workflow_execution_id == execution.id,
+                        NodeExecution.revision_no == 1,
+                    )
+                ) if row.node_type == "IMAGE_GENERATE"] == [node_id]
+                assert [row.id for row in observed.scalars(
+                    select(NodeExecutionAttempt).where(
+                        NodeExecutionAttempt.node_execution_id == node_id
+                    )
+                )] == [attempt_id]
+        finally:
+            main.app.dependency_overrides.clear()
+            _cleanup_independent_v3_fixture(execution.id, version)
+
+
+def test_generation_worker_uses_v3_executor_for_approved_resume_and_persists_atomic_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The actual worker composition root selects V3NodeExecutor from workflow_version."""
+    from app import generation_tasks
+
+    version = -int(uuid4().hex[:7], 16)
+    with Session(engine) as api_session:
+        execution = _execution(api_session)
+        _v3_input_contract(api_session, execution, version)
+        api_engine = _v3_engine_with_image_check(api_session, RunnableLambda(_image_check_model))
+        assert (
+            api_engine.start_execution(execution.id, {"request_text": "fake"})
+            is WorkflowExecutionStatus.WAITING_APPROVAL
+        )
+        waiting_node = api_session.scalar(
+            select(NodeExecution).where(
+                NodeExecution.workflow_execution_id == execution.id,
+                NodeExecution.node_type == "HUMAN_APPROVAL",
+            )
+        )
+        assert waiting_node is not None
+        try:
+            with monkeypatch.context() as api_patch, _approval_client(
+                api_session, api_engine, api_patch
+            ) as client:
+                response = client.post(
+                    f"/workflow-executions/{execution.id}/approvals",
+                    json={"node_execution_id": waiting_node.id, "decision": "APPROVED"},
+                )
+            assert response.status_code == 202
+            assert response.json()["status"] == "WAITING_APPROVAL"
+
+            with Session(engine) as observed:
+                approval = observed.scalar(
+                    select(UserApproval).where(UserApproval.node_execution_id == waiting_node.id)
+                )
+                intent = observed.scalar(
+                    select(WorkflowDispatchIntent).where(
+                        WorkflowDispatchIntent.workflow_execution_id == execution.id,
+                        WorkflowDispatchIntent.action == ACTION_RESUME,
+                    )
+                )
+                persisted = observed.get(WorkflowExecution, execution.id)
+                assert approval is not None
+                assert approval.decision is ApprovalDecision.APPROVED
+                assert intent is not None
+                assert intent.status == QUEUED
+                assert persisted is not None
+                assert persisted.status is WorkflowExecutionStatus.WAITING_APPROVAL
+                intent_id = intent.id
+
+            executed_nodes: list[str] = []
+            original_v3_execute = V3NodeExecutor.execute
+
+            def record_v3_execute(
+                executor: V3NodeExecutor, node_key: str, *args: object, **kwargs: object
+            ) -> NodeExecutionResult:
+                executed_nodes.append(node_key)
+                return original_v3_execute(executor, node_key, *args, **kwargs)
+
+            def rule_executor_must_not_run(*args: object, **kwargs: object) -> NodeExecutionResult:
+                del args, kwargs
+                raise AssertionError("V3 worker selected RuleBasedNodeExecutor")
+
+            # The worker currently builds legacy services before it branches on
+            # workflow_version.  V3 PUBLICATION does not invoke this provider.
+            monkeypatch.setattr(main.app.state, "llm_provider", object(), raising=False)
+            monkeypatch.setattr(V3NodeExecutor, "execute", record_v3_execute)
+            monkeypatch.setattr(main.RuleBasedNodeExecutor, "execute", rule_executor_must_not_run)
+            generation_tasks.execute_generation.run(intent_id)
+
+            with Session(engine) as observed:
+                completed = observed.get(WorkflowDispatchIntent, intent_id)
+                persisted = observed.get(WorkflowExecution, execution.id)
+                publication = observed.scalar(
+                    select(NodeExecution).where(
+                        NodeExecution.workflow_execution_id == execution.id,
+                        NodeExecution.node_type == "PUBLICATION",
+                    )
+                )
+                assert completed is not None
+                assert completed.status == COMPLETED
+                assert persisted is not None
+                assert persisted.status is WorkflowExecutionStatus.SUCCEEDED
+                assert publication is not None
+                assert publication.status is NodeExecutionStatus.SUCCEEDED
+                assert observed.scalar(
+                    select(SocialPublication).where(SocialPublication.node_execution_id == publication.id)
+                ) is None
+            assert executed_nodes == ["PUBLICATION"]
+        finally:
+            main.app.dependency_overrides.clear()
+            _cleanup_independent_v3_fixture(execution.id, version)
+
+
+def test_approved_commit_failure_rolls_back_approval_and_resume_intent(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    workflow_engine = _v3_engine_with_image_check(session, RunnableLambda(_image_check_model))
+    assert (
+        workflow_engine.start_execution(execution.id, {"request_text": "fake"})
+        is WorkflowExecutionStatus.WAITING_APPROVAL
+    )
+    waiting_node = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "HUMAN_APPROVAL",
+        )
+    )
+    assert waiting_node is not None
+
+    def fail_commit() -> None:
+        raise RuntimeError("simulated approved commit failure")
+
+    monkeypatch.setattr(session, "commit", fail_commit)
+    with pytest.raises(RuntimeError, match="simulated approved commit failure"):
+        main.approve_workflow_node(
+            execution.id,
+            main.ApprovalRequest(node_execution_id=waiting_node.id, decision=ApprovalDecision.APPROVED),
+            session,
+        )
+    session.expire_all()
+
+    assert session.scalar(
+        select(UserApproval).where(UserApproval.node_execution_id == waiting_node.id)
+    ) is None
+    assert session.scalar(
+        select(WorkflowDispatchIntent).where(
+            WorkflowDispatchIntent.workflow_execution_id == execution.id,
+            WorkflowDispatchIntent.action == ACTION_RESUME,
+        )
+    ) is None
+    persisted = session.get(WorkflowExecution, execution.id)
+    assert persisted is not None
+    assert persisted.status is WorkflowExecutionStatus.WAITING_APPROVAL
+    assert waiting_node.status is NodeExecutionStatus.WAITING
+
+
+def test_expired_generation_claim_reclaims_with_new_fencing_token_and_rejects_old_completion(
+    session: Session,
+) -> None:
+    execution = _execution(session)
+    intent = GenerationDispatchService(session, Mock(), "test_generation").create(
+        execution.id, "START"
+    )
+    session.commit()
+    first_dispatch = GenerationDispatchService(session, Mock(), "test_generation")
+    first = first_dispatch.claim(intent.id, lease_seconds=1)
+    assert first is not None and first.claim_token is not None
+    first_token, first_generation = first.claim_token, first.claim_generation
+    original_expiry = first.lease_expires_at
+    assert original_expiry is not None
+    assert first_dispatch.heartbeat(intent.id, first_token, first_generation, 30)
+    session.refresh(first)
+    assert first.status == CLAIMED
+    assert first.lease_expires_at is not None and first.lease_expires_at > original_expiry
+
+    first.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    session.commit()
+    session.expire_all()
+    second = first_dispatch.claim(intent.id, lease_seconds=30)
+    assert second is not None and second.claim_token is not None
+    assert second.claim_generation == first_generation + 1
+    assert second.claim_token != first_token
+    assert first_dispatch.complete(intent.id, first_token, first_generation) is False
+    assert first_dispatch.complete(intent.id, second.claim_token, second.claim_generation) is True
+    session.expire_all()
+    assert session.get(WorkflowDispatchIntent, intent.id).status == COMPLETED  # type: ignore[union-attr]
+
+
+def test_stale_claim_cannot_commit_workflow_state_or_intent_from_separate_sessions(
+    session: Session, request: pytest.FixtureRequest,
+) -> None:
+    """A real DB re-claim fences both dispatch finalization and Engine state commit."""
+    with Session(engine) as setup:
+        user = User(email=f"{uuid4()}@example.com", name="fencing concurrency tester")
+        setup.add(user)
+        setup.flush()
+        execution = WorkflowExecution(
+            user_id=user.id,
+            workflow_key="vora_content_creation",
+            workflow_version=3,
+        )
+        setup.add(execution)
+        setup.flush()
+        intent = GenerationDispatchService(setup, Mock(), "test_generation").create(
+            execution.id, ACTION_START
+        )
+        execution_id = execution.id
+        intent_id = intent.id
+        setup.commit()
+    request.addfinalizer(lambda: _cleanup_independent_v3_fixture(execution_id, -999999999))
+
+    with Session(engine) as worker_a_session, Session(engine) as worker_b_session:
+        worker_a_dispatch = GenerationDispatchService(worker_a_session, Mock(), "test_generation")
+        first = worker_a_dispatch.claim(intent_id, lease_seconds=30)
+        assert first is not None and first.claim_token is not None
+        first_token, first_generation = first.claim_token, first.claim_generation
+        assert worker_a_dispatch.owns(intent_id, first_token, first_generation)
+
+        worker_b_dispatch = GenerationDispatchService(worker_b_session, Mock(), "test_generation")
+        expired = worker_b_session.get(WorkflowDispatchIntent, intent_id)
+        assert expired is not None
+        expired.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        worker_b_session.commit()
+        second = worker_b_dispatch.claim(intent_id, lease_seconds=30)
+        assert second is not None and second.claim_token is not None
+        assert second.claim_generation == first_generation + 1
+        second_generation = second.claim_generation
+
+        assert worker_a_dispatch.complete(intent_id, first_token, first_generation) is False
+        assert (
+            worker_a_dispatch.fail(
+                intent_id,
+                RuntimeError("stale worker"),
+                first_token,
+                first_generation,
+            )
+            is False
+        )
+
+        stale_execution = worker_a_session.get(WorkflowExecution, execution_id)
+        assert stale_execution is not None
+        stale_execution.status = WorkflowExecutionStatus.SUCCEEDED
+        stale_engine = WorkflowEngine(worker_a_session, workflow_registry, Mock())
+        stale_engine.set_execution_fence(
+            lambda: worker_a_dispatch.owns_for_update(
+                intent_id, first_token, first_generation
+            )
+        )
+        with pytest.raises(RuntimeError, match="lease ownership was lost"):
+            stale_engine._commit_state()
+        worker_a_session.rollback()
+
+        current_execution = worker_b_session.get(WorkflowExecution, execution_id)
+        assert current_execution is not None
+        current_execution.status = WorkflowExecutionStatus.SUCCEEDED
+        current_execution.current_node_type = None
+        current_node = NodeExecution(
+            workflow_execution_id=execution_id,
+            node_type="CONTENT_PLAN",
+            revision_no=0,
+            input_data={},
+            output_data={"fenced": True},
+            status=NodeExecutionStatus.SUCCEEDED,
+        )
+        worker_b_session.add(current_node)
+        worker_b_session.flush()
+        worker_b_session.add(
+            NodeExecutionAttempt(
+                node_execution_id=current_node.id,
+                attempt_no=1,
+                status=NodeExecutionAttemptStatus.SUCCEEDED,
+            )
+        )
+        current_engine = WorkflowEngine(worker_b_session, workflow_registry, Mock())
+        current_engine.set_execution_fence(
+            lambda: worker_b_dispatch.owns_for_update(
+                intent_id, second.claim_token, second.claim_generation
+            )
+        )
+        current_engine._commit_state()
+        assert worker_b_dispatch.complete(
+            intent_id, second.claim_token, second.claim_generation
+        )
+
+    with Session(engine) as observed:
+        persisted_intent = observed.get(WorkflowDispatchIntent, intent_id)
+        persisted_execution = observed.get(WorkflowExecution, execution_id)
+        persisted_node = observed.scalar(
+            select(NodeExecution).where(NodeExecution.workflow_execution_id == execution_id)
+        )
+        persisted_attempt = observed.scalar(
+            select(NodeExecutionAttempt).where(
+                NodeExecutionAttempt.node_execution_id == persisted_node.id  # type: ignore[union-attr]
+            )
+        )
+        assert persisted_intent is not None and persisted_intent.status == COMPLETED
+        assert persisted_intent.claim_generation == second_generation
+        assert persisted_execution is not None
+        assert persisted_execution.status is WorkflowExecutionStatus.SUCCEEDED
+        assert persisted_node is not None and persisted_node.output_data == {"fenced": True}
+        assert persisted_attempt is not None
+        assert persisted_attempt.status is NodeExecutionAttemptStatus.SUCCEEDED
+
+    with Session(engine) as cleanup:
+        node_ids = select(NodeExecution.id).where(
+            NodeExecution.workflow_execution_id == execution_id
+        )
+        cleanup.execute(
+            delete(NodeExecutionAttempt).where(NodeExecutionAttempt.node_execution_id.in_(node_ids))
+        )
+        cleanup.execute(delete(NodeExecution).where(NodeExecution.workflow_execution_id == execution_id))
+        cleanup.execute(
+            delete(WorkflowDispatchIntent).where(
+                WorkflowDispatchIntent.workflow_execution_id == execution_id
+            )
+        )
+        user_id = cleanup.scalar(
+            select(WorkflowExecution.user_id).where(WorkflowExecution.id == execution_id)
+        )
+        cleanup.execute(delete(WorkflowExecution).where(WorkflowExecution.id == execution_id))
+        if user_id is not None:
+            cleanup.execute(delete(User).where(User.id == user_id))
+        cleanup.commit()
+
+
+def test_start_crash_recovery_reuses_completed_nodes_and_fences_late_result(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    engine_instance = _v3_engine_with_image_check(session, RunnableLambda(_image_check_model))
+    original_execute = V3NodeExecutor.execute
+
+    def crash_during_text(
+        executor: V3NodeExecutor, node_key: str, *args: object, **kwargs: object
+    ) -> NodeExecutionResult:
+        if node_key == "TEXT_GENERATE":
+            raise KeyboardInterrupt("simulated worker crash")
+        return original_execute(executor, node_key, *args, **kwargs)
+
+    monkeypatch.setattr(V3NodeExecutor, "execute", crash_during_text)
+    with pytest.raises(KeyboardInterrupt, match="simulated worker crash"):
+        engine_instance.start_execution(execution.id, {"request_text": "fake"})
+    monkeypatch.setattr(V3NodeExecutor, "execute", original_execute)
+
+    completed_plan = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "CONTENT_PLAN",
+            NodeExecution.status == NodeExecutionStatus.SUCCEEDED,
+        )
+    )
+    interrupted_text = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "TEXT_GENERATE",
+            NodeExecution.status == NodeExecutionStatus.RUNNING,
+        )
+    )
+    assert completed_plan is not None and interrupted_text is not None
+    assert engine_instance.recover_interrupted_execution(execution.id) is WorkflowExecutionStatus.WAITING_APPROVAL
+    assert session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "CONTENT_PLAN",
+        )
+    ).id == completed_plan.id  # type: ignore[union-attr]
+    assert interrupted_text.status is NodeExecutionStatus.SUCCEEDED
+
+    fenced_execution = _execution(session)
+    _v3_input_contract(session, fenced_execution, -int(uuid4().hex[:7], 16))
+    still_owner = {"value": True}
+    fenced_engine = _v3_engine_with_image_check(session, RunnableLambda(_image_check_model))
+    fenced_engine.set_execution_guard(lambda: still_owner["value"])
+
+    def lose_claim_after_provider(
+        executor: V3NodeExecutor, node_key: str, *args: object, **kwargs: object
+    ) -> NodeExecutionResult:
+        result = original_execute(executor, node_key, *args, **kwargs)
+        still_owner["value"] = False
+        return result
+
+    monkeypatch.setattr(V3NodeExecutor, "execute", lose_claim_after_provider)
+    with pytest.raises(RuntimeError, match="lease ownership was lost"):
+        fenced_engine.start_execution(fenced_execution.id, {"request_text": "fake"})
+    monkeypatch.setattr(V3NodeExecutor, "execute", original_execute)
+    stale_node = session.scalar(
+        select(NodeExecution).where(NodeExecution.workflow_execution_id == fenced_execution.id)
+    )
+    stale_attempt = session.scalar(
+        select(NodeExecutionAttempt).where(NodeExecutionAttempt.node_execution_id == stale_node.id)  # type: ignore[union-attr]
+    )
+    assert stale_node is not None and stale_attempt is not None
+    assert stale_node.status is NodeExecutionStatus.RUNNING
+    assert stale_attempt.status is NodeExecutionAttemptStatus.RUNNING
+
+
+def test_resume_and_revision_crash_recovery_continue_only_unfinished_boundary(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    workflow_engine = _v3_engine_with_image_check(session, RunnableLambda(_image_check_model))
+    assert (
+        workflow_engine.start_execution(execution.id, {"request_text": "fake"})
+        is WorkflowExecutionStatus.WAITING_APPROVAL
+    )
+    waiting_node = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "HUMAN_APPROVAL",
+        )
+    )
+    assert waiting_node is not None
+    session.add(
+        UserApproval(
+            workflow_execution_id=execution.id,
+            node_execution_id=waiting_node.id,
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+    session.commit()
+    original_run_nodes = workflow_engine._run_nodes
+
+    def crash_before_publication(*args: object, **kwargs: object) -> WorkflowExecutionStatus:
+        del args, kwargs
+        raise KeyboardInterrupt("simulated resume crash")
+
+    monkeypatch.setattr(workflow_engine, "_run_nodes", crash_before_publication)
+    with pytest.raises(KeyboardInterrupt, match="simulated resume crash"):
+        workflow_engine.resume_after_approval(execution.id)
+    monkeypatch.setattr(workflow_engine, "_run_nodes", original_run_nodes)
+    assert workflow_engine.recover_interrupted_execution(execution.id) is WorkflowExecutionStatus.SUCCEEDED
+    assert session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "PUBLICATION",
+        )
+    ).status is NodeExecutionStatus.SUCCEEDED  # type: ignore[union-attr]
+
+    revision_execution = _execution(session)
+    _v3_input_contract(session, revision_execution, -int(uuid4().hex[:7], 16))
+    revision_engine = _v3_engine_with_image_check(session, RunnableLambda(_image_check_model))
+    assert (
+        revision_engine.start_execution(revision_execution.id, {"request_text": "fake"})
+        is WorkflowExecutionStatus.WAITING_APPROVAL
+    )
+    revision_waiting = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == revision_execution.id,
+            NodeExecution.node_type == "HUMAN_APPROVAL",
+        )
+    )
+    assert revision_waiting is not None
+    approval = UserApproval(
+        workflow_execution_id=revision_execution.id,
+        node_execution_id=revision_waiting.id,
+        decision=ApprovalDecision.REJECTED,
+    )
+    session.add(approval)
+    session.flush()
+    original_execute_prepared = revision_engine._execute_prepared_node
+
+    def crash_after_revision_prepare(*args: object, **kwargs: object) -> WorkflowExecutionStatus:
+        del args, kwargs
+        raise KeyboardInterrupt("simulated revision crash")
+
+    monkeypatch.setattr(revision_engine, "_execute_prepared_node", crash_after_revision_prepare)
+    with pytest.raises(KeyboardInterrupt, match="simulated revision crash"):
+        revision_engine.start_rejected_revision(
+            revision_execution.id,
+            "IMAGE_GENERATE",
+            "Preserve the product color.",
+            user_approval_id=approval.id,
+        )
+    monkeypatch.setattr(revision_engine, "_execute_prepared_node", original_execute_prepared)
+    assert (
+        revision_engine.recover_interrupted_execution(revision_execution.id)
+        is WorkflowExecutionStatus.WAITING_APPROVAL
+    )
+    assert len(
+        list(
+            session.scalars(
+                select(Revision).where(Revision.workflow_execution_id == revision_execution.id)
+            )
+        )
+    ) == 1
 
 
 @pytest.mark.parametrize("revision_target", ["PLAN", "TEXT", "IMAGE"])
@@ -1213,7 +2091,7 @@ def test_rejected_revision_commit_failure_rolls_back_all_prepared_state(
 
     monkeypatch.setattr(session, "commit", fail_commit)
     monkeypatch.setattr(main, "get_ai_workflow_services", lambda _: object())
-    monkeypatch.setattr(main, "get_workflow_engine", lambda _session, _services: workflow_engine)
+    monkeypatch.setattr(main, "get_workflow_engine", lambda *_args: workflow_engine)
 
     with pytest.raises(RuntimeError, match="simulated commit failure"):
         main.approve_workflow_node(
@@ -1273,8 +2151,10 @@ def test_rejected_image_revision_execution_failure_marks_prepared_state_failed(
         )
     main.app.dependency_overrides.clear()
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "FAILED"
+    assert response.status_code == 202
+    assert response.json()["status"] == "RUNNING"
+    intent = _consume_latest_v3_dispatch(session, workflow_engine, execution.id)
+    assert intent.action == ACTION_REVISION
     revision = session.scalar(
         select(NodeExecution).where(
             NodeExecution.workflow_execution_id == execution.id,

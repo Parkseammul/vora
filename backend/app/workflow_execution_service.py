@@ -59,6 +59,30 @@ class WorkflowExecutionService:
         source_image: UploadedInputImage,
         workflow_engine: WorkflowEngine,
     ) -> WorkflowStartResult:
+        execution = self.create_pending(
+            request_text, marketing_info, theme, rules_version_id, source_image
+        )
+        input_data = self.input_data(execution.id)
+        status = workflow_engine.start_execution(execution.id, input_data)
+        if status is not WorkflowExecutionStatus.WAITING_APPROVAL:
+            raise WorkflowCreationError("Workflow did not reach human approval")
+        current_node = self._session.scalars(
+            select(NodeExecution).where(
+                NodeExecution.workflow_execution_id == execution.id,
+                NodeExecution.node_type == "HUMAN_APPROVAL",
+                NodeExecution.status == NodeExecutionStatus.WAITING,
+            )
+        ).one()
+        return WorkflowStartResult(workflow_execution=execution, current_node=current_node)
+
+    def create_pending(
+        self,
+        request_text: str,
+        marketing_info: str,
+        theme: str | None,
+        rules_version_id: int,
+        source_image: UploadedInputImage,
+    ) -> WorkflowExecution:
         self._validate_request(request_text, marketing_info, source_image)
         stored_paths: list[Path] = []
         try:
@@ -99,8 +123,8 @@ class WorkflowExecutionService:
                 rules_version_id=rules_version_id,
             )
             self._session.add(snapshot)
-            # Files and input rows are durable before the engine reconstructs its input from DB.
-            self._session.commit()
+            # The caller commits this together with its durable dispatch intent.
+            self._session.flush()
         except (OSError, SQLAlchemyError, WorkflowCreationError) as exc:
             self._session.rollback()
             self._cleanup_files(stored_paths)
@@ -108,18 +132,10 @@ class WorkflowExecutionService:
                 raise
             raise WorkflowCreationError("Failed to persist workflow input") from exc
 
-        input_data = self._assemble_input_data(execution.id)
-        status = workflow_engine.start_execution(execution.id, input_data)
-        if status is not WorkflowExecutionStatus.WAITING_APPROVAL:
-            raise WorkflowCreationError("Workflow did not reach human approval")
-        current_node = self._session.scalars(
-            select(NodeExecution).where(
-                NodeExecution.workflow_execution_id == execution.id,
-                NodeExecution.node_type == "HUMAN_APPROVAL",
-                NodeExecution.status == NodeExecutionStatus.WAITING,
-            )
-        ).one()
-        return WorkflowStartResult(workflow_execution=execution, current_node=current_node)
+        return execution
+
+    def input_data(self, workflow_execution_id: int) -> dict[str, object]:
+        return self._assemble_input_data(workflow_execution_id)
 
     def _assemble_input_data(self, workflow_execution_id: int) -> dict[str, object]:
         snapshot = self._session.scalar(

@@ -9,7 +9,12 @@ from urllib.parse import urlencode, urlsplit
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr, field_validator, model_validator
@@ -30,6 +35,13 @@ from app.e2e_providers import (
     DeterministicE2ELLMProvider,
     FFmpegE2ETTSProvider,
     FFmpegE2EVideoProvider,
+    wait_for_e2e_node_gate,
+)
+from app.generation_dispatch import (
+    ACTION_RESUME,
+    ACTION_REVISION,
+    ACTION_START,
+    GenerationDispatchService,
 )
 from app.image_provider import OpenAIImageProvider
 from app.llm_provider import LLMProvider, LLMProviderType, MultiVendorLLMProvider
@@ -42,11 +54,15 @@ from app.media_providers import (
 )
 from app.models import (
     ApprovalDecision,
+    ExecutionInputSnapshot,
     FileAsset,
     NodeExecution,
     NodeExecutionAttempt,
     NodeExecutionStatus,
     OAuthAuthorizationState,
+    PromptVersion,
+    Revision,
+    RulesVersion,
     SocialAccountConnection,
     SocialConnectionStatus,
     SocialPlatform,
@@ -70,7 +86,14 @@ from app.social_providers import (
     YouTubeProvider,
     platform_from_string,
 )
-from app.v3_runtime import ImageCheckOutput, V3NodeExecutor
+from app.v3_runtime import (
+    ContentPlanOutput,
+    ImageCheckOutput,
+    SlideText,
+    TextCheckOutput,
+    TextGenerateOutput,
+    V3NodeExecutor,
+)
 from app.video_async import (
     CeleryVideoTaskDispatcher,
     RedisVideoProgressEvents,
@@ -159,6 +182,11 @@ def get_session() -> Iterator[Session]:
         yield session
 
 
+def get_trace_authenticated_user_id() -> int:
+    """Fail closed until a real authentication provider supplies a trusted identity."""
+    raise HTTPException(status_code=401, detail="Trace authentication is not configured")
+
+
 def configure_llm_provider(llm_provider: LLMProvider) -> None:
     """Application bootstrap injects the concrete vendor adapter once."""
     app.state.llm_provider = llm_provider
@@ -226,6 +254,10 @@ def get_video_task_dispatcher() -> VideoTaskDispatcher:
     return CeleryVideoTaskDispatcher(
         celery_app, get_video_progress_events(), settings.video_generation_queue
     )
+
+
+def get_generation_dispatcher(session: Session) -> GenerationDispatchService:
+    return GenerationDispatchService(session, celery_app, settings.generation_queue)
 
 
 def get_ai_workflow_services(session: Session) -> AIWorkflowServices:
@@ -303,16 +335,39 @@ def get_workflow_engine(
             if settings.e2e_fake_providers
             else None
         )
+        content_plan_model: Runnable[dict[str, object], ContentPlanOutput] | None = (
+            RunnableLambda(
+                lambda _: ContentPlanOutput(
+                    core_message="Offline V3 carousel message",
+                    slide_structure=["hook", "benefit", "proof", "detail", "cta"],
+                )
+            )
+            if settings.e2e_fake_providers
+            else None
+        )
+        text_generate_model: Runnable[dict[str, object], TextGenerateOutput] | None = (
+            RunnableLambda(lambda _: _e2e_text_generate_output())
+            if settings.e2e_fake_providers
+            else None
+        )
+        text_check_model: Runnable[dict[str, object], TextCheckOutput] | None = (
+            RunnableLambda(lambda _: _e2e_text_check_output())
+            if settings.e2e_fake_providers
+            else None
+        )
         return WorkflowEngine(
             session,
             workflow_registry,
             V3NodeExecutor(
                 session=session,
-                content_plan_model_factory=get_content_plan_chat_model,
+                content_plan_model=content_plan_model,
+                content_plan_model_factory=None if content_plan_model else get_content_plan_chat_model,
                 content_plan_model_name=settings.content_planning_model,
-                text_generate_model_factory=get_text_generate_chat_model,
+                text_generate_model=text_generate_model,
+                text_generate_model_factory=None if text_generate_model else get_text_generate_chat_model,
                 text_generate_model_name=settings.script_generation_model,
-                text_check_model_factory=get_text_check_chat_model,
+                text_check_model=text_check_model,
+                text_check_model_factory=None if text_check_model else get_text_check_chat_model,
                 text_check_model_name=settings.script_generation_model,
                 image_provider=image_provider,
                 image_model_name=settings.image_generation_model,
@@ -335,6 +390,18 @@ def get_workflow_engine(
         ),
         get_video_task_dispatcher(),
     )
+
+
+def _e2e_text_generate_output() -> TextGenerateOutput:
+    wait_for_e2e_node_gate("TEXT_GENERATE")
+    return TextGenerateOutput(
+        slides=[SlideText(slide_no=index, text=f"Offline slide {index}") for index in range(1, 6)]
+    )
+
+
+def _e2e_text_check_output() -> TextCheckOutput:
+    wait_for_e2e_node_gate("TEXT_CHECK")
+    return TextCheckOutput(passed=True, violations=[], feedback=None)
 
 
 def _get_execution_or_404(session: Session, workflow_execution_id: int) -> WorkflowExecution:
@@ -405,6 +472,119 @@ def _publication_response(session: Session, publication: SocialPublication) -> d
     return {"id": publication.id, "platform": connection.platform.value if connection else "UNKNOWN", "status": publication.status.value, "external_post_url": publication.external_post_url, "attempt": {"current": attempts[-1].attempt_no if attempts else 0, "max": 3}}
 
 
+def _attempt_trace(session: Session, attempt: NodeExecutionAttempt) -> dict[str, object]:
+    prompt = session.get(PromptVersion, attempt.prompt_version_id) if attempt.prompt_version_id else None
+    return {
+        "attempt_no": attempt.attempt_no,
+        "status": attempt.status.value,
+        "started_at": attempt.started_at,
+        "completed_at": attempt.completed_at,
+        "ai_company": attempt.ai_company,
+        "model": attempt.model,
+        "prompt_version": (
+            {"id": prompt.id, "node_type": prompt.node_type, "version": prompt.version}
+            if prompt is not None
+            else None
+        ),
+        "latency_ms": attempt.latency_ms,
+        "input_tokens": attempt.input_tokens,
+        "output_tokens": attempt.output_tokens,
+        "cost": attempt.cost,
+        "error_code": attempt.error_code,
+        # Stored diagnostics may contain provider details; external Trace clients
+        # receive the durable domain code and a generic safe explanation instead.
+        "error_message": "Execution failed; see error_code." if attempt.error_message else None,
+    }
+
+
+def _workflow_trace(session: Session, execution: WorkflowExecution) -> dict[str, object]:
+    snapshot = session.scalar(
+        select(ExecutionInputSnapshot).where(ExecutionInputSnapshot.workflow_execution_id == execution.id)
+    )
+    rules = session.get(RulesVersion, snapshot.rules_version_id) if snapshot else None
+    nodes = list(session.scalars(
+        select(NodeExecution)
+        .where(NodeExecution.workflow_execution_id == execution.id)
+        .order_by(NodeExecution.revision_no, NodeExecution.id)
+    ))
+    approvals = list(session.scalars(
+        select(UserApproval).where(UserApproval.workflow_execution_id == execution.id).order_by(UserApproval.id)
+    ))
+    revisions = list(session.scalars(
+        select(Revision).where(Revision.workflow_execution_id == execution.id).order_by(Revision.revision_no)
+    ))
+    publications = list(session.scalars(
+        select(SocialPublication)
+        .join(NodeExecution, SocialPublication.node_execution_id == NodeExecution.id)
+        .where(NodeExecution.workflow_execution_id == execution.id)
+        .order_by(SocialPublication.id)
+    ))
+    return {
+        "workflow": {
+            "id": execution.id,
+            "workflow_key": execution.workflow_key,
+            "workflow_version": execution.workflow_version,
+            "status": execution.status.value,
+            "started_at": execution.started_at,
+            "completed_at": execution.completed_at,
+        },
+        "rules_version": {"id": rules.id, "version": rules.version} if rules else None,
+        "nodes": [
+            {
+                "id": node.id,
+                "node_type": node.node_type,
+                "revision_no": node.revision_no,
+                "status": node.status.value,
+                "started_at": node.started_at,
+                "completed_at": node.completed_at,
+                "attempts": [
+                    _attempt_trace(session, attempt) for attempt in session.scalars(
+                        select(NodeExecutionAttempt)
+                        .where(NodeExecutionAttempt.node_execution_id == node.id)
+                        .order_by(NodeExecutionAttempt.attempt_no)
+                    )
+                ],
+            }
+            for node in nodes
+        ],
+        "approvals": [
+            {"node_execution_id": item.node_execution_id, "decision": item.decision.value, "decided_at": item.decided_at}
+            for item in approvals
+        ],
+        "revisions": [
+            {
+                "revision_no": item.revision_no,
+                "start_node_type": item.start_node_type,
+                "created_at": item.created_at,
+            }
+            for item in revisions
+        ],
+        "publications": [
+            {
+                "id": publication.id,
+                "status": publication.status.value,
+                "published_at": publication.published_at,
+                "attempts": [
+                    {
+                        "attempt_no": item.attempt_no,
+                        "status": item.status.value,
+                        "started_at": item.started_at,
+                        "finished_at": item.finished_at,
+                        "error_code": item.error_code,
+                        "error_message": (
+                            "Publication failed; see error_code."
+                            if item.error_message
+                            else None
+                        ),
+                    }
+                    for item in session.scalars(select(SocialPublicationAttempt).where(SocialPublicationAttempt.social_publication_id == publication.id).order_by(SocialPublicationAttempt.attempt_no))
+                ],
+            }
+            for publication in publications
+        ],
+    }
+
+
 def _dev_user_or_404(session: Session) -> User:
     user = session.scalar(select(User).where(User.email == "dev@vora.local"))
     if user is None:
@@ -424,6 +604,24 @@ def get_workflow_execution(
     session: Session = Depends(get_session),  # noqa: B008
 ):
     return _workflow_response(session, _get_execution_or_404(session, workflow_execution_id))
+
+
+@app.get("/workflow-executions/{workflow_execution_id}/trace")
+def get_workflow_trace(
+    workflow_execution_id: int,
+    session: Session = Depends(get_session),  # noqa: B008
+    authenticated_user_id: int = Depends(get_trace_authenticated_user_id),
+):
+    """Read durable execution history without exposing prompts, payloads, or credentials."""
+    execution = session.scalar(
+        select(WorkflowExecution).where(
+            WorkflowExecution.id == workflow_execution_id,
+            WorkflowExecution.user_id == authenticated_user_id,
+        )
+    )
+    if execution is None:
+        raise HTTPException(status_code=404, detail="Workflow execution was not found")
+    return _workflow_trace(session, execution)
 
 
 @app.get("/workflow-executions/{workflow_execution_id}/plan")
@@ -747,31 +945,32 @@ async def create_workflow_execution(
         content_type=source_image.content_type or "",
         content=await source_image.read(),
     )
-    workflow_engine = get_workflow_engine(
-        session, get_ai_workflow_services(session), workflow_version=3
-    )
     service = WorkflowExecutionService(session)
     try:
-        result = service.create_and_start(
+        execution = service.create_pending(
             request_text=request_text,
             marketing_info=marketing_info,
             theme=theme,
             rules_version_id=rules_version_id,
             source_image=uploaded_source_image,
-            workflow_engine=workflow_engine,
         )
+        intent = get_generation_dispatcher(session).create(execution.id, ACTION_START)
+        session.commit()
     except ValueError as exc:
+        session.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except WorkflowCreationError as exc:
+        session.rollback()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return {
-        "workflow_execution_id": result.workflow_execution.id,
-        "status": result.workflow_execution.status.value,
-        "current_node": result.current_node.node_type,
-        "current_node_execution_id": result.current_node.id,
-        "result": result.current_node.output_data,
-    }
+    get_generation_dispatcher(session).enqueue(intent.id)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "workflow_execution_id": execution.id,
+            "status": execution.status.value,
+            "dispatch_intent_id": intent.id,
+        },
+    )
 
 
 @app.post("/workflow-executions/{workflow_execution_id}/revisions")
@@ -852,6 +1051,50 @@ def approve_workflow_node(
         decision=request.decision,
     )
     session.add(approval)
+    if execution.workflow_version == 3:
+        if request.decision is ApprovalDecision.REJECTED:
+            target_node_key = {
+                "PLAN": "CONTENT_PLAN",
+                "TEXT": "TEXT_GENERATE",
+                "IMAGE": "IMAGE_GENERATE",
+            }[request.revision_target or ""]
+            # Engine owns revision/node/attempt state; this API transaction adds
+            # the user decision and durable dispatch intent before any worker runs.
+            session.flush()
+            get_workflow_engine(
+                session, get_ai_workflow_services(session), execution.workflow_version
+            ).prepare_rejected_revision(
+                execution.id,
+                target_node_key,
+                request.revision_request or "",
+                user_approval_id=approval.id,
+            )
+            intent = get_generation_dispatcher(session).create(
+                execution.id,
+                ACTION_REVISION,
+                target_node_key,
+                request.revision_request or "",
+            )
+        else:
+            intent = get_generation_dispatcher(session).create(execution.id, ACTION_RESUME)
+        try:
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise HTTPException(status_code=422, detail="Node already has a user decision") from exc
+        except Exception:
+            # A failed transaction must not leave a prepared revision visible.
+            session.rollback()
+            raise
+        get_generation_dispatcher(session).enqueue(intent.id)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "workflow_execution_id": execution.id,
+                "status": execution.status.value,
+                "dispatch_intent_id": intent.id,
+            },
+        )
     if request.decision is ApprovalDecision.REJECTED:
         try:
             # Flush only assigns the approval id. The engine commits this row together

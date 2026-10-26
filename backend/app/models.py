@@ -417,3 +417,30 @@ class Revision(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class WorkflowDispatchIntent(Base):
+    """Durable V3 generation dispatch record; Redis is never the source of truth."""
+
+    __tablename__ = "workflow_dispatch_intents"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    workflow_execution_id: Mapped[int] = mapped_column(
+        ForeignKey("workflow_executions.id"), nullable=False
+    )
+    action: Mapped[str] = mapped_column(String(30), nullable=False)
+    revision_target: Mapped[str | None] = mapped_column(String(100))
+    revision_request: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, server_default="PENDING")
+    dispatch_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    celery_task_id: Mapped[str | None] = mapped_column(String(255))
+    claim_generation: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    claim_token: Mapped[str | None] = mapped_column(String(36))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )

@@ -95,12 +95,30 @@ class RuntimePublisher:
         )
 
 
+class DeterministicE2EInstagramPublisher:
+    """Offline publication adapter; never constructs an Instagram HTTP client."""
+
+    def publish(self, connection, assets, publication, attempt, persist_progress) -> PublishedPost:  # type: ignore[no-untyped-def]
+        # Unlike the real non-idempotent provider, this deterministic adapter
+        # has no intermediate remote state to persist.
+        del connection, assets, attempt, persist_progress
+        if publication.instagram_caption == "__VORA_E2E_FAKE_PUBLICATION_FAILURE__":
+            raise SocialProviderError("Deterministic E2E publication failure", code="e2e_fake_failure")
+        return PublishedPost(f"e2e-instagram-{publication.id}", f"https://e2e.invalid/{publication.id}")
+
+    def reconcile(self, connection, attempt, persist_progress) -> PublishedPost | None:  # type: ignore[no-untyped-def]
+        del connection, attempt, persist_progress
+        return None
+
+
 def get_publication_service(session: Session, llm_provider: LLMProvider | None = None) -> PublicationService:
     return PublicationService(
         session,
         CeleryPublicationDispatcher(celery_app, settings.publication_queue),
         RedisPublicationEvents(settings.redis_url),
-        lambda platform: RuntimePublisher(
+        lambda platform: DeterministicE2EInstagramPublisher()
+        if settings.e2e_fake_providers and platform is SocialPlatform.INSTAGRAM
+        else RuntimePublisher(
             platform,
             get_storage_provider() if platform is SocialPlatform.INSTAGRAM else None,
             session,

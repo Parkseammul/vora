@@ -67,7 +67,10 @@ def _configure_celery_redis_e2e() -> None:
     # worker consumes the one explicit test queue; it cannot consume default queues.
     os.environ["REDIS_URL"] = redis_url
     os.environ["VIDEO_GENERATION_QUEUE"] = queue
+    os.environ["GENERATION_QUEUE"] = queue
     os.environ["PUBLICATION_QUEUE"] = f"{queue}_publication"
+    # The opt-in process test must never resolve an S3-backed storage adapter.
+    os.environ["STORAGE_PROVIDER"] = "local"
 
 
 _configure_celery_redis_e2e()
