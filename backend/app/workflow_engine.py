@@ -322,6 +322,10 @@ class WorkflowEngine:
                 "manual_recovery_claimed_at": self._now().isoformat(),
             }
             self._session.commit()
+        if "execution_started_at" in attempt.metadata_:
+            interrupted_at = self._now()
+            attempt = self._replace_interrupted_attempt(node_execution, attempt, interrupted_at)
+            self._session.commit()
         self._assert_execution_guard()
         return self._execute_prepared_node(
             execution, self._definition_for(execution), node_execution, attempt
@@ -357,7 +361,22 @@ class WorkflowEngine:
             )
             if attempt is None:
                 raise ValueError("Running node has no running attempt")
-            return self._execute_prepared_node(execution, definition, running_node, attempt)
+            if "execution_started_at" not in attempt.metadata_:
+                # A prepared revision is durable before its first provider call.
+                # If the process stopped before that boundary, reuse the prepared
+                # Attempt rather than manufacturing a technical retry.
+                return self._execute_prepared_node(execution, definition, running_node, attempt)
+            # A worker crash must remain visible in the attempt history.  Do not
+            # execute the same RUNNING attempt again: close it as an interrupted
+            # system attempt and create the next attempt on the same NodeExecution.
+            # This keeps the user revision number (revision_no) intact
+            # while separating technical retries from user-requested revisions.
+            interrupted_at = self._now()
+            next_attempt = self._replace_interrupted_attempt(running_node, attempt, interrupted_at)
+            self._commit_state()
+            return self._execute_prepared_node(
+                execution, definition, running_node, next_attempt
+            )
 
         completed = list(
             self._session.scalars(
@@ -519,6 +538,7 @@ class WorkflowEngine:
                 metadata_={},
             )
             self._session.add(attempt)
+            attempt.metadata_ = {"execution_started_at": started_at.isoformat()}
             self._commit_state()
 
             if node_key == "video_generation" and self._video_task_dispatcher is not None:
@@ -589,6 +609,14 @@ class WorkflowEngine:
         """Execute an already-committed node intent without opening a long DB transaction."""
         self._assert_execution_guard()
         node_definition = definition.node(node_execution.node_type)
+        # Persist the execution boundary before invoking provider code.  Recovery
+        # can then distinguish a prepared-but-never-started Attempt from one that
+        # may have been interrupted during an external call.
+        attempt.metadata_ = {
+            **attempt.metadata_,
+            "execution_started_at": self._now().isoformat(),
+        }
+        self._commit_state()
         try:
             execution_result = self._executor.execute(
                 node_execution.node_type,
@@ -647,6 +675,37 @@ class WorkflowEngine:
             output_data,
             node_execution.revision_no,
         )
+
+    def _replace_interrupted_attempt(
+        self,
+        node_execution: NodeExecution,
+        interrupted_attempt: NodeExecutionAttempt,
+        started_at: datetime,
+    ) -> NodeExecutionAttempt:
+        """Close an interrupted attempt and create a technical retry."""
+        interrupted_attempt.status = NodeExecutionAttemptStatus.FAILED
+        interrupted_attempt.error_code = "INTERNAL_ERROR"
+        interrupted_attempt.error_message = "Worker interrupted before attempt completion"
+        interrupted_attempt.completed_at = started_at
+        interrupted_attempt.latency_ms = self._latency_ms(
+            interrupted_attempt.started_at, started_at
+        )
+        interrupted_attempt.metadata_ = {
+            **interrupted_attempt.metadata_,
+            "recovery_reason": "WORKER_INTERRUPTED",
+        }
+        next_attempt = NodeExecutionAttempt(
+            node_execution_id=node_execution.id,
+            attempt_no=interrupted_attempt.attempt_no + 1,
+            status=NodeExecutionAttemptStatus.RUNNING,
+            started_at=started_at,
+            metadata_={
+                "retry_kind": "SYSTEM",
+                "recovery_reason": "WORKER_INTERRUPTED",
+            },
+        )
+        self._session.add(next_attempt)
+        return next_attempt
 
     @staticmethod
     def _record_attempt_execution_details(

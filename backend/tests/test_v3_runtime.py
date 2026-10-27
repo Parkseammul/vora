@@ -1947,6 +1947,19 @@ def test_start_crash_recovery_reuses_completed_nodes_and_fences_late_result(
         )
     ).id == completed_plan.id  # type: ignore[union-attr]
     assert interrupted_text.status is NodeExecutionStatus.SUCCEEDED
+    attempts = list(
+        session.scalars(
+            select(NodeExecutionAttempt)
+            .where(NodeExecutionAttempt.node_execution_id == interrupted_text.id)
+            .order_by(NodeExecutionAttempt.attempt_no)
+        )
+    )
+    assert [attempt.attempt_no for attempt in attempts] == [1, 2]
+    assert attempts[0].status is NodeExecutionAttemptStatus.FAILED
+    assert attempts[0].metadata_["recovery_reason"] == "WORKER_INTERRUPTED"
+    assert attempts[1].status is NodeExecutionAttemptStatus.SUCCEEDED
+    assert attempts[1].metadata_["retry_kind"] == "SYSTEM"
+    assert interrupted_text.revision_no == 0
 
     fenced_execution = _execution(session)
     _v3_input_contract(session, fenced_execution, -int(uuid4().hex[:7], 16))
@@ -2229,6 +2242,12 @@ def test_recover_prepared_plan_or_text_revision_reuses_committed_attempt(
     assert workflow_engine.recover_prepared_revision(execution.id) is WorkflowExecutionStatus.WAITING_APPROVAL
     session.refresh(prepared)
     assert prepared.status is NodeExecutionStatus.SUCCEEDED
+    assert session.scalar(
+        select(NodeExecutionAttempt).where(NodeExecutionAttempt.node_execution_id == prepared.id)
+    ) is not None
+    assert len(list(session.scalars(
+        select(NodeExecutionAttempt).where(NodeExecutionAttempt.node_execution_id == prepared.id)
+    ))) == 1
 
 
 def test_recover_prepared_image_revision_reuses_committed_node_and_attempt(
