@@ -21,7 +21,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr, field_validator, model_validator
 
 # SQL 문자열을 안전하게 실행하기 위한 SQLAlchemy 함수
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -56,6 +56,7 @@ from app.media_providers import (
 )
 from app.models import (
     ApprovalDecision,
+    AssetType,
     ExecutionInputSnapshot,
     FileAsset,
     NodeExecution,
@@ -169,6 +170,15 @@ class PublishRequest(BaseModel):
 
 
 NODE_KEYS = ("input_analysis", "content_planning", "script_generation", "video_generation")
+V3_NODE_KEYS = (
+    "CONTENT_PLAN",
+    "TEXT_GENERATE",
+    "TEXT_CHECK",
+    "IMAGE_GENERATE",
+    "IMAGE_CHECK",
+    "HUMAN_APPROVAL",
+    "PUBLICATION",
+)
 MAX_AUTOMATIC_VIDEO_ATTEMPTS = 3
 
 
@@ -498,6 +508,131 @@ def _workflow_response(session: Session, execution: WorkflowExecution) -> dict[s
     }
 
 
+def _current_v3_revision(session: Session, workflow_execution_id: int) -> int:
+    revision = session.scalar(
+        select(func.max(NodeExecution.revision_no)).where(
+            NodeExecution.workflow_execution_id == workflow_execution_id,
+        )
+    )
+    return int(revision or 0)
+
+
+def _v3_node_for_revision(
+    session: Session, workflow_execution_id: int, node_type: str, revision_no: int
+) -> NodeExecution | None:
+    return session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == workflow_execution_id,
+            NodeExecution.node_type == node_type,
+            NodeExecution.revision_no == revision_no,
+        )
+    )
+
+
+def _v3_attempt_response(session: Session, node: NodeExecution) -> dict[str, int]:
+    attempt = _latest_attempt(session, node.id)
+    return {
+        "current": attempt.attempt_no if attempt is not None else 0,
+        "automatic_max": 1,
+    }
+
+
+def _v3_safe_output(node: NodeExecution | None) -> dict[str, object] | None:
+    """Expose only UI-safe V3 result fields; prompts and storage keys stay private."""
+    if node is None or not isinstance(node.output_data, dict):
+        return None
+    output = node.output_data
+    allowed: dict[str, object]
+    if node.node_type == "CONTENT_PLAN":
+        allowed = {key: output[key] for key in ("core_message", "slide_structure") if key in output}
+    elif node.node_type == "TEXT_GENERATE":
+        allowed = {"slides": output.get("slides", [])}
+    elif node.node_type in {"TEXT_CHECK", "IMAGE_CHECK"}:
+        allowed = {
+            key: output[key]
+            for key in ("passed", "violations", "feedback")
+            if key in output
+        }
+    else:
+        allowed = {}
+    return allowed
+
+
+def _v3_images_for_revision(
+    session: Session,
+    execution: WorkflowExecution,
+    revision_no: int,
+) -> list[dict[str, object]]:
+    image_node = _v3_node_for_revision(
+        session, execution.id, "IMAGE_GENERATE", revision_no
+    )
+    if image_node is None or image_node.status is not NodeExecutionStatus.SUCCEEDED:
+        return []
+    output = image_node.output_data
+    asset_ids = output.get("asset_ids") if isinstance(output, dict) else None
+    if not isinstance(asset_ids, list) or not all(isinstance(asset_id, int) for asset_id in asset_ids):
+        return []
+    assets = list(
+        session.scalars(
+            select(FileAsset).where(
+                FileAsset.workflow_execution_id == execution.id,
+                FileAsset.created_by_node_execution_id == image_node.id,
+                FileAsset.asset_type == AssetType.IMAGE,
+                FileAsset.slide_no.in_([1, 2, 3, 4, 5]),
+                FileAsset.id.in_(asset_ids),
+            )
+        )
+    )
+    by_slide = {asset.slide_no: asset for asset in assets}
+    if set(by_slide) != {1, 2, 3, 4, 5}:
+        return []
+    return [
+        {
+            "slide_no": slide_no,
+            "file_name": by_slide[slide_no].file_name,
+            "mime_type": by_slide[slide_no].mime_type,
+            "image_url": f"/workflow-executions/{execution.id}/slides/{slide_no}/image",
+        }
+        for slide_no in range(1, 6)
+    ]
+
+
+def _v3_workflow_response(session: Session, execution: WorkflowExecution) -> dict[str, object]:
+    revision_no = _current_v3_revision(session, execution.id)
+    nodes: dict[str, dict[str, object] | None] = {}
+    for node_type in V3_NODE_KEYS:
+        node = _v3_node_for_revision(session, execution.id, node_type, revision_no)
+        nodes[node_type] = (
+            {
+                "id": node.id,
+                "node_type": node.node_type,
+                "revision_no": node.revision_no,
+                "status": node.status.value,
+                "attempt": _v3_attempt_response(session, node),
+                "result": _v3_safe_output(node),
+            }
+            if node is not None
+            else None
+        )
+    approval = nodes["HUMAN_APPROVAL"]
+    approval_waiting = bool(approval and approval["status"] == NodeExecutionStatus.WAITING.value)
+    return {
+        "id": execution.id,
+        "workflow_execution_id": execution.id,
+        "workflow_version": execution.workflow_version,
+        "status": execution.status.value,
+        "current_node_type": execution.current_node_type,
+        "current_revision": revision_no,
+        "nodes": nodes,
+        "human_approval": {
+            "waiting": approval_waiting,
+            "node_execution_id": approval["id"] if approval_waiting and approval else None,
+            "status": approval["status"] if approval else None,
+        },
+        "images": _v3_images_for_revision(session, execution, revision_no),
+    }
+
+
 def _detail_response(session: Session, execution: WorkflowExecution, node_key: str) -> dict[str, object]:
     node = _latest_node(session, execution.id, node_key)
     detail = _node_response(session, node)
@@ -647,7 +782,14 @@ def get_workflow_execution(
     session: Session = Depends(get_session),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    return _workflow_response(session, _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user)))
+    execution = _get_owned_execution_or_404(
+        session,
+        workflow_execution_id,
+        _owner_id_for_route(session, workflow_execution_id, current_user),
+    )
+    if execution.workflow_version == 3:
+        return _v3_workflow_response(session, execution)
+    return _workflow_response(session, execution)
 
 
 @app.get("/workflow-executions/{workflow_execution_id}/trace")
@@ -970,6 +1112,35 @@ def _video_file_or_404(asset: FileAsset) -> Path:
     return path
 
 
+def _v3_image_asset_or_404(
+    session: Session, execution: WorkflowExecution, slide_no: int
+) -> FileAsset:
+    if execution.workflow_version != 3:
+        raise HTTPException(status_code=404, detail="V3 slide image was not found")
+    if slide_no not in range(1, 6):
+        raise HTTPException(status_code=422, detail="slide_no must be between 1 and 5")
+    revision_no = _current_v3_revision(session, execution.id)
+    image_node = _v3_node_for_revision(session, execution.id, "IMAGE_GENERATE", revision_no)
+    if image_node is None or image_node.status is not NodeExecutionStatus.SUCCEEDED:
+        raise HTTPException(status_code=404, detail="V3 slide image was not found")
+    output = image_node.output_data
+    asset_ids = output.get("asset_ids") if isinstance(output, dict) else None
+    if not isinstance(asset_ids, list) or not all(isinstance(asset_id, int) for asset_id in asset_ids):
+        raise HTTPException(status_code=404, detail="V3 slide image was not found")
+    asset = session.scalar(
+        select(FileAsset).where(
+            FileAsset.id.in_(asset_ids),
+            FileAsset.workflow_execution_id == execution.id,
+            FileAsset.created_by_node_execution_id == image_node.id,
+            FileAsset.asset_type == AssetType.IMAGE,
+            FileAsset.slide_no == slide_no,
+        )
+    )
+    if asset is None or asset.mime_type not in {"image/png", "image/jpeg"}:
+        raise HTTPException(status_code=404, detail="V3 slide image was not found")
+    return asset
+
+
 @app.get("/workflow-executions/{workflow_execution_id}/video/stream")
 def stream_generated_video(
     workflow_execution_id: int,
@@ -978,6 +1149,35 @@ def stream_generated_video(
 ):
     asset = _video_asset_or_404(session, _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user)))
     return FileResponse(_video_file_or_404(asset), media_type=asset.mime_type)
+
+
+@app.get("/workflow-executions/{workflow_execution_id}/slides/{slide_no}/image")
+def get_v3_slide_image(
+    workflow_execution_id: int,
+    slide_no: int,
+    session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
+):
+    execution = _get_owned_execution_or_404(
+        session,
+        workflow_execution_id,
+        _owner_id_for_route(session, workflow_execution_id, current_user),
+    )
+    asset = _v3_image_asset_or_404(session, execution, slide_no)
+    headers = {"Cache-Control": "private, no-store"}
+    storage = get_storage_provider()
+    if settings.storage_provider.lower() == "s3":
+        try:
+            url = storage.presigned_get_url(
+                asset.storage_key, settings.instagram_presigned_url_ttl_seconds
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail="V3 slide image was not found") from exc
+        return RedirectResponse(url, status_code=307, headers=headers)
+    path = storage.local_path(asset.storage_key)
+    if path is None:
+        raise HTTPException(status_code=404, detail="V3 slide image was not found")
+    return FileResponse(path, media_type=asset.mime_type, headers=headers)
 
 
 @app.get("/workflow-executions/{workflow_execution_id}/video/download")
@@ -1231,9 +1431,11 @@ def retry_failed_workflow_execution(
 ):
     execution = _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     try:
-        status = get_workflow_engine(session, get_ai_workflow_services(session)).retry_failed_execution(
-            execution.id
-        )
+        status = get_workflow_engine(
+            session,
+            get_ai_workflow_services(session),
+            execution.workflow_version,
+        ).retry_failed_execution(execution.id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"workflow_execution_id": execution.id, "status": status.value}
