@@ -1,6 +1,6 @@
 import json
 from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Self
 from uuid import uuid4
 
@@ -64,7 +64,7 @@ def cognito_fixture(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, objec
         claims: dict[str, object] = {
             "iss": issuer,
             "sub": "cognito-sub",
-            "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+            "exp": datetime.now(UTC) + timedelta(minutes=5),
             "token_use": "access",
             "client_id": client_id,
         }
@@ -101,7 +101,7 @@ def test_cognito_access_token_is_verified_and_identity_is_mapped(cognito_fixture
         {"token_use": "id"},
         {"client_id": "wrong-client"},
         {"iss": "https://wrong.example"},
-        {"exp": datetime.now(timezone.utc) - timedelta(minutes=1)},
+        {"exp": datetime.now(UTC) - timedelta(minutes=1)},
     ],
 )
 def test_invalid_access_tokens_are_rejected(
@@ -118,7 +118,7 @@ def test_forged_signature_and_unknown_kid_are_rejected(cognito_fixture: dict[str
         verifier.verify(token(kid="unknown"))
     other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     forged = jwt.encode(
-        {"iss": cognito_fixture["issuer"], "sub": "cognito-sub", "exp": datetime.now(timezone.utc) + timedelta(minutes=5), "token_use": "access", "client_id": "test-client"},
+        {"iss": cognito_fixture["issuer"], "sub": "cognito-sub", "exp": datetime.now(UTC) + timedelta(minutes=5), "token_use": "access", "client_id": "test-client"},
         other,
         algorithm="RS256",
         headers={"kid": "test-key"},
