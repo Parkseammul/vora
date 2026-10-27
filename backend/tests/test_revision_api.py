@@ -164,10 +164,20 @@ def test_application_wiring_reuses_one_injected_provider_for_all_ai_services(
 
 @pytest.mark.parametrize("revision_request", ["", "   "])
 def test_revision_api_rejects_blank_request(
-    client: TestClient, revision_request: str
+    client: TestClient, session: Session, revision_request: str
 ) -> None:
+    user = User(email=f"{uuid4()}@example.com", name="blank revision tester")
+    session.add(user)
+    session.flush()
+    execution = WorkflowExecution(
+        user_id=user.id,
+        workflow_key="vora_content_creation",
+        workflow_version=1,
+    )
+    session.add(execution)
+    session.commit()
     response = client.post(
-        "/workflow-executions/1/revisions",
+        f"/workflow-executions/{execution.id}/revisions",
         json={"current_node": "script_generation", "revision_request": revision_request},
     )
 

@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -117,8 +118,31 @@ def test_fake_media_providers_write_valid_ffmpeg_inputs(tmp_path: Path) -> None:
         )
 
 
-def test_composer_renders_korean_subtitle_with_explicit_windows_font(tmp_path: Path) -> None:
-    font = Path(r"C:\Windows\Fonts\malgun.ttf")
+def _korean_subtitle_font() -> Path:
+    candidates = (
+        Path(r"C:\Windows\Fonts\malgun.ttf"),
+        Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    fc_match = shutil.which("fc-match")
+    if fc_match:
+        result = subprocess.run(
+            [fc_match, "-f", "%{file}", ":lang=ko"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        matched = Path(result.stdout.strip())
+        if matched.is_file():
+            return matched
+    raise AssertionError("A Korean subtitle font is required for the FFmpeg composition test")
+
+
+def test_composer_renders_korean_subtitle_with_platform_font(tmp_path: Path) -> None:
+    font = _korean_subtitle_font()
     scene = FFmpegE2EVideoProvider().generate_scene("prompt", 1, tmp_path / "scene.mp4", None)
     audio = FFmpegE2ETTSProvider().synthesize("narration", tmp_path / "speech.mp3")
     bgm = FFmpegE2ETTSProvider().synthesize("bgm", tmp_path / "bgm.mp3")
