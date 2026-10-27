@@ -1,8 +1,9 @@
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
+import localDesignReference from "./vite.reference.mjs";
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), localDesignReference()],
   server: {
     proxy: {
       "/workflow-executions": "http://localhost:8000",

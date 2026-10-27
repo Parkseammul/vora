@@ -8,8 +8,11 @@ const WorkflowContext = createContext<WorkflowContextValue | null>(null);
 
 export function WorkflowProvider({ workflowExecutionId, children }: { workflowExecutionId: number; children: ReactNode }) {
   const [workflow, setWorkflow] = useState<Workflow | null>(null);
-  const refetch = useCallback(async () => setWorkflow(await api.getWorkflow(workflowExecutionId)), [workflowExecutionId]);
-  useEffect(() => { void api.getWorkflow(workflowExecutionId).then(setWorkflow); }, [workflowExecutionId]);
+  const refetch = useCallback(async () => {
+    const next = await api.getWorkflow(workflowExecutionId);
+    if (!("workflow_version" in next)) setWorkflow(next);
+  }, [workflowExecutionId]);
+  useEffect(() => { queueMicrotask(() => void refetch()); }, [refetch]);
   useEffect(() => {
     if (!workflow || !Object.values(workflow.nodes).some((node) => node?.status === "PENDING" || node?.status === "RUNNING")) return undefined;
     const timer = window.setInterval(() => { void refetch(); }, 2000);

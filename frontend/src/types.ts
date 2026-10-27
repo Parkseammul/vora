@@ -16,6 +16,50 @@ export interface Workflow {
   nodes: Record<NodeKey, NodeSummary | null>;
 }
 
+export type V3WorkflowStatus = "PENDING" | "RUNNING" | "WAITING_APPROVAL" | "REVISING" | "SUCCEEDED" | "FAILED" | "CANCELED";
+export type V3NodeType = "CONTENT_PLAN" | "TEXT_GENERATE" | "TEXT_CHECK" | "IMAGE_GENERATE" | "IMAGE_CHECK" | "HUMAN_APPROVAL" | "PUBLICATION";
+export type V3NodeStatus = "PENDING" | "RUNNING" | "WAITING" | "SUCCEEDED" | "FAILED" | "SKIPPED";
+
+export interface V3NodeExecution {
+  id: number;
+  node_type: V3NodeType;
+  revision_no: number;
+  status: V3NodeStatus;
+  attempt: { current: number; automatic_max: number };
+  result: Record<string, unknown> | null;
+}
+
+export interface V3ApprovalTarget {
+  waiting: boolean;
+  node_execution_id: number | null;
+  status: V3NodeStatus | null;
+}
+
+export interface V3ImageAsset {
+  slide_no: 1 | 2 | 3 | 4 | 5;
+  file_name: string;
+  mime_type: string;
+  image_url: string;
+}
+
+export interface V3Workflow {
+  id: number;
+  workflow_execution_id: number;
+  workflow_version: 3;
+  status: V3WorkflowStatus;
+  current_node_type: V3NodeType | null;
+  current_revision: number;
+  nodes: Record<V3NodeType, V3NodeExecution | null>;
+  human_approval: V3ApprovalTarget;
+  images: V3ImageAsset[];
+}
+
+export type WorkflowRead = Workflow | V3Workflow;
+
+export function isV3Workflow(workflow: WorkflowRead): workflow is V3Workflow {
+  return "workflow_version" in workflow && workflow.workflow_version === 3;
+}
+
 export interface Detail<T> {
   workflow_execution_id: number;
   workflow_status: WorkflowStatus;
