@@ -689,7 +689,14 @@ def test_real_worker_crash_relay_recovery_reuses_completed_v3_nodes() -> None:
             assert intent.claim_token != first.claim_token
             assert len(plans) == 1 and plans[0].status is NodeExecutionStatus.SUCCEEDED
             assert len(text_nodes) == 1 and text_nodes[0].status is NodeExecutionStatus.SUCCEEDED
-            assert len(text_attempts) == 1
+            assert text_nodes[0].revision_no == 0
+            assert [attempt.attempt_no for attempt in sorted(text_attempts, key=lambda item: item.attempt_no)] == [1, 2]
+            attempts_by_no = {attempt.attempt_no: attempt for attempt in text_attempts}
+            assert attempts_by_no[1].status is NodeExecutionAttemptStatus.FAILED
+            assert attempts_by_no[1].error_code == "INTERNAL_ERROR"
+            assert attempts_by_no[1].metadata_["recovery_reason"] == "WORKER_INTERRUPTED"
+            assert attempts_by_no[2].status is NodeExecutionAttemptStatus.SUCCEEDED
+            assert attempts_by_no[2].metadata_["retry_kind"] == "SYSTEM"
         duplicate = celery_app.send_task(
             "app.generation_tasks.execute_generation",
             kwargs={"intent_id": first.id},
@@ -822,7 +829,13 @@ def test_real_worker_fencing_blocks_resumed_stale_claim_result() -> None:
             assert intent is not None and intent.status == "COMPLETED"
             assert intent.claim_generation == 2
             assert text is not None and text.output_data == output_before_release
-            assert len(attempts) == 1
+            attempts_by_no = {attempt.attempt_no: attempt for attempt in attempts}
+            assert set(attempts_by_no) == {1, 2}
+            assert attempts_by_no[1].status is NodeExecutionAttemptStatus.FAILED
+            assert attempts_by_no[1].error_code == "INTERNAL_ERROR"
+            assert attempts_by_no[1].metadata_["recovery_reason"] == "WORKER_INTERRUPTED"
+            assert attempts_by_no[2].status is NodeExecutionAttemptStatus.SUCCEEDED
+            assert attempts_by_no[2].metadata_["retry_kind"] == "SYSTEM"
     finally:
         _stop_worker(worker_b)
         _stop_worker(worker_a)
