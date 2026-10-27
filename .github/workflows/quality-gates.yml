@@ -9,6 +9,9 @@ on:
 jobs:
   quality-gates:
     runs-on: ubuntu-latest
+    # The full backend suite plus the opt-in real-worker E2E needs more time
+    # than the unit-only gates, but must not be allowed to run indefinitely.
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:16
@@ -69,6 +72,7 @@ jobs:
         run: python -m mypy app
       - name: V3 offline fake-provider safety gate
         working-directory: backend
+        timeout-minutes: 10
         env:
           VORA_RUN_CELERY_REDIS_E2E: "true"
           VORA_E2E_FAKE_PROVIDERS: "true"
@@ -79,6 +83,7 @@ jobs:
           -k e2e_fake_v3_composition_blocks_vendor_provider_construction
       - name: V3 Redis/Celery worker E2E
         working-directory: backend
+        timeout-minutes: 40
         env:
           VORA_RUN_CELERY_REDIS_E2E: "true"
           VORA_E2E_FAKE_PROVIDERS: "true"
@@ -96,6 +101,33 @@ jobs:
       - name: Frontend build
         working-directory: frontend
         run: npm run build
+      - name: Cleanup V3 CI resources
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          # Test code performs normal-path cleanup. This is the last-resort
+          # cleanup for assertion failures, step timeouts, and cancellations.
+          set +e
+          worker_pattern='[c]elery.*app\.celery_app.*worker'
+          for signal in TERM KILL; do
+            pids=$(pgrep -f "$worker_pattern" || true)
+            if [ -n "$pids" ]; then
+              kill -"$signal" $pids 2>/dev/null || true
+              sleep 2
+            fi
+          done
+
+          # Redis DB 15 is dedicated to this CI job; never flush the default DB.
+          redis-cli -u "redis://localhost:6379/15" FLUSHDB >/dev/null 2>&1 || true
+
+          # Only remove the test-owned local-storage prefixes.
+          if [ -d backend/uploads ]; then
+            find backend/uploads -mindepth 1 -maxdepth 1 \
+              \( -name 'v3-celery-e2e-*' -o -name 'test-celery-redis-*' \) \
+              -exec rm -rf -- {} +
+          fi
+          # Cleanup is best effort and must not hide the original gate result.
+          exit 0
       - name: Git whitespace
         run: |
           git diff --check
