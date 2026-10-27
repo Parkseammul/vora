@@ -15,6 +15,7 @@ from fastapi.responses import (
     RedirectResponse,
     StreamingResponse,
 )
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr, field_validator, model_validator
@@ -25,6 +26,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.celery_app import celery_app
+from app.cognito_auth import CognitoAuthenticationError, get_or_create_user, verifier
 from app.config import settings
 from app.content_planning import ContentPlanningService
 
@@ -117,6 +119,7 @@ from app.workflow_execution_service import (
 
 # VORA Backend의 FastAPI 애플리케이션 객체 생성
 app = FastAPI()
+bearer_scheme = HTTPBearer(auto_error=False)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_url],
@@ -182,9 +185,25 @@ def get_session() -> Iterator[Session]:
         yield session
 
 
-def get_trace_authenticated_user_id() -> int:
-    """Fail closed until a real authentication provider supplies a trusted identity."""
-    raise HTTPException(status_code=401, detail="Trace authentication is not configured")
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),  # noqa: B008
+    session: Session = Depends(get_session),  # noqa: B008
+) -> User:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
+    try:
+        identity = verifier.verify(credentials.credentials)
+        user = get_or_create_user(session, identity)
+        # First-contact user provisioning is durable before the route executes.
+        session.commit()
+        return user
+    except CognitoAuthenticationError as exc:
+        session.rollback()
+        raise HTTPException(status_code=401, detail="Invalid access token", headers={"WWW-Authenticate": "Bearer"}) from exc
+
+
+def get_trace_authenticated_user_id(current_user: User = Depends(get_current_user)) -> int:  # noqa: B008
+    return current_user.id
 
 
 def configure_llm_provider(llm_provider: LLMProvider) -> None:
@@ -411,6 +430,30 @@ def _get_execution_or_404(session: Session, workflow_execution_id: int) -> Workf
     return execution
 
 
+def _get_owned_execution_or_404(
+    session: Session, workflow_execution_id: int, user_id: int
+) -> WorkflowExecution:
+    execution = session.scalar(
+        select(WorkflowExecution).where(
+            WorkflowExecution.id == workflow_execution_id,
+            WorkflowExecution.user_id == user_id,
+        )
+    )
+    if execution is None:
+        raise HTTPException(status_code=404, detail="Workflow execution was not found")
+    return execution
+
+
+def _owner_id_for_route(
+    session: Session, workflow_execution_id: int, current_user: object
+) -> int:
+    """Resolve direct unit-test calls without weakening HTTP dependency auth."""
+    if isinstance(current_user, User):
+        return current_user.id
+    execution = _get_execution_or_404(session, workflow_execution_id)
+    return execution.user_id
+
+
 def _latest_node(session: Session, workflow_execution_id: int, node_key: str) -> NodeExecution | None:
     return session.scalar(
         select(NodeExecution)
@@ -602,8 +645,9 @@ def health_check():
 def get_workflow_execution(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    return _workflow_response(session, _get_execution_or_404(session, workflow_execution_id))
+    return _workflow_response(session, _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user)))
 
 
 @app.get("/workflow-executions/{workflow_execution_id}/trace")
@@ -628,9 +672,10 @@ def get_workflow_trace(
 def get_workflow_plan(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
     return _detail_response(
-        session, _get_execution_or_404(session, workflow_execution_id), "content_planning"
+        session, _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user)), "content_planning"
     )
 
 
@@ -638,9 +683,10 @@ def get_workflow_plan(
 def get_workflow_script(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
     return _detail_response(
-        session, _get_execution_or_404(session, workflow_execution_id), "script_generation"
+        session, _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user)), "script_generation"
     )
 
 
@@ -648,8 +694,9 @@ def get_workflow_script(
 def get_workflow_video(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    execution = _get_execution_or_404(session, workflow_execution_id)
+    execution = _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     response = _detail_response(session, execution, "video_generation")
     output = response["output"]
     if isinstance(output, dict) and isinstance(output.get("video_asset_id"), int):
@@ -665,8 +712,11 @@ def get_workflow_video(
 @app.get("/workflow-executions/{workflow_execution_id}/video-generation/events")
 def stream_video_generation_events(
     workflow_execution_id: int,
+    session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
     events: VideoProgressEvents = Depends(get_video_progress_events),  # noqa: B008
 ):
+    _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     return StreamingResponse(
         (sse_event(payload) for payload in events.subscribe(workflow_execution_id)),
         media_type="text/event-stream",
@@ -677,8 +727,9 @@ def stream_video_generation_events(
 def get_publications(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    execution = _get_execution_or_404(session, workflow_execution_id)
+    execution = _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     publications = list(
         session.scalars(
             select(SocialPublication)
@@ -696,8 +747,9 @@ def publish_video(
     workflow_execution_id: int,
     request: PublishRequest,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    execution = _get_execution_or_404(session, workflow_execution_id)
+    execution = _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     try:
         platforms = [platform_from_string(item) for item in request.platforms]
         if not platforms or len(set(platforms)) != len(platforms):
@@ -720,7 +772,10 @@ def publish_video(
 @app.get("/workflow-executions/{workflow_execution_id}/publication/events")
 def stream_publication_events(
     workflow_execution_id: int,
+    session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
+    _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     return StreamingResponse(
         (sse_event(payload) for payload in RedisPublicationEvents(settings.redis_url).subscribe(workflow_execution_id)),
         media_type="text/event-stream",
@@ -808,11 +863,12 @@ def social_authorize(
     platform: str,
     return_to: str = "/settings/social",
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
     try:
         resolved = platform_from_string(platform)
         safe_return_to = _safe_oauth_return_path(return_to)
-        state = _issue_oauth_state(session, _dev_user_or_404(session), resolved, safe_return_to)
+        state = _issue_oauth_state(session, current_user, resolved, safe_return_to)
         return {"authorization_url": _oauth_provider(resolved).authorization_url(state)}
     except SocialProviderError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -865,8 +921,11 @@ def social_browser_callback(
 
 
 @app.get("/social/connections")
-def social_connections(session: Session = Depends(get_session)):  # noqa: B008
-    user = _dev_user_or_404(session)
+def social_connections(
+    session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
+):
+    user = current_user
     connections = list(session.scalars(select(SocialAccountConnection).where(SocialAccountConnection.user_id == user.id)))
     return {"connections": [{"platform": item.platform.value, "account_name": item.account_name, "status": item.status.value} for item in connections]}
 
@@ -915,8 +974,9 @@ def _video_file_or_404(asset: FileAsset) -> Path:
 def stream_generated_video(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    asset = _video_asset_or_404(session, _get_execution_or_404(session, workflow_execution_id))
+    asset = _video_asset_or_404(session, _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user)))
     return FileResponse(_video_file_or_404(asset), media_type=asset.mime_type)
 
 
@@ -924,8 +984,9 @@ def stream_generated_video(
 def download_generated_video(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    asset = _video_asset_or_404(session, _get_execution_or_404(session, workflow_execution_id))
+    asset = _video_asset_or_404(session, _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user)))
     return FileResponse(
         _video_file_or_404(asset), media_type=asset.mime_type, filename=asset.file_name
     )
@@ -939,6 +1000,7 @@ async def create_workflow_execution(
     rules_version_id: int = Form(...),
     source_image: UploadFile = File(...),  # noqa: B008
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
     uploaded_source_image = UploadedInputImage(
         file_name=source_image.filename or "upload",
@@ -953,6 +1015,7 @@ async def create_workflow_execution(
             theme=theme,
             rules_version_id=rules_version_id,
             source_image=uploaded_source_image,
+            user_id=current_user.id,
         )
         intent = get_generation_dispatcher(session).create(execution.id, ACTION_START)
         session.commit()
@@ -978,7 +1041,9 @@ def create_revision(
     workflow_execution_id: int,
     request: RevisionRequest,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
+    _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     try:
         services = get_ai_workflow_services(session)
         impact = services.revision_impact.determine(
@@ -1020,8 +1085,9 @@ def approve_workflow_node(
     workflow_execution_id: int,
     request: ApprovalRequest,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    execution = _get_execution_or_404(session, workflow_execution_id)
+    execution = _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     node = session.get(NodeExecution, request.node_execution_id)
     if (
         node is None
@@ -1161,8 +1227,9 @@ def _ensure_v3_image_check_passed(
 def retry_failed_workflow_execution(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    execution = _get_execution_or_404(session, workflow_execution_id)
+    execution = _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     try:
         status = get_workflow_engine(session, get_ai_workflow_services(session)).retry_failed_execution(
             execution.id

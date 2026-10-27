@@ -286,7 +286,10 @@ def test_trace_returns_full_history_without_payloads_and_does_not_mutate(
     ))
     session.commit()
 
+    # The production trace dependency is fail-closed without a bearer token.
+    main.app.dependency_overrides.pop(main.get_current_user, None)
     assert client.get(f"/workflow-executions/{execution.id}/trace").status_code == 401
+    main.app.dependency_overrides[main.get_current_user] = lambda: user
     main.app.dependency_overrides[main.get_trace_authenticated_user_id] = lambda: user.id
     response = client.get(f"/workflow-executions/{execution.id}/trace")
     assert response.status_code == 200

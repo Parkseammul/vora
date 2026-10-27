@@ -108,6 +108,7 @@ def test_fake_provider_workflow_reaches_final_video_approval_without_http(
         session.commit()
         user = session.scalar(select(User).where(User.email == DEV_USER_EMAIL))
     assert user is not None
+    main.app.dependency_overrides[main.get_current_user] = lambda: user
 
     def get_test_session() -> Iterator[Session]:
         yield session

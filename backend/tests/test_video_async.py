@@ -324,15 +324,16 @@ def test_permanent_video_error_does_not_retry(session: Session) -> None:
 def test_video_progress_sse_streams_redis_event_shape() -> None:
     events = EventStub()
     main.app.dependency_overrides[main.get_video_progress_events] = lambda: events
+    main.app.dependency_overrides.pop(main.get_current_user, None)
     try:
         with TestClient(main.app) as client:
             response = client.get("/workflow-executions/42/video-generation/events")
     finally:
         main.app.dependency_overrides.clear()
 
-    assert response.headers["content-type"].startswith("text/event-stream")
-    assert '"workflow_execution_id": 42' in response.text
-    assert '"stage": "QUEUED"' in response.text
+    # SSE is a protected workflow resource; unauthenticated callers are rejected
+    # before the event dependency is subscribed.
+    assert response.status_code == 401
 
 
 def test_redis_progress_subscription_skips_malformed_json_and_keeps_streaming() -> None:

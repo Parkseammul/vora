@@ -82,6 +82,7 @@ class WorkflowExecutionService:
         theme: str | None,
         rules_version_id: int,
         source_image: UploadedInputImage,
+        user_id: int | None = None,
     ) -> WorkflowExecution:
         self._validate_request(request_text, marketing_info, source_image)
         stored_paths: list[Path] = []
@@ -89,7 +90,7 @@ class WorkflowExecutionService:
             if self._session.get(RulesVersion, rules_version_id) is None:
                 raise WorkflowCreationError("Rules version does not exist")
 
-            user = self._session.scalar(select(User).where(User.email == DEV_USER_EMAIL))
+            user = self._session.get(User, user_id) if user_id is not None else self._session.scalar(select(User).where(User.email == DEV_USER_EMAIL))
             if user is None:
                 raise WorkflowCreationError("Development user does not exist; run the seed script first")
 

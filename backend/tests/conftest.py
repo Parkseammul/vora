@@ -84,3 +84,29 @@ def test_database_schema() -> Iterator[None]:
 
     Base.metadata.create_all(engine)
     yield
+
+
+@pytest.fixture(autouse=True)
+def test_authenticated_user_override() -> Iterator[None]:
+    """Keep legacy API fixtures authenticated without adding a production bypass."""
+    from fastapi import Depends, HTTPException
+    from sqlalchemy import select
+
+    from app import main
+    from app.models import User
+
+    def current_user(session=Depends(main.get_session)):  # type: ignore[no-untyped-def]  # noqa: B008
+        user = session.scalar(select(User).order_by(User.id.desc()).limit(1))
+        if user is None:
+            raise HTTPException(status_code=401, detail="Test user was not prepared")
+        return user
+
+    previous = main.app.dependency_overrides.get(main.get_current_user)
+    main.app.dependency_overrides[main.get_current_user] = current_user
+    try:
+        yield
+    finally:
+        if previous is None:
+            main.app.dependency_overrides.pop(main.get_current_user, None)
+        else:
+            main.app.dependency_overrides[main.get_current_user] = previous

@@ -107,10 +107,20 @@ class SocialPublicationAttemptStatus(enum.Enum):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("cognito_issuer", "cognito_sub", name="uq_user_cognito_identity"),
+        CheckConstraint(
+            "(cognito_issuer IS NULL AND cognito_sub IS NULL) OR "
+            "(cognito_issuer IS NOT NULL AND cognito_sub IS NOT NULL)",
+            name="ck_user_cognito_identity_pair",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
+    cognito_issuer: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    cognito_sub: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
