@@ -404,24 +404,19 @@ def test_real_redis_celery_v3_approved_then_fake_instagram_publication() -> None
             assert session.scalar(
                 select(SocialPublication).where(SocialPublication.node_execution_id == publication_node.id)
             ) is None
-            connection = session.scalar(
-                select(SocialAccountConnection).where(
-                    SocialAccountConnection.user_id == completed.user_id,
-                    SocialAccountConnection.platform == SocialPlatform.INSTAGRAM,
-                )
+            # Always create a connection owned by this test. Reusing a prior
+            # connection would couple cleanup to data from another run.
+            connection = SocialAccountConnection(
+                user_id=completed.user_id,
+                platform=SocialPlatform.INSTAGRAM,
+                external_account_id=f"e2e-{uuid4()}",
+                account_name="E2E fake Instagram",
+                access_token="offline-fake-token",
+                status=SocialConnectionStatus.CONNECTED,
             )
-            if connection is None:
-                connection = SocialAccountConnection(
-                    user_id=completed.user_id,
-                    platform=SocialPlatform.INSTAGRAM,
-                    external_account_id=f"e2e-{uuid4()}",
-                    account_name="E2E fake Instagram",
-                    access_token="offline-fake-token",
-                    status=SocialConnectionStatus.CONNECTED,
-                )
-                session.add(connection)
-                session.commit()
-                created_connection = True
+            session.add(connection)
+            session.commit()
+            created_connection = True
             connection_id = connection.id
 
         publication_worker = _start_publication_worker(context.root)
@@ -449,6 +444,8 @@ def test_real_redis_celery_v3_approved_then_fake_instagram_publication() -> None
         _stop_worker(publication_worker)
         _stop_worker(generation_worker)
         if created_connection and connection_id is not None:
+            if context.execution_id is not None:
+                _delete_execution_publications(context.execution_id)
             _delete_social_connection(connection_id)
         context.cleanup()
 
@@ -1247,18 +1244,10 @@ def _node(session: Session, workflow_execution_id: int, key: str) -> NodeExecuti
 
 def _delete_execution(workflow_execution_id: int) -> None:
     """Remove only rows created by this E2E from the already validated test database."""
+    _delete_execution_publications(workflow_execution_id)
     with Session(engine) as session:
         node_ids = select(NodeExecution.id).where(NodeExecution.workflow_execution_id == workflow_execution_id)
         approval_ids = select(UserApproval.id).where(UserApproval.node_execution_id.in_(node_ids))
-        publication_ids = select(SocialPublication.id).where(
-            SocialPublication.node_execution_id.in_(node_ids)
-        )
-        session.execute(
-            delete(SocialPublicationAttempt).where(
-                SocialPublicationAttempt.social_publication_id.in_(publication_ids)
-            )
-        )
-        session.execute(delete(SocialPublication).where(SocialPublication.id.in_(publication_ids)))
         session.execute(delete(Revision).where(Revision.user_approval_id.in_(approval_ids)))
         session.execute(delete(UserApproval).where(UserApproval.node_execution_id.in_(node_ids)))
         session.execute(delete(NodeExecutionAttempt).where(NodeExecutionAttempt.node_execution_id.in_(node_ids)))
@@ -1276,6 +1265,24 @@ def _delete_execution(workflow_execution_id: int) -> None:
         session.execute(delete(FileAsset).where(FileAsset.workflow_execution_id == workflow_execution_id))
         session.execute(delete(NodeExecution).where(NodeExecution.workflow_execution_id == workflow_execution_id))
         session.execute(delete(WorkflowExecution).where(WorkflowExecution.id == workflow_execution_id))
+        session.commit()
+
+
+def _delete_execution_publications(workflow_execution_id: int) -> None:
+    """Delete publication children before a test-owned social connection."""
+    with Session(engine) as session:
+        node_ids = select(NodeExecution.id).where(
+            NodeExecution.workflow_execution_id == workflow_execution_id
+        )
+        publication_ids = select(SocialPublication.id).where(
+            SocialPublication.node_execution_id.in_(node_ids)
+        )
+        session.execute(
+            delete(SocialPublicationAttempt).where(
+                SocialPublicationAttempt.social_publication_id.in_(publication_ids)
+            )
+        )
+        session.execute(delete(SocialPublication).where(SocialPublication.id.in_(publication_ids)))
         session.commit()
 
 
