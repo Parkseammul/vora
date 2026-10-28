@@ -1,6 +1,6 @@
 """Make one approved ElevenLabs TTS request without a Workflow or database access."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from app.config import settings
@@ -19,7 +19,7 @@ def main() -> int:
         return 1
 
     output_path = _OUTPUT_ROOT / (
-        "elevenlabs-tts-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + ".mp3"
+        "elevenlabs-tts-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + ".mp3"
     )
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)

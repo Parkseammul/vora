@@ -1,6 +1,6 @@
 """Make one approved Runway text-to-video request without a Workflow or database access."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from app.config import settings
@@ -53,7 +53,7 @@ def main() -> int:
         print("not_run reason=runway_configuration_missing")
         return 1
     output_path = _OUTPUT_ROOT / (
-        "runway-video-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + ".mp4"
+        "runway-video-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + ".mp4"
     )
     phase = "preflight"
     try:

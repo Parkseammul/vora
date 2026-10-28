@@ -29,7 +29,11 @@ class Settings(BaseSettings):
     elevenlabs_model: str = "eleven_multilingual_v2"
     redis_url: str = "redis://localhost:6379/0"
     video_generation_queue: str = "video_generation"
+    generation_queue: str = "generation"
     publication_queue: str = "publication"
+    generation_dispatch_lease_seconds: int = Field(
+        900, ge=1, validation_alias="VORA_GENERATION_DISPATCH_LEASE_SECONDS"
+    )
     storage_provider: str = "local"
     s3_bucket: str | None = None
     s3_region: str | None = None
@@ -47,6 +51,11 @@ class Settings(BaseSettings):
     instagram_presigned_url_ttl_seconds: int = 3600
     oauth_state_ttl_seconds: int = Field(600, ge=60, le=3600)
     frontend_url: str = "http://localhost:5173"
+    cognito_issuer: str | None = Field(None, validation_alias="COGNITO_ISSUER")
+    cognito_client_id: str | None = Field(None, validation_alias="COGNITO_CLIENT_ID")
+    cognito_jwks_url: str | None = Field(None, validation_alias="COGNITO_JWKS_URL")
+    cognito_userinfo_url: str | None = Field(None, validation_alias="COGNITO_USERINFO_URL")
+    cognito_jwks_ttl_seconds: int = Field(3600, ge=60, validation_alias="COGNITO_JWKS_TTL_SECONDS")
     e2e_fake_providers: bool = Field(False, validation_alias="VORA_E2E_FAKE_PROVIDERS")
     ffmpeg_subtitle_font_path: Path | None = Field(
         None, validation_alias="FFMPEG_SUBTITLE_FONT_PATH"

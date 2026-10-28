@@ -107,10 +107,20 @@ class SocialPublicationAttemptStatus(enum.Enum):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("cognito_issuer", "cognito_sub", name="uq_user_cognito_identity"),
+        CheckConstraint(
+            "(cognito_issuer IS NULL AND cognito_sub IS NULL) OR "
+            "(cognito_issuer IS NOT NULL AND cognito_sub IS NOT NULL)",
+            name="ck_user_cognito_identity_pair",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
+    cognito_issuer: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    cognito_sub: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -416,4 +426,31 @@ class Revision(Base):
     request_text: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class WorkflowDispatchIntent(Base):
+    """Durable V3 generation dispatch record; Redis is never the source of truth."""
+
+    __tablename__ = "workflow_dispatch_intents"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    workflow_execution_id: Mapped[int] = mapped_column(
+        ForeignKey("workflow_executions.id"), nullable=False
+    )
+    action: Mapped[str] = mapped_column(String(30), nullable=False)
+    revision_target: Mapped[str | None] = mapped_column(String(100))
+    revision_request: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, server_default="PENDING")
+    dispatch_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    celery_task_id: Mapped[str | None] = mapped_column(String(255))
+    claim_generation: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    claim_token: Mapped[str | None] = mapped_column(String(36))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )

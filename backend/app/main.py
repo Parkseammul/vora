@@ -9,17 +9,24 @@ from urllib.parse import urlencode, urlsplit
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr, field_validator, model_validator
 
 # SQL 문자열을 안전하게 실행하기 위한 SQLAlchemy 함수
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.celery_app import celery_app
+from app.cognito_auth import CognitoAuthenticationError, get_or_create_user, verifier
 from app.config import settings
 from app.content_planning import ContentPlanningService
 
@@ -30,6 +37,13 @@ from app.e2e_providers import (
     DeterministicE2ELLMProvider,
     FFmpegE2ETTSProvider,
     FFmpegE2EVideoProvider,
+    wait_for_e2e_node_gate,
+)
+from app.generation_dispatch import (
+    ACTION_RESUME,
+    ACTION_REVISION,
+    ACTION_START,
+    GenerationDispatchService,
 )
 from app.image_provider import OpenAIImageProvider
 from app.llm_provider import LLMProvider, LLMProviderType, MultiVendorLLMProvider
@@ -42,11 +56,16 @@ from app.media_providers import (
 )
 from app.models import (
     ApprovalDecision,
+    AssetType,
+    ExecutionInputSnapshot,
     FileAsset,
     NodeExecution,
     NodeExecutionAttempt,
     NodeExecutionStatus,
     OAuthAuthorizationState,
+    PromptVersion,
+    Revision,
+    RulesVersion,
     SocialAccountConnection,
     SocialConnectionStatus,
     SocialPlatform,
@@ -70,7 +89,14 @@ from app.social_providers import (
     YouTubeProvider,
     platform_from_string,
 )
-from app.v3_runtime import ImageCheckOutput, V3NodeExecutor
+from app.v3_runtime import (
+    ContentPlanOutput,
+    ImageCheckOutput,
+    SlideText,
+    TextCheckOutput,
+    TextGenerateOutput,
+    V3NodeExecutor,
+)
 from app.video_async import (
     CeleryVideoTaskDispatcher,
     RedisVideoProgressEvents,
@@ -94,6 +120,7 @@ from app.workflow_execution_service import (
 
 # VORA Backend의 FastAPI 애플리케이션 객체 생성
 app = FastAPI()
+bearer_scheme = HTTPBearer(auto_error=False)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_url],
@@ -143,6 +170,15 @@ class PublishRequest(BaseModel):
 
 
 NODE_KEYS = ("input_analysis", "content_planning", "script_generation", "video_generation")
+V3_NODE_KEYS = (
+    "CONTENT_PLAN",
+    "TEXT_GENERATE",
+    "TEXT_CHECK",
+    "IMAGE_GENERATE",
+    "IMAGE_CHECK",
+    "HUMAN_APPROVAL",
+    "PUBLICATION",
+)
 MAX_AUTOMATIC_VIDEO_ATTEMPTS = 3
 
 
@@ -157,6 +193,27 @@ class AIWorkflowServices:
 def get_session() -> Iterator[Session]:
     with Session(engine) as session:
         yield session
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),  # noqa: B008
+    session: Session = Depends(get_session),  # noqa: B008
+) -> User:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
+    try:
+        identity = verifier.verify(credentials.credentials)
+        user = get_or_create_user(session, identity)
+        # First-contact user provisioning is durable before the route executes.
+        session.commit()
+        return user
+    except CognitoAuthenticationError as exc:
+        session.rollback()
+        raise HTTPException(status_code=401, detail="Invalid access token", headers={"WWW-Authenticate": "Bearer"}) from exc
+
+
+def get_trace_authenticated_user_id(current_user: User = Depends(get_current_user)) -> int:  # noqa: B008
+    return current_user.id
 
 
 def configure_llm_provider(llm_provider: LLMProvider) -> None:
@@ -226,6 +283,10 @@ def get_video_task_dispatcher() -> VideoTaskDispatcher:
     return CeleryVideoTaskDispatcher(
         celery_app, get_video_progress_events(), settings.video_generation_queue
     )
+
+
+def get_generation_dispatcher(session: Session) -> GenerationDispatchService:
+    return GenerationDispatchService(session, celery_app, settings.generation_queue)
 
 
 def get_ai_workflow_services(session: Session) -> AIWorkflowServices:
@@ -303,16 +364,39 @@ def get_workflow_engine(
             if settings.e2e_fake_providers
             else None
         )
+        content_plan_model: Runnable[dict[str, object], ContentPlanOutput] | None = (
+            RunnableLambda(
+                lambda _: ContentPlanOutput(
+                    core_message="Offline V3 carousel message",
+                    slide_structure=["hook", "benefit", "proof", "detail", "cta"],
+                )
+            )
+            if settings.e2e_fake_providers
+            else None
+        )
+        text_generate_model: Runnable[dict[str, object], TextGenerateOutput] | None = (
+            RunnableLambda(lambda _: _e2e_text_generate_output())
+            if settings.e2e_fake_providers
+            else None
+        )
+        text_check_model: Runnable[dict[str, object], TextCheckOutput] | None = (
+            RunnableLambda(lambda _: _e2e_text_check_output())
+            if settings.e2e_fake_providers
+            else None
+        )
         return WorkflowEngine(
             session,
             workflow_registry,
             V3NodeExecutor(
                 session=session,
-                content_plan_model_factory=get_content_plan_chat_model,
+                content_plan_model=content_plan_model,
+                content_plan_model_factory=None if content_plan_model else get_content_plan_chat_model,
                 content_plan_model_name=settings.content_planning_model,
-                text_generate_model_factory=get_text_generate_chat_model,
+                text_generate_model=text_generate_model,
+                text_generate_model_factory=None if text_generate_model else get_text_generate_chat_model,
                 text_generate_model_name=settings.script_generation_model,
-                text_check_model_factory=get_text_check_chat_model,
+                text_check_model=text_check_model,
+                text_check_model_factory=None if text_check_model else get_text_check_chat_model,
                 text_check_model_name=settings.script_generation_model,
                 image_provider=image_provider,
                 image_model_name=settings.image_generation_model,
@@ -337,11 +421,47 @@ def get_workflow_engine(
     )
 
 
+def _e2e_text_generate_output() -> TextGenerateOutput:
+    wait_for_e2e_node_gate("TEXT_GENERATE")
+    return TextGenerateOutput(
+        slides=[SlideText(slide_no=index, text=f"Offline slide {index}") for index in range(1, 6)]
+    )
+
+
+def _e2e_text_check_output() -> TextCheckOutput:
+    wait_for_e2e_node_gate("TEXT_CHECK")
+    return TextCheckOutput(passed=True, violations=[], feedback=None)
+
+
 def _get_execution_or_404(session: Session, workflow_execution_id: int) -> WorkflowExecution:
     execution = session.get(WorkflowExecution, workflow_execution_id)
     if execution is None:
         raise HTTPException(status_code=404, detail="Workflow execution was not found")
     return execution
+
+
+def _get_owned_execution_or_404(
+    session: Session, workflow_execution_id: int, user_id: int
+) -> WorkflowExecution:
+    execution = session.scalar(
+        select(WorkflowExecution).where(
+            WorkflowExecution.id == workflow_execution_id,
+            WorkflowExecution.user_id == user_id,
+        )
+    )
+    if execution is None:
+        raise HTTPException(status_code=404, detail="Workflow execution was not found")
+    return execution
+
+
+def _owner_id_for_route(
+    session: Session, workflow_execution_id: int, current_user: object
+) -> int:
+    """Resolve direct unit-test calls without weakening HTTP dependency auth."""
+    if isinstance(current_user, User):
+        return current_user.id
+    execution = _get_execution_or_404(session, workflow_execution_id)
+    return execution.user_id
 
 
 def _latest_node(session: Session, workflow_execution_id: int, node_key: str) -> NodeExecution | None:
@@ -388,6 +508,131 @@ def _workflow_response(session: Session, execution: WorkflowExecution) -> dict[s
     }
 
 
+def _current_v3_revision(session: Session, workflow_execution_id: int) -> int:
+    revision = session.scalar(
+        select(func.max(NodeExecution.revision_no)).where(
+            NodeExecution.workflow_execution_id == workflow_execution_id,
+        )
+    )
+    return int(revision or 0)
+
+
+def _v3_node_for_revision(
+    session: Session, workflow_execution_id: int, node_type: str, revision_no: int
+) -> NodeExecution | None:
+    return session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == workflow_execution_id,
+            NodeExecution.node_type == node_type,
+            NodeExecution.revision_no == revision_no,
+        )
+    )
+
+
+def _v3_attempt_response(session: Session, node: NodeExecution) -> dict[str, int]:
+    attempt = _latest_attempt(session, node.id)
+    return {
+        "current": attempt.attempt_no if attempt is not None else 0,
+        "automatic_max": 1,
+    }
+
+
+def _v3_safe_output(node: NodeExecution | None) -> dict[str, object] | None:
+    """Expose only UI-safe V3 result fields; prompts and storage keys stay private."""
+    if node is None or not isinstance(node.output_data, dict):
+        return None
+    output = node.output_data
+    allowed: dict[str, object]
+    if node.node_type == "CONTENT_PLAN":
+        allowed = {key: output[key] for key in ("core_message", "slide_structure") if key in output}
+    elif node.node_type == "TEXT_GENERATE":
+        allowed = {"slides": output.get("slides", [])}
+    elif node.node_type in {"TEXT_CHECK", "IMAGE_CHECK"}:
+        allowed = {
+            key: output[key]
+            for key in ("passed", "violations", "feedback")
+            if key in output
+        }
+    else:
+        allowed = {}
+    return allowed
+
+
+def _v3_images_for_revision(
+    session: Session,
+    execution: WorkflowExecution,
+    revision_no: int,
+) -> list[dict[str, object]]:
+    image_node = _v3_node_for_revision(
+        session, execution.id, "IMAGE_GENERATE", revision_no
+    )
+    if image_node is None or image_node.status is not NodeExecutionStatus.SUCCEEDED:
+        return []
+    output = image_node.output_data
+    asset_ids = output.get("asset_ids") if isinstance(output, dict) else None
+    if not isinstance(asset_ids, list) or not all(isinstance(asset_id, int) for asset_id in asset_ids):
+        return []
+    assets = list(
+        session.scalars(
+            select(FileAsset).where(
+                FileAsset.workflow_execution_id == execution.id,
+                FileAsset.created_by_node_execution_id == image_node.id,
+                FileAsset.asset_type == AssetType.IMAGE,
+                FileAsset.slide_no.in_([1, 2, 3, 4, 5]),
+                FileAsset.id.in_(asset_ids),
+            )
+        )
+    )
+    by_slide = {asset.slide_no: asset for asset in assets}
+    if set(by_slide) != {1, 2, 3, 4, 5}:
+        return []
+    return [
+        {
+            "slide_no": slide_no,
+            "file_name": by_slide[slide_no].file_name,
+            "mime_type": by_slide[slide_no].mime_type,
+            "image_url": f"/workflow-executions/{execution.id}/slides/{slide_no}/image",
+        }
+        for slide_no in range(1, 6)
+    ]
+
+
+def _v3_workflow_response(session: Session, execution: WorkflowExecution) -> dict[str, object]:
+    revision_no = _current_v3_revision(session, execution.id)
+    nodes: dict[str, dict[str, object] | None] = {}
+    for node_type in V3_NODE_KEYS:
+        node = _v3_node_for_revision(session, execution.id, node_type, revision_no)
+        nodes[node_type] = (
+            {
+                "id": node.id,
+                "node_type": node.node_type,
+                "revision_no": node.revision_no,
+                "status": node.status.value,
+                "attempt": _v3_attempt_response(session, node),
+                "result": _v3_safe_output(node),
+            }
+            if node is not None
+            else None
+        )
+    approval = nodes["HUMAN_APPROVAL"]
+    approval_waiting = bool(approval and approval["status"] == NodeExecutionStatus.WAITING.value)
+    return {
+        "id": execution.id,
+        "workflow_execution_id": execution.id,
+        "workflow_version": execution.workflow_version,
+        "status": execution.status.value,
+        "current_node_type": execution.current_node_type,
+        "current_revision": revision_no,
+        "nodes": nodes,
+        "human_approval": {
+            "waiting": approval_waiting,
+            "node_execution_id": approval["id"] if approval_waiting and approval else None,
+            "status": approval["status"] if approval else None,
+        },
+        "images": _v3_images_for_revision(session, execution, revision_no),
+    }
+
+
 def _detail_response(session: Session, execution: WorkflowExecution, node_key: str) -> dict[str, object]:
     node = _latest_node(session, execution.id, node_key)
     detail = _node_response(session, node)
@@ -403,6 +648,119 @@ def _publication_response(session: Session, publication: SocialPublication) -> d
     connection = session.get(SocialAccountConnection, publication.social_account_connection_id)
     attempts = list(session.scalars(select(SocialPublicationAttempt).where(SocialPublicationAttempt.social_publication_id == publication.id).order_by(SocialPublicationAttempt.attempt_no)))
     return {"id": publication.id, "platform": connection.platform.value if connection else "UNKNOWN", "status": publication.status.value, "external_post_url": publication.external_post_url, "attempt": {"current": attempts[-1].attempt_no if attempts else 0, "max": 3}}
+
+
+def _attempt_trace(session: Session, attempt: NodeExecutionAttempt) -> dict[str, object]:
+    prompt = session.get(PromptVersion, attempt.prompt_version_id) if attempt.prompt_version_id else None
+    return {
+        "attempt_no": attempt.attempt_no,
+        "status": attempt.status.value,
+        "started_at": attempt.started_at,
+        "completed_at": attempt.completed_at,
+        "ai_company": attempt.ai_company,
+        "model": attempt.model,
+        "prompt_version": (
+            {"id": prompt.id, "node_type": prompt.node_type, "version": prompt.version}
+            if prompt is not None
+            else None
+        ),
+        "latency_ms": attempt.latency_ms,
+        "input_tokens": attempt.input_tokens,
+        "output_tokens": attempt.output_tokens,
+        "cost": attempt.cost,
+        "error_code": attempt.error_code,
+        # Stored diagnostics may contain provider details; external Trace clients
+        # receive the durable domain code and a generic safe explanation instead.
+        "error_message": "Execution failed; see error_code." if attempt.error_message else None,
+    }
+
+
+def _workflow_trace(session: Session, execution: WorkflowExecution) -> dict[str, object]:
+    snapshot = session.scalar(
+        select(ExecutionInputSnapshot).where(ExecutionInputSnapshot.workflow_execution_id == execution.id)
+    )
+    rules = session.get(RulesVersion, snapshot.rules_version_id) if snapshot else None
+    nodes = list(session.scalars(
+        select(NodeExecution)
+        .where(NodeExecution.workflow_execution_id == execution.id)
+        .order_by(NodeExecution.revision_no, NodeExecution.id)
+    ))
+    approvals = list(session.scalars(
+        select(UserApproval).where(UserApproval.workflow_execution_id == execution.id).order_by(UserApproval.id)
+    ))
+    revisions = list(session.scalars(
+        select(Revision).where(Revision.workflow_execution_id == execution.id).order_by(Revision.revision_no)
+    ))
+    publications = list(session.scalars(
+        select(SocialPublication)
+        .join(NodeExecution, SocialPublication.node_execution_id == NodeExecution.id)
+        .where(NodeExecution.workflow_execution_id == execution.id)
+        .order_by(SocialPublication.id)
+    ))
+    return {
+        "workflow": {
+            "id": execution.id,
+            "workflow_key": execution.workflow_key,
+            "workflow_version": execution.workflow_version,
+            "status": execution.status.value,
+            "started_at": execution.started_at,
+            "completed_at": execution.completed_at,
+        },
+        "rules_version": {"id": rules.id, "version": rules.version} if rules else None,
+        "nodes": [
+            {
+                "id": node.id,
+                "node_type": node.node_type,
+                "revision_no": node.revision_no,
+                "status": node.status.value,
+                "started_at": node.started_at,
+                "completed_at": node.completed_at,
+                "attempts": [
+                    _attempt_trace(session, attempt) for attempt in session.scalars(
+                        select(NodeExecutionAttempt)
+                        .where(NodeExecutionAttempt.node_execution_id == node.id)
+                        .order_by(NodeExecutionAttempt.attempt_no)
+                    )
+                ],
+            }
+            for node in nodes
+        ],
+        "approvals": [
+            {"node_execution_id": item.node_execution_id, "decision": item.decision.value, "decided_at": item.decided_at}
+            for item in approvals
+        ],
+        "revisions": [
+            {
+                "revision_no": item.revision_no,
+                "start_node_type": item.start_node_type,
+                "created_at": item.created_at,
+            }
+            for item in revisions
+        ],
+        "publications": [
+            {
+                "id": publication.id,
+                "status": publication.status.value,
+                "published_at": publication.published_at,
+                "attempts": [
+                    {
+                        "attempt_no": item.attempt_no,
+                        "status": item.status.value,
+                        "started_at": item.started_at,
+                        "finished_at": item.finished_at,
+                        "error_code": item.error_code,
+                        "error_message": (
+                            "Publication failed; see error_code."
+                            if item.error_message
+                            else None
+                        ),
+                    }
+                    for item in session.scalars(select(SocialPublicationAttempt).where(SocialPublicationAttempt.social_publication_id == publication.id).order_by(SocialPublicationAttempt.attempt_no))
+                ],
+            }
+            for publication in publications
+        ],
+    }
 
 
 def _dev_user_or_404(session: Session) -> User:
@@ -422,17 +780,44 @@ def health_check():
 def get_workflow_execution(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    return _workflow_response(session, _get_execution_or_404(session, workflow_execution_id))
+    execution = _get_owned_execution_or_404(
+        session,
+        workflow_execution_id,
+        _owner_id_for_route(session, workflow_execution_id, current_user),
+    )
+    if execution.workflow_version == 3:
+        return _v3_workflow_response(session, execution)
+    return _workflow_response(session, execution)
+
+
+@app.get("/workflow-executions/{workflow_execution_id}/trace")
+def get_workflow_trace(
+    workflow_execution_id: int,
+    session: Session = Depends(get_session),  # noqa: B008
+    authenticated_user_id: int = Depends(get_trace_authenticated_user_id),
+):
+    """Read durable execution history without exposing prompts, payloads, or credentials."""
+    execution = session.scalar(
+        select(WorkflowExecution).where(
+            WorkflowExecution.id == workflow_execution_id,
+            WorkflowExecution.user_id == authenticated_user_id,
+        )
+    )
+    if execution is None:
+        raise HTTPException(status_code=404, detail="Workflow execution was not found")
+    return _workflow_trace(session, execution)
 
 
 @app.get("/workflow-executions/{workflow_execution_id}/plan")
 def get_workflow_plan(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
     return _detail_response(
-        session, _get_execution_or_404(session, workflow_execution_id), "content_planning"
+        session, _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user)), "content_planning"
     )
 
 
@@ -440,9 +825,10 @@ def get_workflow_plan(
 def get_workflow_script(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
     return _detail_response(
-        session, _get_execution_or_404(session, workflow_execution_id), "script_generation"
+        session, _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user)), "script_generation"
     )
 
 
@@ -450,8 +836,9 @@ def get_workflow_script(
 def get_workflow_video(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    execution = _get_execution_or_404(session, workflow_execution_id)
+    execution = _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     response = _detail_response(session, execution, "video_generation")
     output = response["output"]
     if isinstance(output, dict) and isinstance(output.get("video_asset_id"), int):
@@ -467,8 +854,11 @@ def get_workflow_video(
 @app.get("/workflow-executions/{workflow_execution_id}/video-generation/events")
 def stream_video_generation_events(
     workflow_execution_id: int,
+    session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
     events: VideoProgressEvents = Depends(get_video_progress_events),  # noqa: B008
 ):
+    _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     return StreamingResponse(
         (sse_event(payload) for payload in events.subscribe(workflow_execution_id)),
         media_type="text/event-stream",
@@ -479,8 +869,9 @@ def stream_video_generation_events(
 def get_publications(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    execution = _get_execution_or_404(session, workflow_execution_id)
+    execution = _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     publications = list(
         session.scalars(
             select(SocialPublication)
@@ -498,8 +889,9 @@ def publish_video(
     workflow_execution_id: int,
     request: PublishRequest,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    execution = _get_execution_or_404(session, workflow_execution_id)
+    execution = _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     try:
         platforms = [platform_from_string(item) for item in request.platforms]
         if not platforms or len(set(platforms)) != len(platforms):
@@ -522,7 +914,10 @@ def publish_video(
 @app.get("/workflow-executions/{workflow_execution_id}/publication/events")
 def stream_publication_events(
     workflow_execution_id: int,
+    session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
+    _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     return StreamingResponse(
         (sse_event(payload) for payload in RedisPublicationEvents(settings.redis_url).subscribe(workflow_execution_id)),
         media_type="text/event-stream",
@@ -610,11 +1005,12 @@ def social_authorize(
     platform: str,
     return_to: str = "/settings/social",
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
     try:
         resolved = platform_from_string(platform)
         safe_return_to = _safe_oauth_return_path(return_to)
-        state = _issue_oauth_state(session, _dev_user_or_404(session), resolved, safe_return_to)
+        state = _issue_oauth_state(session, current_user, resolved, safe_return_to)
         return {"authorization_url": _oauth_provider(resolved).authorization_url(state)}
     except SocialProviderError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -667,8 +1063,11 @@ def social_browser_callback(
 
 
 @app.get("/social/connections")
-def social_connections(session: Session = Depends(get_session)):  # noqa: B008
-    user = _dev_user_or_404(session)
+def social_connections(
+    session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
+):
+    user = current_user
     connections = list(session.scalars(select(SocialAccountConnection).where(SocialAccountConnection.user_id == user.id)))
     return {"connections": [{"platform": item.platform.value, "account_name": item.account_name, "status": item.status.value} for item in connections]}
 
@@ -713,21 +1112,81 @@ def _video_file_or_404(asset: FileAsset) -> Path:
     return path
 
 
+def _v3_image_asset_or_404(
+    session: Session, execution: WorkflowExecution, slide_no: int
+) -> FileAsset:
+    if execution.workflow_version != 3:
+        raise HTTPException(status_code=404, detail="V3 slide image was not found")
+    if slide_no not in range(1, 6):
+        raise HTTPException(status_code=422, detail="slide_no must be between 1 and 5")
+    revision_no = _current_v3_revision(session, execution.id)
+    image_node = _v3_node_for_revision(session, execution.id, "IMAGE_GENERATE", revision_no)
+    if image_node is None or image_node.status is not NodeExecutionStatus.SUCCEEDED:
+        raise HTTPException(status_code=404, detail="V3 slide image was not found")
+    output = image_node.output_data
+    asset_ids = output.get("asset_ids") if isinstance(output, dict) else None
+    if not isinstance(asset_ids, list) or not all(isinstance(asset_id, int) for asset_id in asset_ids):
+        raise HTTPException(status_code=404, detail="V3 slide image was not found")
+    asset = session.scalar(
+        select(FileAsset).where(
+            FileAsset.id.in_(asset_ids),
+            FileAsset.workflow_execution_id == execution.id,
+            FileAsset.created_by_node_execution_id == image_node.id,
+            FileAsset.asset_type == AssetType.IMAGE,
+            FileAsset.slide_no == slide_no,
+        )
+    )
+    if asset is None or asset.mime_type not in {"image/png", "image/jpeg"}:
+        raise HTTPException(status_code=404, detail="V3 slide image was not found")
+    return asset
+
+
 @app.get("/workflow-executions/{workflow_execution_id}/video/stream")
 def stream_generated_video(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    asset = _video_asset_or_404(session, _get_execution_or_404(session, workflow_execution_id))
+    asset = _video_asset_or_404(session, _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user)))
     return FileResponse(_video_file_or_404(asset), media_type=asset.mime_type)
+
+
+@app.get("/workflow-executions/{workflow_execution_id}/slides/{slide_no}/image")
+def get_v3_slide_image(
+    workflow_execution_id: int,
+    slide_no: int,
+    session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
+):
+    execution = _get_owned_execution_or_404(
+        session,
+        workflow_execution_id,
+        _owner_id_for_route(session, workflow_execution_id, current_user),
+    )
+    asset = _v3_image_asset_or_404(session, execution, slide_no)
+    headers = {"Cache-Control": "private, no-store"}
+    storage = get_storage_provider()
+    if settings.storage_provider.lower() == "s3":
+        try:
+            url = storage.presigned_get_url(
+                asset.storage_key, settings.instagram_presigned_url_ttl_seconds
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail="V3 slide image was not found") from exc
+        return RedirectResponse(url, status_code=307, headers=headers)
+    path = storage.local_path(asset.storage_key)
+    if path is None:
+        raise HTTPException(status_code=404, detail="V3 slide image was not found")
+    return FileResponse(path, media_type=asset.mime_type, headers=headers)
 
 
 @app.get("/workflow-executions/{workflow_execution_id}/video/download")
 def download_generated_video(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    asset = _video_asset_or_404(session, _get_execution_or_404(session, workflow_execution_id))
+    asset = _video_asset_or_404(session, _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user)))
     return FileResponse(
         _video_file_or_404(asset), media_type=asset.mime_type, filename=asset.file_name
     )
@@ -741,37 +1200,40 @@ async def create_workflow_execution(
     rules_version_id: int = Form(...),
     source_image: UploadFile = File(...),  # noqa: B008
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
     uploaded_source_image = UploadedInputImage(
         file_name=source_image.filename or "upload",
         content_type=source_image.content_type or "",
         content=await source_image.read(),
     )
-    workflow_engine = get_workflow_engine(
-        session, get_ai_workflow_services(session), workflow_version=3
-    )
     service = WorkflowExecutionService(session)
     try:
-        result = service.create_and_start(
+        execution = service.create_pending(
             request_text=request_text,
             marketing_info=marketing_info,
             theme=theme,
             rules_version_id=rules_version_id,
             source_image=uploaded_source_image,
-            workflow_engine=workflow_engine,
+            user_id=current_user.id,
         )
+        intent = get_generation_dispatcher(session).create(execution.id, ACTION_START)
+        session.commit()
     except ValueError as exc:
+        session.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except WorkflowCreationError as exc:
+        session.rollback()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return {
-        "workflow_execution_id": result.workflow_execution.id,
-        "status": result.workflow_execution.status.value,
-        "current_node": result.current_node.node_type,
-        "current_node_execution_id": result.current_node.id,
-        "result": result.current_node.output_data,
-    }
+    get_generation_dispatcher(session).enqueue(intent.id)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "workflow_execution_id": execution.id,
+            "status": execution.status.value,
+            "dispatch_intent_id": intent.id,
+        },
+    )
 
 
 @app.post("/workflow-executions/{workflow_execution_id}/revisions")
@@ -779,7 +1241,9 @@ def create_revision(
     workflow_execution_id: int,
     request: RevisionRequest,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
+    _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     try:
         services = get_ai_workflow_services(session)
         impact = services.revision_impact.determine(
@@ -821,8 +1285,9 @@ def approve_workflow_node(
     workflow_execution_id: int,
     request: ApprovalRequest,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    execution = _get_execution_or_404(session, workflow_execution_id)
+    execution = _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     node = session.get(NodeExecution, request.node_execution_id)
     if (
         node is None
@@ -852,6 +1317,50 @@ def approve_workflow_node(
         decision=request.decision,
     )
     session.add(approval)
+    if execution.workflow_version == 3:
+        if request.decision is ApprovalDecision.REJECTED:
+            target_node_key = {
+                "PLAN": "CONTENT_PLAN",
+                "TEXT": "TEXT_GENERATE",
+                "IMAGE": "IMAGE_GENERATE",
+            }[request.revision_target or ""]
+            # Engine owns revision/node/attempt state; this API transaction adds
+            # the user decision and durable dispatch intent before any worker runs.
+            session.flush()
+            get_workflow_engine(
+                session, get_ai_workflow_services(session), execution.workflow_version
+            ).prepare_rejected_revision(
+                execution.id,
+                target_node_key,
+                request.revision_request or "",
+                user_approval_id=approval.id,
+            )
+            intent = get_generation_dispatcher(session).create(
+                execution.id,
+                ACTION_REVISION,
+                target_node_key,
+                request.revision_request or "",
+            )
+        else:
+            intent = get_generation_dispatcher(session).create(execution.id, ACTION_RESUME)
+        try:
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise HTTPException(status_code=422, detail="Node already has a user decision") from exc
+        except Exception:
+            # A failed transaction must not leave a prepared revision visible.
+            session.rollback()
+            raise
+        get_generation_dispatcher(session).enqueue(intent.id)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "workflow_execution_id": execution.id,
+                "status": execution.status.value,
+                "dispatch_intent_id": intent.id,
+            },
+        )
     if request.decision is ApprovalDecision.REJECTED:
         try:
             # Flush only assigns the approval id. The engine commits this row together
@@ -918,12 +1427,15 @@ def _ensure_v3_image_check_passed(
 def retry_failed_workflow_execution(
     workflow_execution_id: int,
     session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ):
-    execution = _get_execution_or_404(session, workflow_execution_id)
+    execution = _get_owned_execution_or_404(session, workflow_execution_id, _owner_id_for_route(session, workflow_execution_id, current_user))
     try:
-        status = get_workflow_engine(session, get_ai_workflow_services(session)).retry_failed_execution(
-            execution.id
-        )
+        status = get_workflow_engine(
+            session,
+            get_ai_workflow_services(session),
+            execution.workflow_version,
+        ).retry_failed_execution(execution.id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"workflow_execution_id": execution.id, "status": status.value}

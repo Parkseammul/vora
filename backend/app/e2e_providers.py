@@ -1,7 +1,9 @@
 """Offline providers used only when VORA_E2E_FAKE_PROVIDERS is explicitly enabled."""
 
 import json
+import os
 import subprocess
+import time
 from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +19,25 @@ from app.script_generation import ScriptGenerationResult
 from app.video_generation import GeneratedSceneVideo, GeneratedSpeech
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
+
+
+def wait_for_e2e_node_gate(node_type: str) -> None:
+    """Block one offline fake node only when a process E2E explicitly requests it."""
+    if os.environ.get("VORA_E2E_BLOCK_NODE") != node_type:
+        return
+    started_path = os.environ.get("VORA_E2E_GATE_STARTED_PATH")
+    release_path = os.environ.get("VORA_E2E_GATE_RELEASE_PATH")
+    if not started_path or not release_path:
+        raise RuntimeError("E2E node gate requires both started and release paths")
+    started = Path(started_path)
+    release = Path(release_path)
+    started.parent.mkdir(parents=True, exist_ok=True)
+    started.write_text(node_type, encoding="utf-8")
+    deadline = time.monotonic() + 60
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"E2E node gate timed out for {node_type}")
+        time.sleep(0.05)
 
 
 class DeterministicE2EImageProvider:

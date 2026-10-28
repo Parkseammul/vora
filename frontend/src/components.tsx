@@ -5,12 +5,31 @@ import { PublicationPanel } from "./publication";
 import { WorkflowProvider, useWorkflow } from "./WorkflowContext";
 import { statusLabel, steps } from "./workflow";
 import type { NodeKey } from "./types";
+import { V3WorkflowPage } from "./v3Workflow";
+import type { V3Workflow } from "./types";
 
 export function WorkflowShell() {
   const { workflowExecutionId } = useParams();
   const id = Number(workflowExecutionId);
   if (!Number.isInteger(id) || id <= 0) return <p>잘못된 Workflow 주소입니다.</p>;
-  return <WorkflowProvider workflowExecutionId={id}><WorkflowLayout /></WorkflowProvider>;
+  return <WorkflowVersionRouter workflowExecutionId={id} />;
+}
+
+function WorkflowVersionRouter({ workflowExecutionId }: { workflowExecutionId: number }) {
+  const [version, setVersion] = useState<"loading" | "v1" | "v3" | "error">("loading");
+  const [v3Workflow, setV3Workflow] = useState<V3Workflow>();
+  useEffect(() => {
+    const controller = new AbortController();
+    void api.getWorkflow(workflowExecutionId, controller.signal).then((workflow) => {
+      if ("workflow_version" in workflow && workflow.workflow_version === 3) { setV3Workflow(workflow); setVersion("v3"); }
+      else setVersion("v1");
+    }).catch((cause) => { if (!(cause instanceof DOMException && cause.name === "AbortError")) setVersion("error"); });
+    return () => controller.abort();
+  }, [workflowExecutionId]);
+  if (version === "loading") return <main className="v3-detail-shell"><p className="v3-state">Workflow를 불러오는 중입니다…</p></main>;
+  if (version === "error") return <main className="v3-detail-shell"><p className="v3-error" role="alert">Workflow를 불러오지 못했습니다.</p></main>;
+  if (version === "v3") return <V3WorkflowPage workflowExecutionId={workflowExecutionId} initialWorkflow={v3Workflow} />;
+  return <WorkflowProvider workflowExecutionId={workflowExecutionId}><WorkflowLayout /></WorkflowProvider>;
 }
 
 function WorkflowLayout() { return <main className="workflow-layout"><header><Link to="/request" className="brand">VORA</Link><span>숏폼 제작 워크플로우</span></header><WorkflowStepper /><Outlet /></main>; }

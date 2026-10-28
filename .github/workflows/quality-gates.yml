@@ -1,0 +1,146 @@
+name: Quality Gates
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  quality-gates:
+    runs-on: ubuntu-latest
+    # The full backend suite plus the opt-in real-worker E2E needs more time
+    # than the unit-only gates, but must not be allowed to run indefinitely.
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: vora_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d vora_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      VORA_TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:5432/vora_test
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      DB_NAME: vora_test
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install FFmpeg and Korean fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg fontconfig fonts-nanum
+          ffmpeg -version
+          ffprobe -version
+          test -n "$(command -v ffmpeg)"
+          test -n "$(command -v ffprobe)"
+          korean_font="$(fc-match -f '%{file}' ':lang=ko')"
+          test -n "$korean_font"
+          test -f "$korean_font"
+          echo "Korean subtitle font: $korean_font"
+      - name: Install backend dependencies
+        run: python -m pip install -r backend/requirements.txt
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Apply backend migrations to the dedicated test database
+        working-directory: backend
+        run: python -m alembic upgrade head
+      - name: Backend pytest
+        working-directory: backend
+        run: python -m pytest
+      - name: Backend Ruff
+        working-directory: backend
+        run: python -m ruff check .
+      - name: Backend mypy
+        working-directory: backend
+        run: python -m mypy app
+      - name: V3 offline fake-provider safety gate
+        working-directory: backend
+        timeout-minutes: 10
+        env:
+          VORA_RUN_CELERY_REDIS_E2E: "true"
+          VORA_E2E_FAKE_PROVIDERS: "true"
+          VORA_TEST_REDIS_URL: redis://localhost:6379/15
+          VORA_TEST_CELERY_QUEUE: vora_test_ci_generation
+        run: >-
+          python -m pytest tests/test_celery_redis_fake_workflow_e2e.py -q
+          -k e2e_fake_v3_composition_blocks_vendor_provider_construction
+      - name: V3 Redis/Celery worker E2E
+        working-directory: backend
+        timeout-minutes: 40
+        env:
+          VORA_RUN_CELERY_REDIS_E2E: "true"
+          VORA_E2E_FAKE_PROVIDERS: "true"
+          VORA_TEST_REDIS_URL: redis://localhost:6379/15
+          VORA_TEST_CELERY_QUEUE: vora_test_ci_generation
+        run: >-
+          python -m pytest tests/test_celery_redis_fake_workflow_e2e.py -q
+          -k "not completes_fake_video_workflow and not e2e_fake_v3_composition_blocks_vendor_provider_construction"
+      - name: Frontend lint
+        working-directory: frontend
+        run: npm run lint
+      - name: Frontend test
+        working-directory: frontend
+        run: npm test
+      - name: Frontend build
+        working-directory: frontend
+        run: npm run build
+      - name: Cleanup V3 CI resources
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          # Test code performs normal-path cleanup. This is the last-resort
+          # cleanup for assertion failures, step timeouts, and cancellations.
+          set +e
+          worker_pattern='[c]elery.*app\.celery_app.*worker'
+          for signal in TERM KILL; do
+            pids=$(pgrep -f "$worker_pattern" || true)
+            if [ -n "$pids" ]; then
+              kill -"$signal" $pids 2>/dev/null || true
+              sleep 2
+            fi
+          done
+
+          # Redis DB 15 is dedicated to this CI job; never flush the default DB.
+          redis-cli -u "redis://localhost:6379/15" FLUSHDB >/dev/null 2>&1 || true
+
+          # Only remove the test-owned local-storage prefixes.
+          if [ -d backend/uploads ]; then
+            find backend/uploads -mindepth 1 -maxdepth 1 \
+              \( -name 'v3-celery-e2e-*' -o -name 'test-celery-redis-*' \) \
+              -exec rm -rf -- {} +
+          fi
+          # Cleanup is best effort and must not hide the original gate result.
+          exit 0
+      - name: Git whitespace
+        run: |
+          git diff --check
+          git diff --cached --check

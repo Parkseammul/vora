@@ -1,6 +1,7 @@
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from shutil import rmtree
+from types import SimpleNamespace
 from typing import TypeVar
 from uuid import uuid4
 
@@ -26,7 +27,6 @@ from app.models import (
     ExecutionInputSnapshot,
     FileAsset,
     NodeExecution,
-    NodeExecutionStatus,
     PromptVersion,
     RulesVersion,
     User,
@@ -169,6 +169,11 @@ def client(
     monkeypatch.setattr("app.workflow_execution_service.UPLOADS_ROOT", uploads_root)
     monkeypatch.setattr(main, "get_llm_provider", lambda: DeterministicPlanningProvider())
     monkeypatch.setattr(
+        main.celery_app,
+        "send_task",
+        lambda *_args, **_kwargs: SimpleNamespace(id="test-generation-task"),
+    )
+    monkeypatch.setattr(
         main,
         "get_content_plan_chat_model",
         lambda: RunnableLambda(
@@ -226,7 +231,7 @@ def test_source_image_input_is_reassembled_from_db_and_stops_for_content_approva
         files={"source_image": ("source.png", b"source", "image/png")},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     body = response.json()
     execution = session.get(WorkflowExecution, body["workflow_execution_id"])
     assert execution is not None
@@ -243,18 +248,12 @@ def test_source_image_input_is_reassembled_from_db_and_stops_for_content_approva
     assert source.created_by_node_execution_id is None
     assert source.slide_no is None
 
-    nodes = nodes_for(session, execution.id)
-    assert [node.node_type for node in nodes] == [
-        "CONTENT_PLAN", "TEXT_GENERATE", "TEXT_CHECK", "IMAGE_GENERATE", "IMAGE_CHECK", "HUMAN_APPROVAL"
-    ]
-    assert execution.status is WorkflowExecutionStatus.WAITING_APPROVAL
-    assert nodes[-1].status is NodeExecutionStatus.WAITING
+    assert execution.status is WorkflowExecutionStatus.PENDING
+    assert nodes_for(session, execution.id) == []
     assert body == {
         "workflow_execution_id": execution.id,
-        "status": "WAITING_APPROVAL",
-        "current_node": "HUMAN_APPROVAL",
-        "current_node_execution_id": nodes[-1].id,
-        "result": nodes[-1].output_data,
+        "status": "PENDING",
+        "dispatch_intent_id": body["dispatch_intent_id"],
     }
 
 
@@ -273,7 +272,7 @@ def test_source_image_is_persisted_and_reaches_input_analysis(
         files={"source_image": ("source.jpg", b"source", "image/jpeg")},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     execution_id = response.json()["workflow_execution_id"]
     snapshot = session.scalar(
         select(ExecutionInputSnapshot).where(
@@ -289,9 +288,7 @@ def test_source_image_is_persisted_and_reaches_input_analysis(
     assert not asset.storage_key.startswith("C:")
     assert (uploads_root / asset.storage_key).read_bytes() == b"source"
 
-    nodes = nodes_for(session, execution_id)
-    assert nodes[-1].node_type == "HUMAN_APPROVAL"
-    assert nodes[-1].status is NodeExecutionStatus.WAITING
+    assert nodes_for(session, execution_id) == []
 
 
 @pytest.mark.parametrize(
