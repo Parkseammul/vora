@@ -441,13 +441,13 @@ def test_real_redis_celery_v3_approved_then_fake_instagram_publication() -> None
             assert attempt is not None and attempt.status is SocialPublicationAttemptStatus.SUCCESS
             assert workflow is not None and workflow.status is WorkflowExecutionStatus.SUCCEEDED
     finally:
-        _stop_worker(publication_worker)
-        _stop_worker(generation_worker)
-        if created_connection and connection_id is not None:
-            if context.execution_id is not None:
-                _delete_execution_publications(context.execution_id)
-            _delete_social_connection(connection_id)
-        context.cleanup()
+        _cleanup_publication_e2e(
+            context,
+            publication_worker,
+            generation_worker,
+            connection_id,
+            created_connection,
+        )
 
 
 def test_real_redis_celery_v3_rejected_revision_reenters_human_approval() -> None:
@@ -551,24 +551,19 @@ def test_real_redis_celery_fake_publication_failure_does_not_republish() -> None
             ).status_code == 202
         completed = _wait_for_workflow(execution_id, WorkflowExecutionStatus.SUCCEEDED)
         with Session(engine) as session:
-            connection = session.scalar(
-                select(SocialAccountConnection).where(
-                    SocialAccountConnection.user_id == completed.user_id,
-                    SocialAccountConnection.platform == SocialPlatform.INSTAGRAM,
-                )
+            # Always create a connection owned by this test. Reusing a prior
+            # connection would couple cleanup to data from another run.
+            connection = SocialAccountConnection(
+                user_id=completed.user_id,
+                platform=SocialPlatform.INSTAGRAM,
+                external_account_id=f"e2e-{uuid4()}",
+                account_name="E2E fake Instagram",
+                access_token="offline-fake-token",
+                status=SocialConnectionStatus.CONNECTED,
             )
-            if connection is None:
-                connection = SocialAccountConnection(
-                    user_id=completed.user_id,
-                    platform=SocialPlatform.INSTAGRAM,
-                    external_account_id=f"e2e-{uuid4()}",
-                    account_name="E2E fake Instagram",
-                    access_token="offline-fake-token",
-                    status=SocialConnectionStatus.CONNECTED,
-                )
-                session.add(connection)
-                session.commit()
-                created_connection = True
+            session.add(connection)
+            session.commit()
+            created_connection = True
             connection_id = connection.id
 
         publication_worker = _start_publication_worker(context.root)
@@ -598,11 +593,13 @@ def test_real_redis_celery_fake_publication_failure_does_not_republish() -> None
             assert attempts[0].status is SocialPublicationAttemptStatus.FAILED
             assert attempts[0].error_code == "e2e_fake_failure"
     finally:
-        _stop_worker(publication_worker)
-        _stop_worker(generation_worker)
-        if created_connection and connection_id is not None:
-            _delete_social_connection(connection_id)
-        context.cleanup()
+        _cleanup_publication_e2e(
+            context,
+            publication_worker,
+            generation_worker,
+            connection_id,
+            created_connection,
+        )
 
 
 def test_real_worker_crash_relay_recovery_reuses_completed_v3_nodes() -> None:
@@ -1286,8 +1283,40 @@ def _delete_execution_publications(workflow_execution_id: int) -> None:
         session.commit()
 
 
+def _cleanup_publication_e2e(
+    context: _V3E2EContext,
+    publication_worker: subprocess.Popen[bytes] | None,
+    generation_worker: subprocess.Popen[bytes] | None,
+    connection_id: int | None,
+    created_connection: bool,
+) -> None:
+    """Always stop workers before deleting owned publication dependencies."""
+    try:
+        _stop_worker(publication_worker)
+    finally:
+        try:
+            _stop_worker(generation_worker)
+        finally:
+            try:
+                if created_connection and connection_id is not None:
+                    if context.execution_id is not None:
+                        _delete_execution_publications(context.execution_id)
+                    _delete_social_connection(connection_id)
+            finally:
+                context.cleanup()
+
+
 def _delete_social_connection(connection_id: int) -> None:
     with Session(engine) as session:
+        publication_ids = select(SocialPublication.id).where(
+            SocialPublication.social_account_connection_id == connection_id
+        )
+        session.execute(
+            delete(SocialPublicationAttempt).where(
+                SocialPublicationAttempt.social_publication_id.in_(publication_ids)
+            )
+        )
+        session.execute(delete(SocialPublication).where(SocialPublication.id.in_(publication_ids)))
         session.execute(delete(SocialAccountConnection).where(SocialAccountConnection.id == connection_id))
         session.commit()
 
