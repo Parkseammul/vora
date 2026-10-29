@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { UserManager, WebStorageStateStore, type User, type UserManagerSettings } from "oidc-client-ts";
 import { configureAccessTokenProvider } from "./api";
 import kakaoLoginButton from "./assets/kakao-login-complete-ko.svg";
@@ -31,7 +31,65 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   return <AuthContext.Provider value={useMemo(() => ({ user, state, login, logout }), [user, state, login, logout])}>{children}</AuthContext.Provider>;
 }
 export function useAuth() { const value = useContext(AuthContext); if (!value) throw new Error("useAuth must be used within AuthProvider"); return value; }
-export function LoginPage() { const { state, login } = useAuth(); const location = useLocation(); const [error, setError] = useState(""); const [busy, setBusy] = useState<LoginProvider | null>(null); const returnTo = new URLSearchParams(location.search).get("returnTo") ?? "/request"; const start = (provider: LoginProvider) => { if (busy) return; setBusy(provider); setError(""); void login(returnTo, provider).catch((cause) => setError(cause instanceof Error ? cause.message : "로그인을 시작할 수 없습니다.")).finally(() => setBusy(null)); }; return <main className="auth-page"><section className="auth-card"><p className="auth-kicker">VORA CREATIVE STUDIO</p><h1>당신의 아이디어를<br /><span>콘텐츠로 만드세요.</span></h1><p className="auth-description">로그인하면 작업 중인 Workflow와 콘텐츠를 안전하게 이어갈 수 있습니다.</p>{state === "error" && <p className="error">Cognito 설정이 없습니다.</p>}{error && <p className="error" role="alert">{error}</p>}<button aria-label="카카오 로그인" className="auth-login-button auth-login-button--kakao" type="button" disabled={state === "error" || busy !== null} onClick={() => start("kakao")}><img src={kakaoLoginButton} alt="" aria-hidden="true" />{busy === "kakao" && <span className="auth-busy-label">카카오 로그인으로 이동 중...</span>}</button><button className="auth-login-button auth-login-button--vora" type="button" disabled={state === "error" || busy !== null} onClick={() => start("vora")}>{busy === "vora" ? "VORA 로그인으로 이동 중..." : "VORA 계정으로 로그인"}</button><p className="auth-policy">로그인 시 VORA의 서비스 이용약관 및 개인정보처리방침에 동의합니다.</p></section></main>; }
+export function LoginPage() {
+  const { state, login } = useAuth();
+  const location = useLocation();
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState<LoginProvider | null>(null);
+  const returnTo = new URLSearchParams(location.search).get("returnTo") ?? "/request";
+  const start = (provider: LoginProvider) => {
+    if (busy) return;
+    setBusy(provider);
+    setError("");
+    void login(returnTo, provider).catch((cause) => setError(cause instanceof Error ? cause.message : "로그인을 시작할 수 없습니다.")).finally(() => setBusy(null));
+  };
+
+  return <main className="auth-page auth-page--login">
+    <div className="auth-login-layout">
+      <section className="auth-brand" aria-labelledby="auth-brand-title">
+        <Link to="/request" className="auth-logo" aria-label="VORA 홈">
+          <span className="auth-logo-mark" aria-hidden="true">✳</span>
+          <span>VORA<small>Creative Studio</small></span>
+        </Link>
+        <div className="auth-brand-copy">
+          <p className="auth-edition">CREATIVE STUDIO <span aria-hidden="true">/</span> 01</p>
+          <p className="auth-eyebrow">✦ YOUR TINY CREATIVE TEAM</p>
+          <h1 id="auth-brand-title">아이디어가<br /><span>콘텐츠가 되는 순간.</span></h1>
+          <p className="auth-brand-description">혼자 일해도, 작은 크리에이티브 팀이 함께하는 것처럼.<br />한 줄의 아이디어를 다섯 장의 이야기로 만들어 보세요.</p>
+        </div>
+        <div className="auth-workflow-preview" aria-label="VORA 제작 과정: 아이디어, 기획, 제작, 검토">
+          <p>FROM IDEA TO STORY <span>01 — 04</span></p>
+          <ol>
+            <li><span>01</span><strong>Idea</strong><small>아이디어</small></li>
+            <li><span>02</span><strong>Plan</strong><small>방향 잡기</small></li>
+            <li><span>03</span><strong>Create</strong><small>카드뉴스 제작</small></li>
+            <li><span>04</span><strong>Review</strong><small>당신의 승인</small></li>
+          </ol>
+        </div>
+      </section>
+
+      <section className="auth-login-area" aria-labelledby="auth-login-title">
+        <div className="auth-login-card">
+          <span className="auth-login-kicker">A NEW WAY TO CREATE</span>
+          <h2 id="auth-login-title">Welcome to <span>VORA.</span></h2>
+          <p className="auth-login-description">다시 만나 반가워요. 로그인하고 당신의 이야기를 이어가세요.</p>
+          {state === "error" && <p className="auth-login-error" role="alert">Cognito 설정이 없습니다.</p>}
+          {error && <p className="auth-login-error" role="alert">{error}</p>}
+          <div className="auth-login-actions">
+            <button aria-label="카카오 로그인" className="auth-login-button auth-login-button--kakao" type="button" disabled={state === "error" || busy !== null} onClick={() => start("kakao")}>
+              <img src={kakaoLoginButton} alt="" aria-hidden="true" />
+              {busy === "kakao" && <span className="auth-busy-label" role="status">카카오 로그인으로 이동 중...</span>}
+            </button>
+            <div className="auth-login-separator"><span>또는</span></div>
+            <button className="auth-login-button auth-login-button--vora" type="button" disabled={state === "error" || busy !== null} onClick={() => start("vora")}>{busy === "vora" ? "VORA 로그인으로 이동 중..." : "VORA 계정으로 로그인"}</button>
+          </div>
+          <p className="auth-policy">로그인 시 VORA의 서비스 이용약관 및 개인정보처리방침에 동의합니다.</p>
+        </div>
+        <p className="auth-login-footer">IDEAS BECOME STORIES. <span>© VORA CREATIVE STUDIO</span></p>
+      </section>
+    </div>
+  </main>;
+}
 export function AuthCallbackPage() { const navigate = useNavigate(); const callbackStarted = useRef(false); const [error, setError] = useState(manager ? "" : "Cognito frontend configuration is missing"); useEffect(() => { if (!manager || callbackStarted.current) return; callbackStarted.current = true; void manager.signinCallback().then((user) => navigate(safeReturnTo((user?.state as { returnTo?: string } | undefined)?.returnTo), { replace: true })).catch((cause) => setError(cause instanceof Error ? cause.message : "로그인 콜백을 처리할 수 없습니다.")); }, [navigate]); if (error) return <main className="auth-page"><section className="auth-card"><h1>로그인 실패</h1><p className="error" role="alert">{error}</p><a href="/login">다시 로그인</a></section></main>; return <main className="auth-page"><section className="auth-card"><p>로그인 확인 중...</p></section></main>; }
 export function RequireAuth({ children }: { children: ReactNode }) { const { state } = useAuth(); const location = useLocation(); if (state === "loading") return <main className="auth-page"><p>세션 확인 중...</p></main>; if (state !== "authenticated") return <LoginRedirect returnTo={location.pathname + location.search} />; return <>{children}</>; }
 function LoginRedirect({ returnTo }: { returnTo: string }) { const navigate = useNavigate(); useEffect(() => { navigate(`/login?returnTo=${encodeURIComponent(safeReturnTo(returnTo))}`, { replace: true }); }, [navigate, returnTo]); return <main className="auth-page"><p>로그인 화면으로 이동 중...</p></main>; }
