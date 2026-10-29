@@ -9,12 +9,16 @@ import "./styles.css";
 import "./studio.css";
 import "./creativeStudio.css";
 import "./homePrototype.css";
+import "./auth.css";
+import { AuthCallbackPage, AuthProvider, LoginPage, RequireAuth } from "./auth";
 
-createRoot(document.getElementById("root")!).render(<StrictMode><BrowserRouter><Routes>
+createRoot(document.getElementById("root")!).render(<StrictMode><BrowserRouter><AuthProvider><Routes>
+  <Route path="/login" element={<LoginPage />} />
+  <Route path="/auth/callback" element={<AuthCallbackPage />} />
   <Route path="/request" element={<DashboardPage />} />
-  <Route path="/settings/social" element={<SocialSettingsPage />} />
-  <Route path="/workflows/:workflowExecutionId" element={<WorkflowShell />}>
+  <Route path="/settings/social" element={<RequireAuth><SocialSettingsPage /></RequireAuth>} />
+  <Route path="/workflows/:workflowExecutionId" element={<RequireAuth><WorkflowShell /></RequireAuth>}>
     <Route path="plan" element={<PlanPage />} /><Route path="script" element={<ScriptPage />} /><Route path="video" element={<VideoPage />} />
   </Route>
   <Route path="*" element={<Navigate to="/request" replace />} />
-</Routes></BrowserRouter></StrictMode>);
+</Routes></AuthProvider></BrowserRouter></StrictMode>);

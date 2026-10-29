@@ -104,9 +104,17 @@ def create_snapshot(session: Session, workflow: WorkflowExecution) -> ExecutionI
     return snapshot
 
 
-def test_user_email_is_unique(session: Session) -> None:
+def test_user_email_is_optional_and_not_an_identity_key(session: Session) -> None:
     user = create_user(session)
-    flush_fails(session, User(email=user.email, name="duplicate"))
+    workflow = create_workflow(session, user)
+    original_user_id = user.id
+    duplicate = User(email=user.email, name="duplicate")
+    without_email = User(email=None, name="without email")
+    session.add_all([duplicate, without_email])
+    session.flush()
+    assert duplicate.id != original_user_id
+    assert without_email.id != original_user_id
+    assert workflow.user_id == original_user_id
 
 
 def test_workflow_has_only_one_snapshot_and_jsonb_round_trips(session: Session) -> None:
