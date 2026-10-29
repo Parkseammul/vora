@@ -4,12 +4,34 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "./api";
 import { DashboardPage } from "./dashboard";
 
+const authFixture = vi.hoisted(() => ({ state: "authenticated" }));
+vi.mock("./auth", () => ({
+  useAuth: () => ({ state: authFixture.state, user: null, logout: vi.fn() }),
+}));
+
 function renderDashboard() {
-  return render(<MemoryRouter initialEntries={["/request"]}><Routes><Route path="/request" element={<DashboardPage />} /><Route path="/workflows/:id" element={<p>V3 workflow opened</p>} /><Route path="/workflows/:id/plan" element={<p>Workflow plan opened</p>} /></Routes></MemoryRouter>);
+  return render(<MemoryRouter initialEntries={["/request"]}><Routes><Route path="/request" element={<DashboardPage />} /><Route path="/login" element={<p>Login required</p>} /><Route path="/workflows/:id" element={<p>V3 workflow opened</p>} /><Route path="/workflows/:id/plan" element={<p>Workflow plan opened</p>} /></Routes></MemoryRouter>);
 }
 
 describe("Creative Studio dashboard", () => {
-  afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+  afterEach(() => { cleanup(); vi.restoreAllMocks(); authFixture.state = "authenticated"; window.sessionStorage.clear(); });
+
+  it("keeps Studio public but protects creation and restores only safe text", async () => {
+    authFixture.state = "unauthenticated";
+    const create = vi.spyOn(api, "createWorkflow");
+    const first = renderDashboard();
+    expect(screen.getByRole("link", { name: "로그인" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/콘텐츠 주제/), { target: { value: "로그인 후 복원할 주제" } });
+    fireEvent.click(screen.getByRole("button", { name: /AI로 생성하기/ }));
+    expect(await screen.findByText("Login required")).toBeInTheDocument();
+    expect(create).not.toHaveBeenCalled();
+    first.unmount();
+
+    authFixture.state = "authenticated";
+    renderDashboard();
+    expect(screen.getByLabelText(/콘텐츠 주제/)).toHaveValue("로그인 후 복원할 주제");
+    expect(screen.getByRole("status")).toHaveTextContent("이미지는 보안상 저장되지 않으니 다시 선택해주세요");
+  });
 
   it("uses the local reference as decorative artwork, not a fake UI control", () => {
     const { container } = renderDashboard();

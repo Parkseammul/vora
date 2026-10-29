@@ -1,7 +1,7 @@
 import json
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
-from typing import Self
+from typing import Self, cast
 from uuid import uuid4
 
 import jwt
@@ -44,13 +44,19 @@ def cognito_fixture(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, objec
     client_id = "test-client"
     jwks_url = "https://fixture.test/.well-known/jwks.json"
     userinfo_url = "https://fixture.test/oauth2/userInfo"
+    userinfo: dict[str, object] = {
+        "sub": "cognito-sub",
+        "email": "new@example.test",
+        "email_verified": True,
+        "name": "New User",
+    }
 
     def fake_urlopen(request: object, timeout: int = 5) -> _Response:
         del timeout
         url = getattr(request, "full_url", "")
         if url == jwks_url:
             return _Response({"keys": [{**public_jwk, "kid": "test-key", "alg": "RS256", "use": "sig"}]})
-        return _Response({"sub": "cognito-sub", "email": "new@example.test", "email_verified": True, "name": "New User"})
+        return _Response(userinfo)
 
     monkeypatch.setattr("app.cognito_auth.urlopen", fake_urlopen)
     monkeypatch.setattr(main.settings, "cognito_issuer", issuer)
@@ -71,7 +77,7 @@ def cognito_fixture(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, objec
         claims.update(overrides)
         return jwt.encode(claims, private, algorithm="RS256", headers={"kid": kid})
 
-    yield {"token": token, "private": private, "issuer": issuer}
+    yield {"token": token, "private": private, "issuer": issuer, "userinfo": userinfo}
     verifier.clear_cache()
 
 
@@ -157,7 +163,17 @@ def test_authenticated_user_cannot_read_another_users_workflow(
                 f"/workflow-executions/{execution_id}",
                 headers={"Authorization": f"Bearer {cognito_fixture['token']()}"},
             )
+            publications = client.get(
+                f"/workflow-executions/{execution_id}/publications",
+                headers={"Authorization": f"Bearer {cognito_fixture['token']()}"},
+            )
+            asset = client.get(
+                f"/workflow-executions/{execution_id}/slides/1/image",
+                headers={"Authorization": f"Bearer {cognito_fixture['token']()}"},
+            )
         assert response.status_code == 404
+        assert publications.status_code == 404
+        assert asset.status_code == 404
         session.delete(execution)
         session.flush()
         session.delete(other)
@@ -165,16 +181,97 @@ def test_authenticated_user_cannot_read_another_users_workflow(
         session.commit()
 
 
-def test_legacy_email_is_not_auto_linked() -> None:
+def test_same_email_does_not_auto_link_cognito_identity() -> None:
     identity = CognitoIdentity("https://issuer.test", "sub-" + str(uuid4()), f"legacy-{uuid4()}@example.test", "Dev")
     with Session(engine) as session:
         legacy = User(email=identity.email, name="Legacy")
         session.add(legacy)
         session.commit()
-        with pytest.raises(CognitoAuthenticationError):
-            get_or_create_user(session, identity)
+        mapped = get_or_create_user(session, identity)
+        session.commit()
+        assert mapped.id != legacy.id
+        assert mapped.email == legacy.email
+        session.delete(mapped)
         session.delete(legacy)
         session.commit()
+
+
+def test_cognito_identity_without_email_is_allowed() -> None:
+    identity = CognitoIdentity("https://issuer.test", "sub-" + str(uuid4()), None, "VORA User")
+    with Session(engine) as session:
+        user = get_or_create_user(session, identity)
+        session.commit()
+        assert user.email is None
+        same = get_or_create_user(session, identity)
+        assert same.id == user.id
+        session.rollback()
+        session.delete(user)
+        session.commit()
+
+
+def test_unverified_email_is_not_used(cognito_fixture: dict[str, object]) -> None:
+    userinfo = cognito_fixture["userinfo"]
+    assert isinstance(userinfo, dict)
+    userinfo["email_verified"] = False
+    token = cognito_fixture["token"]
+    assert callable(token)
+    identity = verifier.verify(token())
+    assert identity.email is None
+
+
+def test_userinfo_subject_mismatch_is_rejected(cognito_fixture: dict[str, object]) -> None:
+    userinfo = cognito_fixture["userinfo"]
+    assert isinstance(userinfo, dict)
+    userinfo["sub"] = "different-sub"
+    token = cognito_fixture["token"]
+    assert callable(token)
+    with pytest.raises(CognitoAuthenticationError):
+        verifier.verify(token())
+
+
+def test_different_cognito_subjects_with_same_email_are_separate_users() -> None:
+    issuer = "https://issuer.test"
+    email = f"shared-{uuid4()}@example.test"
+    with Session(engine) as session:
+        first = get_or_create_user(session, CognitoIdentity(issuer, "sub-1-" + str(uuid4()), email, "First"))
+        second = get_or_create_user(session, CognitoIdentity(issuer, "sub-2-" + str(uuid4()), email, "Second"))
+        session.commit()
+        assert first.id != second.id
+        session.delete(second)
+        session.delete(first)
+        session.commit()
+
+
+def test_cognito_user_creation_race_returns_winning_identity() -> None:
+    identity = CognitoIdentity("https://issuer.test", "race-sub", None, "Race User")
+    winner = User(
+        id=987654321,
+        email=None,
+        name="Race User",
+        cognito_issuer=identity.issuer,
+        cognito_sub=identity.sub,
+    )
+
+    class RaceSession:
+        scalar_calls = 0
+        rolled_back = False
+
+        def scalar(self, _statement: object) -> User | None:
+            self.scalar_calls += 1
+            return None if self.scalar_calls == 1 else winner
+
+        def add(self, _user: User) -> None:
+            return None
+
+        def flush(self) -> None:
+            raise IntegrityError("INSERT", {}, Exception("identity race"))
+
+        def rollback(self) -> None:
+            self.rolled_back = True
+
+    race_session = RaceSession()
+    assert get_or_create_user(cast(Session, race_session), identity) is winner
+    assert race_session.rolled_back is True
 
 
 def test_cognito_identity_pair_constraint_and_unique_key() -> None:

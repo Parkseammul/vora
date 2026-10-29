@@ -23,14 +23,28 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(apiUrl(path), { ...init, headers });
   if (!response.ok) {
     const body = await response.json().catch(() => null) as { detail?: string } | null;
+    if (response.status === 401) window.dispatchEvent(new Event("vora:auth-expired"));
     throw new ApiError(response.status, body?.detail ?? `Request failed (${response.status})`);
     throw new Error(body?.detail ?? "요청을 처리하지 못했습니다.");
   }
   return response.json() as Promise<T>;
 }
 
+export type EventStream = { close: () => void };
+async function openEventStream(path: string, onMessage: (data: string) => void, onError: (error: unknown) => void): Promise<EventStream> {
+  const controller = new AbortController();
+  void (async () => { try {
+    const response = await fetch(apiUrl(path), { headers: await authHeaders(), signal: controller.signal });
+    if (!response.ok || !response.body) throw new ApiError(response.status, `Event stream failed (${response.status})`);
+    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "";
+    while (true) { const { value, done } = await reader.read(); if (done) break; buffer += decoder.decode(value, { stream: true }); const blocks = buffer.split("\n\n"); buffer = blocks.pop() ?? ""; for (const block of blocks) { const data = block.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n"); if (data) onMessage(data); } }
+  } catch (error) { if (!(error instanceof DOMException && error.name === "AbortError")) onError(error); } })();
+  return { close: () => controller.abort() };
+}
+
 async function requestBlob(path: string, signal?: AbortSignal): Promise<Blob> {
   const response = await fetch(apiUrl(path), { headers: await authHeaders(), signal });
+  if (response.status === 401) window.dispatchEvent(new Event("vora:auth-expired"));
   if (!response.ok) throw new ApiError(response.status, `Image request failed (${response.status})`);
   return response.blob();
 }
@@ -53,6 +67,7 @@ export const api = {
   }),
   retry: (id: number) => request<void>(`/workflow-executions/${id}/retry`, { method: "POST" }),
   eventUrl: (id: number) => apiUrl(`/workflow-executions/${id}/video-generation/events`),
+  subscribeSse: (path: string, onMessage: (data: string) => void, onError: (error: unknown) => void) => openEventStream(path, onMessage, onError),
   getPublications: (id: number) => request<PublicationDetail>(`/workflow-executions/${id}/publications`),
   publish: (id: number, body: object) => request<PublicationDetail>(`/workflow-executions/${id}/publications`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   publishInstagram: (id: number, body: InstagramPublicationRequest) => request<PublicationDetail>(`/workflow-executions/${id}/publications`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),

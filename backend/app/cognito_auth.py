@@ -24,7 +24,7 @@ class CognitoAuthenticationError(Exception):
 class CognitoIdentity:
     issuer: str
     sub: str
-    email: str
+    email: str | None
     name: str
 
 
@@ -99,26 +99,35 @@ class CognitoTokenVerifier:
             sub = claims.get("sub")
             if not isinstance(sub, str) or not sub.strip():
                 raise ValueError("token subject is invalid")
-            email, name = self._userinfo(token, issuer)
+            email, name = self._userinfo(token, issuer, sub)
             return CognitoIdentity(issuer, sub, email, name)
         except CognitoAuthenticationError:
             raise
         except Exception as exc:
             raise CognitoAuthenticationError("Invalid Cognito access token") from exc
 
-    def _userinfo(self, token: str, issuer: str) -> tuple[str, str]:
+    def _userinfo(self, token: str, issuer: str, expected_sub: str) -> tuple[str | None, str]:
         url = self.settings.cognito_userinfo_url or f"{issuer}/oauth2/userInfo"
         try:
             request = Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
             with urlopen(request, timeout=5) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-            email = payload.get("email")
-            if not isinstance(email, str) or "@" not in email or email.strip() != email or len(email) > 255:
-                raise ValueError("verified email is missing")
-            if payload.get("email_verified") is not True:
-                raise ValueError("email is not verified")
-            name = payload.get("name") or payload.get("preferred_username") or email.split("@", 1)[0]
-            return email, str(name)[:100]
+            userinfo_sub = payload.get("sub")
+            if userinfo_sub is not None and userinfo_sub != expected_sub:
+                raise ValueError("userinfo subject does not match access token")
+            raw_email = payload.get("email")
+            email = (
+                raw_email
+                if isinstance(raw_email, str)
+                and "@" in raw_email
+                and raw_email.strip() == raw_email
+                and len(raw_email) <= 255
+                and payload.get("email_verified") is True
+                else None
+            )
+            raw_name = payload.get("name") or payload.get("preferred_username")
+            name = raw_name.strip()[:100] if isinstance(raw_name, str) and raw_name.strip() else "VORA User"
+            return email, name
         except Exception as exc:
             raise CognitoAuthenticationError("Cognito user information is unavailable") from exc
 
@@ -130,9 +139,6 @@ def get_or_create_user(session: Session, identity: CognitoIdentity) -> User:
     existing = session.scalar(select(User).where(User.cognito_issuer == identity.issuer, User.cognito_sub == identity.sub))
     if existing is not None:
         return existing
-    # Email is not an account-linking key; legacy users must not be adopted.
-    if session.scalar(select(User).where(User.email == identity.email)) is not None:
-        raise CognitoAuthenticationError("A legacy account cannot be linked by email")
     user = User(email=identity.email, name=identity.name, cognito_issuer=identity.issuer, cognito_sub=identity.sub)
     session.add(user)
     try:

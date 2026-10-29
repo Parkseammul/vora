@@ -1,12 +1,20 @@
 import { useEffect, useState, type ChangeEvent, type FormEvent, type KeyboardEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "./api";
+import { useAuth } from "./auth";
 
 const steps = ["Plan", "Text", "Image", "Review", "Publish"];
+const loginDraftKey = "vora.login-draft.request-text";
 
 export function DashboardPage() {
   const navigate = useNavigate();
-  const [brief, setBrief] = useState("");
+  const { state: authState } = useAuth();
+  const [restoredDraft] = useState(() => window.sessionStorage.getItem(loginDraftKey) !== null);
+  const [brief, setBrief] = useState(() => {
+    const saved = window.sessionStorage.getItem(loginDraftKey) ?? "";
+    window.sessionStorage.removeItem(loginDraftKey);
+    return saved;
+  });
   const [image, setImage] = useState<File | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [selectedSlide, setSelectedSlide] = useState(0);
@@ -28,6 +36,11 @@ export function DashboardPage() {
     event.preventDefault();
     if (busy) return;
     if (!brief.trim()) { setError("콘텐츠 주제를 입력해주세요."); return; }
+    if (authState !== "authenticated") {
+      window.sessionStorage.setItem(loginDraftKey, brief.trim());
+      navigate("/login?returnTo=%2Frequest");
+      return;
+    }
     if (!image) { setError("현재 생성 API는 기준 이미지 1장을 필요로 합니다."); return; }
     setBusy(true); setError("");
     try {
@@ -46,7 +59,7 @@ export function DashboardPage() {
         <HeroScene />
       </section>
       <div className="studio-grid">
-        <CreateForm brief={brief} setBrief={setBrief} image={image} onImage={onImage} onCreate={create} busy={busy} error={error} />
+        <CreateForm brief={brief} setBrief={setBrief} image={image} onImage={onImage} onCreate={create} busy={busy} error={error} restoredDraft={restoredDraft} />
         <PreviewPanel imageUrl={imageUrl} selectedSlide={selectedSlide} setSelectedSlide={setSelectedSlide} />
         <WorkflowSummary />
         <RecentProjects />
@@ -56,7 +69,8 @@ export function DashboardPage() {
 }
 
 function StudioHeader() {
-  return <header className="studio-header"><Link to="/request" className="studio-logo" aria-label="VORA 홈"><span className="logo-mark" aria-hidden="true">✳</span><span>VORA<small>Creative Studio</small></span></Link><nav className="studio-nav" aria-label="주 탐색"><a href="#create-studio" className="studio-nav-item active">만들기</a><a href="#workflow-progress" className="studio-nav-item">제작 흐름</a><a href="#recent-projects" className="studio-nav-item">최근 프로젝트</a></nav><Link to="/settings/social" className="studio-account-link">계정 연결 <span aria-hidden="true">↗</span></Link></header>;
+  const { user, state, logout } = useAuth();
+  return <header className="studio-header"><Link to="/request" className="studio-logo" aria-label="VORA 홈"><span className="logo-mark" aria-hidden="true">✳</span><span>VORA<small>Creative Studio</small></span></Link><nav className="studio-nav" aria-label="주 탐색"><a href="#create-studio" className="studio-nav-item active">만들기</a><a href="#workflow-progress" className="studio-nav-item">제작 흐름</a><a href="#recent-projects" className="studio-nav-item">최근 프로젝트</a></nav>{state === "authenticated" ? <span className="studio-account-link">{user?.profile.email ?? "Account"} <button type="button" onClick={() => void logout()}>로그아웃</button></span> : <Link className="studio-account-link" to="/login?returnTo=%2Frequest">로그인</Link>}</header>;
 }
 
 const localPrototypeImage = import.meta.env.DEV ? "/__prototype__/home.png" : undefined;
@@ -75,8 +89,8 @@ function FloatingCard({ className, number, icon, title, detail }: { className: s
   return <div className={`float-card ${className}`} aria-hidden="true"><span className="float-icon">{icon}</span><span><small>{number}</small><strong>{title}</strong><em>{detail}</em></span></div>;
 }
 
-function CreateForm({ brief, setBrief, image, onImage, onCreate, busy, error }: { brief: string; setBrief: (value: string) => void; image: File | null; onImage: (file: File | undefined) => void; onCreate: (event: FormEvent<HTMLFormElement>) => void; busy: boolean; error: string }) {
-  return <section id="create-studio" className="create-card" aria-labelledby="create-title"><div className="section-kicker"><span className="kicker-icon" aria-hidden="true">✦</span> CREATE STUDIO <span className="contract-pill">V3 / 5 SLIDES</span></div><h2 id="create-title">오늘은 어떤 이야기를 만들까요?</h2><p className="section-description">주제와 기준 이미지를 알려주면 VORA가 제작을 시작해요.</p><form onSubmit={(event) => void onCreate(event)} noValidate><label className="field-label" htmlFor="content-brief">콘텐츠 주제 <span>필수</span></label><textarea id="content-brief" value={brief} onChange={(event) => setBrief(event.target.value)} placeholder="예: 신제품을 소개하는 감각적인 인스타그램 카드뉴스" rows={4} aria-invalid={Boolean(error && !brief.trim())} /><label className="field-label image-field-label" htmlFor="source-image">기준 이미지 <span>JPG 또는 PNG · 1장</span></label><label className="upload-field" htmlFor="source-image"><input id="source-image" type="file" accept="image/png,image/jpeg" onChange={(event: ChangeEvent<HTMLInputElement>) => onImage(event.target.files?.[0])} /><span className="upload-icon" aria-hidden="true">＋</span><span><strong>{image ? image.name : "이미지 선택하기"}</strong><small>이미지는 제작의 출발점으로 사용돼요.</small></span><span className="upload-arrow" aria-hidden="true">↗</span></label>{error && <p className="form-error" role="alert">{error}</p>}<button className="generate-button" type="submit" disabled={busy}><span aria-hidden="true">✦</span>{busy ? "생성 요청 중..." : "AI로 생성하기"}<span className="button-arrow" aria-hidden="true">→</span></button><p className="form-hint">생성한 결과는 HUMAN_APPROVAL에서 확인하고 수정할 수 있어요.</p></form></section>;
+function CreateForm({ brief, setBrief, image, onImage, onCreate, busy, error, restoredDraft }: { brief: string; setBrief: (value: string) => void; image: File | null; onImage: (file: File | undefined) => void; onCreate: (event: FormEvent<HTMLFormElement>) => void; busy: boolean; error: string; restoredDraft: boolean }) {
+  return <section id="create-studio" className="create-card" aria-labelledby="create-title"><div className="section-kicker"><span className="kicker-icon" aria-hidden="true">✦</span> CREATE STUDIO <span className="contract-pill">V3 / 5 SLIDES</span></div><h2 id="create-title">오늘은 어떤 이야기를 만들까요?</h2><p className="section-description">주제와 기준 이미지를 알려주면 VORA가 제작을 시작해요.</p><form onSubmit={(event) => void onCreate(event)} noValidate>{restoredDraft && <p className="form-hint" role="status">입력한 주제를 복원했습니다. 업로드 이미지는 보안상 저장되지 않으니 다시 선택해주세요.</p>}<label className="field-label" htmlFor="content-brief">콘텐츠 주제 <span>필수</span></label><textarea id="content-brief" value={brief} onChange={(event) => setBrief(event.target.value)} placeholder="예: 신제품을 소개하는 감각적인 인스타그램 카드뉴스" rows={4} aria-invalid={Boolean(error && !brief.trim())} /><label className="field-label image-field-label" htmlFor="source-image">기준 이미지 <span>JPG 또는 PNG · 1장</span></label><label className="upload-field" htmlFor="source-image"><input id="source-image" type="file" accept="image/png,image/jpeg" onChange={(event: ChangeEvent<HTMLInputElement>) => onImage(event.target.files?.[0])} /><span className="upload-icon" aria-hidden="true">＋</span><span><strong>{image ? image.name : "이미지 선택하기"}</strong><small>이미지는 제작의 출발점으로 사용돼요.</small></span><span className="upload-arrow" aria-hidden="true">↗</span></label>{error && <p className="form-error" role="alert">{error}</p>}<button className="generate-button" type="submit" disabled={busy}><span aria-hidden="true">✦</span>{busy ? "생성 요청 중..." : "AI로 생성하기"}<span className="button-arrow" aria-hidden="true">→</span></button><p className="form-hint">생성한 결과는 HUMAN_APPROVAL에서 확인하고 수정할 수 있어요.</p></form></section>;
 }
 
 function PreviewPanel({ imageUrl, selectedSlide, setSelectedSlide }: { imageUrl: string | null; selectedSlide: number; setSelectedSlide: (value: number) => void }) {

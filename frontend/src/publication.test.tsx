@@ -7,7 +7,7 @@ import { ApprovalActions } from "./components";
 import type { PublicationDetail, Publication } from "./types";
 import { WorkflowProvider } from "./WorkflowContext";
 
-vi.mock("./api", () => ({ api: { getWorkflow: vi.fn(), getPublications: vi.fn(), connections: vi.fn(), authorize: vi.fn(), publish: vi.fn(), publicationEventUrl: vi.fn(), assetUrl: vi.fn() } }));
+vi.mock("./api", () => ({ api: { getWorkflow: vi.fn(), getPublications: vi.fn(), connections: vi.fn(), authorize: vi.fn(), publish: vi.fn(), publicationEventUrl: vi.fn(), subscribeSse: vi.fn(), assetUrl: vi.fn() } }));
 
 class EventSourceStub {
   static instances: EventSourceStub[] = [];
@@ -31,6 +31,7 @@ describe("publication UI", () => {
     vi.mocked(api.getPublications).mockResolvedValue(publication());
     vi.mocked(api.connections).mockResolvedValue({ connections: [{ platform: "YOUTUBE", account_name: "channel", status: "CONNECTED" }] });
     vi.mocked(api.publicationEventUrl).mockReturnValue("/events");
+    vi.mocked(api.subscribeSse).mockImplementation((_path, onMessage) => { const source = new EventSourceStub(); source.onmessage = (event) => onMessage(event.data); return Promise.resolve({ close: () => source.close() }); });
     vi.mocked(api.publish).mockResolvedValue(publication());
   });
   afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
