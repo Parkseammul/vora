@@ -31,7 +31,7 @@ function revisedWorkflow(): V3Workflow {
 describe("V3 reused revision display", () => {
   afterEach(() => { vi.restoreAllMocks(); });
 
-  it("shows the source revision for an upstream reused node", async () => {
+  it("shows reused progress as complete without exposing internal history", async () => {
     vi.spyOn(api, "getWorkflowTrace").mockResolvedValue({
       nodes: [{ node_type: "CONTENT_PLAN", revision_no: 0, status: "SUCCEEDED" }],
       revisions: [{ revision_no: 2, start_node_type: "TEXT_GENERATE" }],
@@ -39,7 +39,11 @@ describe("V3 reused revision display", () => {
 
     render(<MemoryRouter><V3WorkflowPage workflowExecutionId={42} initialWorkflow={revisedWorkflow()} /></MemoryRouter>);
 
-    await waitFor(() => expect(screen.getAllByText(/이전 Revision 0 결과 재사용/).length).toBeGreaterThan(0));
-    expect(screen.getAllByText("REUSED").length).toBeGreaterThan(0);
+    await waitFor(() => expect(api.getWorkflowTrace).toHaveBeenCalled());
+    const planning = screen.getByText("기획").closest("li");
+    expect(planning).toHaveClass("reused");
+    expect(planning).toHaveTextContent("완료");
+    expect(screen.queryByText(/기존 결과 사용|이전 결과를 그대로 사용해요/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Revision|NodeExecution|REUSED/)).not.toBeInTheDocument();
   });
 });
