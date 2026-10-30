@@ -54,6 +54,22 @@ export interface V3Workflow {
   images: V3ImageAsset[];
 }
 
+export interface V3TraceNode {
+  node_type: V3NodeType;
+  revision_no: number;
+  status: V3NodeStatus;
+}
+
+export interface V3TraceRevision {
+  revision_no: number;
+  start_node_type: V3NodeType;
+}
+
+export interface V3WorkflowTrace {
+  nodes: V3TraceNode[];
+  revisions: V3TraceRevision[];
+}
+
 export type WorkflowRead = Workflow | V3Workflow;
 
 export function isV3Workflow(workflow: WorkflowRead): workflow is V3Workflow {

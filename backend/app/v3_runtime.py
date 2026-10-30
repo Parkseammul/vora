@@ -10,7 +10,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import Runnable
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -32,16 +32,36 @@ class ContentPlanOutput(BaseModel):
     """The structured response required from the CONTENT_PLAN chat model."""
 
     core_message: str
-    slide_structure: list[str] = Field(min_length=1)
+    slide_structure: list[str] = Field(min_length=5, max_length=5)
+
+    @field_validator("slide_structure")
+    @classmethod
+    def validate_slide_structure(cls, value: list[str]) -> list[str]:
+        if any(not purpose.strip() for purpose in value):
+            raise ValueError("slide_structure items must not be blank")
+        return value
 
 
 class SlideText(BaseModel):
-    slide_no: int
+    slide_no: int = Field(ge=1, le=5)
     text: str
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("slide text must not be blank")
+        return value
 
 
 class TextGenerateOutput(BaseModel):
-    slides: list[SlideText] = Field(min_length=1)
+    slides: list[SlideText] = Field(min_length=5, max_length=5)
+
+    @model_validator(mode="after")
+    def validate_slide_numbers(self) -> "TextGenerateOutput":
+        if [slide.slide_no for slide in self.slides] != [1, 2, 3, 4, 5]:
+            raise ValueError("slides must contain slide_no 1 through 5 in order")
+        return self
 
 
 class TextCheckOutput(BaseModel):
@@ -307,11 +327,12 @@ class V3NodeExecutor:
     ) -> NodeExecutionResult:
         if self._fail_node == "IMAGE_GENERATE":
             raise RuntimeError("Fake V3 executor failure for IMAGE_GENERATE")
+        slides = TextGenerateOutput.model_validate({"slides": input_data.get("slides")}).slides
         if self._session is None or workflow_execution_id is None or node_execution_id is None:
             raise NodeExecutorConfigurationError("IMAGE_GENERATE requires session and workflow execution")
         if self._image_provider is None or self._storage is None:
             raise NodeExecutorConfigurationError("IMAGE_GENERATE provider and storage are not configured")
-        slides = input_data["slides"]
+        slide_payload = [slide.model_dump(mode="json") for slide in slides]
         snapshot = self._session.scalar(
             select(ExecutionInputSnapshot).where(
                 ExecutionInputSnapshot.workflow_execution_id == workflow_execution_id
@@ -327,7 +348,7 @@ class V3NodeExecutor:
             temporary_root = Path(temporary_directory)
             source_image = temporary_root / source_asset.file_name
             self._storage.materialize_private(source_asset.storage_key, source_image)
-            for slide in slides:
+            for slide in slide_payload:
                 slide_no = slide["slide_no"]
                 prompt = f"Use the reference image as visual inspiration. Create an image for slide {slide_no}: {slide['text']}"
                 image_bytes = self._image_provider.generate(prompt=prompt, source_image=source_image)
@@ -362,7 +383,7 @@ class V3NodeExecutor:
                 self._session.flush()
                 asset_ids.append(asset.id)
         return NodeExecutionResult(
-            output_data={"slides": slides, "asset_ids": asset_ids},
+            output_data={"slides": slide_payload, "asset_ids": asset_ids},
             attempt_metadata={"runtime": "v3-image-provider"},
             ai_company="OPENAI",
             model=self._image_model_name,
@@ -399,8 +420,13 @@ class V3NodeExecutor:
         if rules is None:
             raise NodeExecutorConfigurationError("IMAGE_CHECK rules version does not exist")
         asset_ids = input_data.get("asset_ids", [])
-        if not isinstance(asset_ids, list) or not all(isinstance(asset_id, int) for asset_id in asset_ids):
-            raise ValueError("IMAGE_CHECK asset_ids must be a list of integers")
+        if (
+            not isinstance(asset_ids, list)
+            or len(asset_ids) != 5
+            or len(set(asset_ids)) != 5
+            or not all(isinstance(asset_id, int) for asset_id in asset_ids)
+        ):
+            raise ValueError("IMAGE_CHECK asset_ids must contain five unique integers")
         assets = list(self._session.scalars(select(FileAsset).where(FileAsset.id.in_(asset_ids))))
         asset_by_id = {asset.id: asset for asset in assets}
         if len(asset_by_id) != len(asset_ids):

@@ -14,6 +14,7 @@ _CELERY_REDIS_E2E_ENV = "VORA_RUN_CELERY_REDIS_E2E"
 _TEST_REDIS_URL_ENV = "VORA_TEST_REDIS_URL"
 _TEST_CELERY_QUEUE_ENV = "VORA_TEST_CELERY_QUEUE"
 _TEST_CELERY_QUEUE_PATTERN = re.compile(r"vora_test_[a-z0-9_-]+$")
+_TEST_AUTH_USER_ENV = "VORA_TEST_AUTH_USER_EMAIL"
 
 
 def _configure_test_database() -> None:
@@ -96,9 +97,16 @@ def test_authenticated_user_override() -> Iterator[None]:
     from app.models import User
 
     def current_user(session=Depends(main.get_session)):  # type: ignore[no-untyped-def]  # noqa: B008
-        user = session.scalar(select(User).order_by(User.id.desc()).limit(1))
+        requested_email = os.environ.get(_TEST_AUTH_USER_ENV)
+        statement = select(User)
+        if requested_email:
+            statement = statement.where(User.email == requested_email)
+        else:
+            statement = statement.order_by(User.id.desc()).limit(1)
+        user = session.scalar(statement)
         if user is None:
-            raise HTTPException(status_code=401, detail="Test user was not prepared")
+            detail = "Requested test user was not prepared" if requested_email else "Test user was not prepared"
+            raise HTTPException(status_code=401, detail=detail)
         return user
 
     previous = main.app.dependency_overrides.get(main.get_current_user)

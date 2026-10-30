@@ -100,6 +100,8 @@ def test_real_redis_celery_worker_completes_fake_video_workflow(
             dev_user_id = dev_user.id
         assert dev_user_id is not None
 
+        # Authenticate as the owner of this deliberately bootstrapped V1 execution.
+        monkeypatch.setenv("VORA_TEST_AUTH_USER_EMAIL", DEV_USER_EMAIL)
         monkeypatch.setattr(main.settings, "uploads_root", uploads_root)
         monkeypatch.setattr("app.workflow_execution_service.UPLOADS_ROOT", uploads_root)
         with TestClient(main.app) as client:
@@ -225,32 +227,32 @@ def test_real_redis_celery_worker_reaches_v3_human_approval_offline(
                 created_dev_user = True
             rules = RulesVersion(version=version, rules_data={"e2e": True})
             session.add(rules)
-            session.add_all(
-                [
-                    PromptVersion(
-                        node_type="CONTENT_PLAN",
-                        version=version,
-                        prompt_template="Request: {request_text}\nRules: {rules_data}",
-                    ),
-                    PromptVersion(
-                        node_type="TEXT_GENERATE",
-                        version=version,
-                        prompt_template="Message: {core_message}\nSlides: {slide_structure}",
-                    ),
-                    PromptVersion(
-                        node_type="TEXT_CHECK",
-                        version=version,
-                        prompt_template="Slides: {slides}\nRules: {rules_data}",
-                    ),
-                    PromptVersion(
-                        node_type="IMAGE_CHECK",
-                        version=version,
-                        prompt_template="Slides: {slides}\nAssets: {asset_ids}",
-                    ),
-                ]
-            )
+            prompt_versions = [
+                PromptVersion(
+                    node_type="CONTENT_PLAN",
+                    version=version,
+                    prompt_template="Request: {request_text}\nRules: {rules_data}",
+                ),
+                PromptVersion(
+                    node_type="TEXT_GENERATE",
+                    version=version,
+                    prompt_template="Message: {core_message}\nSlides: {slide_structure}",
+                ),
+                PromptVersion(
+                    node_type="TEXT_CHECK",
+                    version=version,
+                    prompt_template="Slides: {slides}\nRules: {rules_data}",
+                ),
+                PromptVersion(
+                    node_type="IMAGE_CHECK",
+                    version=version,
+                    prompt_template="Slides: {slides}\nAssets: {asset_ids}",
+                ),
+            ]
+            session.add_all(prompt_versions)
             session.commit()
             rules_id = rules.id
+            prompt_version_ids = tuple(prompt.id for prompt in prompt_versions)
         # The API process and the child worker must use the same test-only
         # local storage root; no default uploads directory is involved.
         monkeypatch.setattr(main.settings, "uploads_root", root)
@@ -349,7 +351,7 @@ def test_real_redis_celery_worker_reaches_v3_human_approval_offline(
         if execution_id is not None:
             _delete_execution(execution_id)
         with Session(engine) as session:
-            session.execute(delete(PromptVersion).where(PromptVersion.version == version))
+            _delete_unreferenced_prompt_versions(session, prompt_version_ids)
             session.execute(delete(RulesVersion).where(RulesVersion.version == version))
             if created_dev_user:
                 session.execute(delete(User).where(User.email == DEV_USER_EMAIL))
@@ -874,6 +876,7 @@ class _V3E2EContext:
     root: Path
     rules_id: int
     version: int
+    prompt_version_ids: tuple[int, ...]
     created_dev_user: bool
     original_uploads_root: Path
     execution_id: int | None = None
@@ -890,38 +893,38 @@ class _V3E2EContext:
                 created_dev_user = True
             rules = RulesVersion(version=version, rules_data={"e2e": True})
             session.add(rules)
-            session.add_all(
-                [
-                    PromptVersion(
-                        node_type="CONTENT_PLAN",
-                        version=version,
-                        prompt_template="Request: {request_text}\nRules: {rules_data}",
-                    ),
-                    PromptVersion(
-                        node_type="TEXT_GENERATE",
-                        version=version,
-                        prompt_template="Message: {core_message}\nSlides: {slide_structure}",
-                    ),
-                    PromptVersion(
-                        node_type="TEXT_CHECK",
-                        version=version,
-                        prompt_template="Slides: {slides}\nRules: {rules_data}",
-                    ),
-                    PromptVersion(
-                        node_type="IMAGE_CHECK",
-                        version=version,
-                        prompt_template="Slides: {slides}\nAssets: {asset_ids}",
-                    ),
-                ]
-            )
+            prompt_versions = [
+                PromptVersion(
+                    node_type="CONTENT_PLAN",
+                    version=version,
+                    prompt_template="Request: {request_text}\nRules: {rules_data}",
+                ),
+                PromptVersion(
+                    node_type="TEXT_GENERATE",
+                    version=version,
+                    prompt_template="Message: {core_message}\nSlides: {slide_structure}",
+                ),
+                PromptVersion(
+                    node_type="TEXT_CHECK",
+                    version=version,
+                    prompt_template="Slides: {slides}\nRules: {rules_data}",
+                ),
+                PromptVersion(
+                    node_type="IMAGE_CHECK",
+                    version=version,
+                    prompt_template="Slides: {slides}\nAssets: {asset_ids}",
+                ),
+            ]
+            session.add_all(prompt_versions)
             session.commit()
             rules_id = rules.id
+            prompt_version_ids = tuple(prompt.id for prompt in prompt_versions)
         original_uploads_root = main.settings.uploads_root
         main.settings.uploads_root = root
         from app import workflow_execution_service
 
         workflow_execution_service.UPLOADS_ROOT = root
-        return cls(root, rules_id, version, created_dev_user, original_uploads_root)
+        return cls(root, rules_id, version, prompt_version_ids, created_dev_user, original_uploads_root)
 
     def create_generation(self) -> int:
         with TestClient(main.app) as client:
@@ -945,7 +948,7 @@ class _V3E2EContext:
         if self.execution_id is not None:
             _delete_execution(self.execution_id)
         with Session(engine) as session:
-            session.execute(delete(PromptVersion).where(PromptVersion.version == self.version))
+            _delete_unreferenced_prompt_versions(session, self.prompt_version_ids)
             session.execute(delete(RulesVersion).where(RulesVersion.version == self.version))
             if self.created_dev_user:
                 session.execute(delete(User).where(User.email == DEV_USER_EMAIL))
@@ -1263,6 +1266,24 @@ def _delete_execution(workflow_execution_id: int) -> None:
         session.execute(delete(NodeExecution).where(NodeExecution.workflow_execution_id == workflow_execution_id))
         session.execute(delete(WorkflowExecution).where(WorkflowExecution.id == workflow_execution_id))
         session.commit()
+
+
+def _delete_unreferenced_prompt_versions(
+    session: Session, prompt_version_ids: tuple[int, ...]
+) -> None:
+    """Delete only this test's prompts after all attempt children are gone."""
+    if not prompt_version_ids:
+        return
+    referenced_ids = set(
+        session.scalars(
+            select(NodeExecutionAttempt.prompt_version_id).where(
+                NodeExecutionAttempt.prompt_version_id.in_(prompt_version_ids)
+            )
+        )
+    )
+    removable_ids = set(prompt_version_ids) - referenced_ids
+    if removable_ids:
+        session.execute(delete(PromptVersion).where(PromptVersion.id.in_(removable_ids)))
 
 
 def _delete_execution_publications(workflow_execution_id: int) -> None:

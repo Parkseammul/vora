@@ -223,6 +223,38 @@ def test_workflow_read_apis_and_approval_use_latest_node_state(
     assert approval_response.json()["status"] == "WAITING_APPROVAL"
 
 
+def test_approval_returns_404_when_authenticated_user_does_not_own_workflow(
+    client: TestClient, session: Session
+) -> None:
+    owner = User(email=f"{uuid4()}@example.com", name="approval owner")
+    authenticated_user = User(email=f"{uuid4()}@example.com", name="other user")
+    session.add_all([owner, authenticated_user])
+    session.flush()
+    execution = WorkflowExecution(
+        user_id=owner.id,
+        workflow_key="vora_content_creation",
+        workflow_version=1,
+    )
+    session.add(execution)
+    session.flush()
+    waiting_node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="content_planning",
+        status=NodeExecutionStatus.WAITING,
+        input_data={},
+    )
+    session.add(waiting_node)
+    session.commit()
+    main.app.dependency_overrides[main.get_current_user] = lambda: authenticated_user
+
+    response = client.post(
+        f"/workflow-executions/{execution.id}/approvals",
+        json={"node_execution_id": waiting_node.id},
+    )
+
+    assert response.status_code == 404
+
+
 def test_trace_returns_full_history_without_payloads_and_does_not_mutate(
     client: TestClient, session: Session
 ) -> None:

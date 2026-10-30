@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api, ApiError } from "./api";
-import type { V3ImageAsset, V3NodeType, V3Workflow } from "./types";
+import type { V3ImageAsset, V3NodeType, V3Workflow, V3WorkflowTrace } from "./types";
 
 const nodeOrder: V3NodeType[] = ["CONTENT_PLAN", "TEXT_GENERATE", "TEXT_CHECK", "IMAGE_GENERATE", "IMAGE_CHECK", "HUMAN_APPROVAL", "PUBLICATION"];
 const summaryStages: Array<{ label: string; nodes: V3NodeType[] }> = [
@@ -12,6 +12,9 @@ const summaryStages: Array<{ label: string; nodes: V3NodeType[] }> = [
   { label: "Publish", nodes: ["PUBLICATION"] },
 ];
 
+type ReusedNode = { sourceRevision: number };
+type ReusedNodes = Partial<Record<V3NodeType, ReusedNode>>;
+
 function statusLabel(status: string | null | undefined) {
   return status === "WAITING" ? "WAITING APPROVAL" : status ?? "PENDING";
 }
@@ -20,13 +23,30 @@ function statusTone(status: string | null | undefined) {
   return status?.toLowerCase().replace("_", "-") ?? "pending";
 }
 
-function stageStatus(workflow: V3Workflow, nodes: V3NodeType[]) {
-  const values = nodes.map((node) => workflow.nodes[node]?.status);
+function stageStatus(workflow: V3Workflow, nodes: V3NodeType[], reusedNodes: ReusedNodes): string {
+  const values = nodes.map((node) => reusedNodes[node] ? "REUSED" : workflow.nodes[node]?.status);
   if (values.includes("FAILED")) return "FAILED";
   if (values.includes("WAITING")) return "WAITING";
   if (values.includes("RUNNING")) return "RUNNING";
-  if (values.every((status) => status === "SUCCEEDED" || status === "SKIPPED")) return "SUCCEEDED";
+  if (values.every((status) => status === "REUSED")) return "REUSED";
+  if (values.every((status) => status === "SUCCEEDED" || status === "SKIPPED" || status === "REUSED")) return "SUCCEEDED";
   return "PENDING";
+}
+
+function reusedNodesFor(workflow: V3Workflow, trace: V3WorkflowTrace): ReusedNodes {
+  const revision = trace.revisions.find((item) => item.revision_no === workflow.current_revision);
+  if (!revision) return {};
+  const startIndex = nodeOrder.indexOf(revision.start_node_type);
+  if (startIndex < 0) return {};
+  const result: ReusedNodes = {};
+  for (const type of nodeOrder.slice(0, startIndex)) {
+    if (workflow.nodes[type] !== null) continue;
+    const previous = trace.nodes
+      .filter((node) => node.node_type === type && node.revision_no < workflow.current_revision && node.status === "SUCCEEDED")
+      .sort((left, right) => right.revision_no - left.revision_no)[0];
+    if (previous) result[type] = { sourceRevision: previous.revision_no };
+  }
+  return result;
 }
 
 function apiErrorMessage(error: unknown) {
@@ -42,13 +62,24 @@ function apiErrorMessage(error: unknown) {
 export function V3WorkflowPage({ workflowExecutionId, initialWorkflow }: { workflowExecutionId: number; initialWorkflow?: V3Workflow }) {
   const navigate = useNavigate();
   const [workflow, setWorkflow] = useState<V3Workflow | null>(initialWorkflow ?? null);
+  const [reusedNodes, setReusedNodes] = useState<ReusedNodes>({});
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(!initialWorkflow);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     try {
       const next = await api.getWorkflow(workflowExecutionId, signal);
-      if ("workflow_version" in next && next.workflow_version === 3) setWorkflow(next);
+      if ("workflow_version" in next && next.workflow_version === 3) {
+        setWorkflow(next);
+        if (next.current_revision > 0 && Object.values(next.nodes).some((node) => node === null)) {
+          try {
+            const trace = await api.getWorkflowTrace(workflowExecutionId, signal);
+            setReusedNodes(reusedNodesFor(next, trace));
+          } catch {
+            setReusedNodes({});
+          }
+        } else setReusedNodes({});
+      }
       else setError("이 Workflow는 V1 영상 Workflow입니다.");
       setError("");
     } catch (cause) {
@@ -68,6 +99,15 @@ export function V3WorkflowPage({ workflowExecutionId, initialWorkflow }: { workf
     return () => window.clearTimeout(timer);
   }, [load, workflow]);
 
+  useEffect(() => {
+    if (!initialWorkflow || initialWorkflow.current_revision <= 0 || !Object.values(initialWorkflow.nodes).some((node) => node === null)) return;
+    const controller = new AbortController();
+    void api.getWorkflowTrace(workflowExecutionId, controller.signal)
+      .then((trace) => setReusedNodes(reusedNodesFor(initialWorkflow, trace)))
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [initialWorkflow, workflowExecutionId]);
+
   const refresh = () => load();
   if (loading && !workflow) return <main className="v3-detail-shell"><p className="v3-state">Workflow를 불러오는 중입니다…</p></main>;
   if (error && !workflow) return <main className="v3-detail-shell"><p className="v3-error" role="alert">{error}</p><Link className="v3-button" to="/request">Creative Studio로 돌아가기</Link></main>;
@@ -77,16 +117,23 @@ export function V3WorkflowPage({ workflowExecutionId, initialWorkflow }: { workf
     <header className="v3-detail-header"><Link className="v3-brand" to="/request">VORA <small>Creative Studio</small></Link><span className="v3-contract">V3 / CAROUSEL WORKFLOW</span><button className="v3-quiet-button" type="button" onClick={refresh}>새로고침</button></header>
     {error && <p className="v3-error" role="alert">{error}</p>}
     <section className="v3-hero-card"><div><p className="v3-eyebrow">YOUR TINY CREATIVE TEAM</p><h1>아이디어가 콘텐츠가 되는 과정</h1><p>실제 Workflow 상태와 카드뉴스 결과를 한 곳에서 확인하세요.</p></div><div className="v3-orbit-art" aria-hidden="true"><span>✦</span><i /><b>VORA</b></div></section>
-    <section className="v3-status-card" aria-labelledby="v3-status-title"><div className="v3-section-heading"><div><p className="v3-eyebrow">WORKFLOW STATUS</p><h2 id="v3-status-title">제작 진행 상황</h2></div><div className={`v3-status-badge ${statusTone(workflow.status)}`}>{statusLabel(workflow.status)}</div></div><p className="v3-meta">Workflow #{workflow.workflow_execution_id} · Revision {workflow.current_revision} · 현재 노드 {workflow.current_node_type ?? "-"}</p><ol className="v3-stage-list">{summaryStages.map((stage) => { const status = stageStatus(workflow, stage.nodes); return <li key={stage.label} className={statusTone(status)}><span>{stage.label}</span><strong>{statusLabel(status)}</strong><small>{stage.nodes.join(" · ")}</small></li>; })}</ol></section>
-    <div className="v3-content-grid"><V3NodeList workflow={workflow} /><V3Slides workflow={workflow} /></div>
+    <section className="v3-status-card" aria-labelledby="v3-status-title"><div className="v3-section-heading"><div><p className="v3-eyebrow">WORKFLOW STATUS</p><h2 id="v3-status-title">제작 진행 상황</h2></div><div className={`v3-status-badge ${statusTone(workflow.status)}`}>{statusLabel(workflow.status)}</div></div><p className="v3-meta">Workflow #{workflow.workflow_execution_id} · Revision {workflow.current_revision} · 현재 노드 {workflow.current_node_type ?? "-"}</p><ol className="v3-stage-list">{summaryStages.map((stage) => { const status = stageStatus(workflow, stage.nodes, reusedNodes); return <li key={stage.label} className={statusTone(status)}><span>{stage.label}</span><strong>{status === "REUSED" ? "REUSED" : statusLabel(status)}</strong><small>{stage.nodes.join(" · ")}</small></li>; })}</ol></section>
+    <V3ReuseNotice reusedNodes={reusedNodes} />
+    <div className="v3-content-grid"><V3NodeList workflow={workflow} reusedNodes={reusedNodes} /><V3Slides workflow={workflow} /></div>
     <V3Approval workflow={workflow} onUpdated={refresh} />
     <V3Publication workflow={workflow} />
     <p className="v3-back-link"><button className="v3-quiet-button" type="button" onClick={() => navigate("/request")}>← 새 카드뉴스 만들기</button></p>
   </main>;
 }
 
-function V3NodeList({ workflow }: { workflow: V3Workflow }) {
-  return <section className="v3-panel" aria-labelledby="v3-nodes-title"><div className="v3-section-heading"><div><p className="v3-eyebrow">SEVEN NODE TRACE</p><h2 id="v3-nodes-title">실제 Workflow 노드</h2></div></div><ol className="v3-node-list">{nodeOrder.map((type) => { const node = workflow.nodes[type]; return <li key={type} className={node ? statusTone(node.status) : "pending"}><span className="v3-node-index">{String(nodeOrder.indexOf(type) + 1).padStart(2, "0")}</span><div><strong>{type}</strong><small>{node ? `Revision ${node.revision_no} · Attempt ${node.attempt.current}` : "아직 생성되지 않음"}</small></div><em>{statusLabel(node?.status)}</em></li>; })}</ol></section>;
+function V3ReuseNotice({ reusedNodes }: { reusedNodes: ReusedNodes }) {
+  const entries = Object.entries(reusedNodes);
+  if (!entries.length) return null;
+  return <p className="v3-reuse-notice">이전 Revision 결과 재사용 (REUSED): {entries.map(([node, value]) => `${node} ← Revision ${value.sourceRevision}`).join(" · ")}</p>;
+}
+
+function V3NodeList({ workflow, reusedNodes }: { workflow: V3Workflow; reusedNodes: ReusedNodes }) {
+  return <section className="v3-panel" aria-labelledby="v3-nodes-title"><div className="v3-section-heading"><div><p className="v3-eyebrow">SEVEN NODE TRACE</p><h2 id="v3-nodes-title">실제 Workflow 노드</h2></div></div><ol className="v3-node-list">{nodeOrder.map((type) => { const node = workflow.nodes[type]; const reused = reusedNodes[type]; return <li key={type} className={node ? statusTone(node.status) : reused ? "reused" : "pending"}><span className="v3-node-index">{String(nodeOrder.indexOf(type) + 1).padStart(2, "0")}</span><div><strong>{type}</strong><small>{node ? `Revision ${node.revision_no} · Attempt ${node.attempt.current}` : reused ? `이전 Revision ${reused.sourceRevision} 결과 재사용` : "아직 생성되지 않음"}</small></div><em>{reused ? "REUSED" : statusLabel(node?.status)}</em></li>; })}</ol></section>;
 }
 
 function V3Image({ asset }: { asset: V3ImageAsset }) {
