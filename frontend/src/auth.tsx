@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { UserManager, WebStorageStateStore, type User, type UserManagerSettings } from "oidc-client-ts";
 import { configureAccessTokenProvider } from "./api";
 import kakaoLoginButton from "./assets/kakao-login-complete-ko.svg";
+import homeMascot from "../../home.png";
 
 const issuer = import.meta.env.VITE_COGNITO_ISSUER?.replace(/\/$/, "");
 const authority = import.meta.env.VITE_COGNITO_DOMAIN?.replace(/\/$/, "");
@@ -51,11 +52,21 @@ export function LoginPage() {
           <span className="auth-logo-mark" aria-hidden="true">✳</span>
           <span>VORA<small>Creative Studio</small></span>
         </Link>
-        <div className="auth-brand-copy">
-          <p className="auth-edition">CREATIVE STUDIO <span aria-hidden="true">/</span> 01</p>
-          <p className="auth-eyebrow">✦ YOUR TINY CREATIVE TEAM</p>
-          <h1 id="auth-brand-title">아이디어가<br /><span>콘텐츠가 되는 순간.</span></h1>
-          <p className="auth-brand-description">혼자 일해도, 작은 크리에이티브 팀이 함께하는 것처럼.<br />한 줄의 아이디어를 다섯 장의 이야기로 만들어 보세요.</p>
+        <div className="auth-brand-main">
+          <div className="auth-brand-copy">
+            <p className="auth-edition">CREATIVE STUDIO <span aria-hidden="true">/</span> 01</p>
+            <p className="auth-eyebrow">YOUR TINY CREATIVE TEAM <span aria-hidden="true">✳</span></p>
+            <h1 id="auth-brand-title">작은 아이디어가<br /><span>멋진 콘텐츠로.</span></h1>
+            <p className="auth-brand-description">한 줄의 생각에서 다섯 장의 이야기까지.<br />VORA와 함께 가볍게 시작해 보세요.</p>
+            <p className="auth-brand-signoff">A little magic, made together.</p>
+          </div>
+          <div className="auth-brand-visual" aria-hidden="true">
+            <span className="auth-visual-halo" />
+            <span className="auth-mascot-frame"><img src={homeMascot} alt="" draggable="false" /></span>
+            <span className="auth-floating-label auth-floating-label--idea"><span>✳</span> IDEA <small>첫 영감</small></span>
+            <span className="auth-floating-label auth-floating-label--create"><span>↗</span> CREATE <small>다섯 장의 이야기</small></span>
+            <span className="auth-visual-spark">✳</span>
+          </div>
         </div>
         <div className="auth-workflow-preview" aria-label="VORA 제작 과정: 아이디어, 기획, 제작, 검토">
           <p>FROM IDEA TO STORY <span>01 — 04</span></p>
@@ -70,9 +81,9 @@ export function LoginPage() {
 
       <section className="auth-login-area" aria-labelledby="auth-login-title">
         <div className="auth-login-card">
-          <span className="auth-login-kicker">A NEW WAY TO CREATE</span>
-          <h2 id="auth-login-title">Welcome to <span>VORA.</span></h2>
-          <p className="auth-login-description">다시 만나 반가워요. 로그인하고 당신의 이야기를 이어가세요.</p>
+          <span className="auth-login-kicker">WELCOME BACK <span aria-hidden="true">✳</span></span>
+          <h2 id="auth-login-title">다시 만나 <span>반가워요!</span></h2>
+          <p className="auth-login-description">오늘도 멋진 아이디어를 만들어 볼까요?</p>
           {state === "error" && <p className="auth-login-error" role="alert">Cognito 설정이 없습니다.</p>}
           {error && <p className="auth-login-error" role="alert">{error}</p>}
           <div className="auth-login-actions">

@@ -38,10 +38,11 @@ describe("Cognito authentication flow", () => {
 
   it("redirects an unauthenticated protected route to login once", async () => {
     const { AuthProvider, LoginPage, RequireAuth } = await loadAuth();
-    render(<MemoryRouter initialEntries={["/workflows/42"]}><AuthProvider><Routes><Route path="/workflows/:id" element={<RequireAuth><p>protected</p></RequireAuth>} /><Route path="/login" element={<><LoginPage /><Location /></>} /></Routes></AuthProvider></MemoryRouter>);
+    const { container } = render(<MemoryRouter initialEntries={["/workflows/42"]}><AuthProvider><Routes><Route path="/workflows/:id" element={<RequireAuth><p>protected</p></RequireAuth>} /><Route path="/login" element={<><LoginPage /><Location /></>} /></Routes></AuthProvider></MemoryRouter>);
     expect(await screen.findByRole("button", { name: "카카오 로그인" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: /아이디어가.*콘텐츠가 되는 순간/ })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Welcome to VORA." })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /작은 아이디어가.*멋진 콘텐츠로/ })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "다시 만나 반가워요!" })).toBeInTheDocument();
+    expect(container.querySelector(".auth-mascot-frame img")).toHaveAttribute("src", expect.stringMatching(/home.*\.png$/));
     expect(screen.getByRole("link", { name: "VORA 홈" })).toHaveAttribute("href", "/request");
     expect(screen.getByRole("button", { name: "카카오 로그인" }).querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml,/);
     expect(screen.getByTestId("location")).toHaveTextContent("/login");
