@@ -1,5 +1,6 @@
 """V3 node runtime; only CONTENT_PLAN currently uses a provider-backed LangChain path."""
 
+import hashlib
 import json
 import tempfile
 from collections.abc import Callable, Mapping
@@ -23,6 +24,7 @@ from app.models import (
     NodeExecutionStatus,
     PromptVersion,
     RulesVersion,
+    WorkflowExecution,
 )
 from app.node_executors import NodeExecutionResult, NodeExecutorConfigurationError
 from app.storage import StorageProvider
@@ -332,39 +334,73 @@ class V3NodeExecutor:
             raise NodeExecutorConfigurationError("IMAGE_GENERATE requires session and workflow execution")
         if self._image_provider is None or self._storage is None:
             raise NodeExecutorConfigurationError("IMAGE_GENERATE provider and storage are not configured")
+        session = self._session
+        image_provider = self._image_provider
+        storage = self._storage
+        self._lock_image_generation_scope(workflow_execution_id, node_execution_id)
         slide_payload = [slide.model_dump(mode="json") for slide in slides]
-        snapshot = self._session.scalar(
+        snapshot = session.scalar(
             select(ExecutionInputSnapshot).where(
                 ExecutionInputSnapshot.workflow_execution_id == workflow_execution_id
             )
         )
         if snapshot is None or snapshot.source_asset_id is None:
             raise NodeExecutorConfigurationError("IMAGE_GENERATE input source asset does not exist")
-        source_asset = self._session.get(FileAsset, snapshot.source_asset_id)
+        source_asset = session.get(FileAsset, snapshot.source_asset_id)
         if source_asset is None:
             raise NodeExecutorConfigurationError("IMAGE_GENERATE source asset does not exist")
         asset_ids: list[int] = []
         with tempfile.TemporaryDirectory(prefix="vora-image-") as temporary_directory:
             temporary_root = Path(temporary_directory)
             source_image = temporary_root / source_asset.file_name
-            self._storage.materialize_private(source_asset.storage_key, source_image)
+            storage.materialize_private(source_asset.storage_key, source_image)
+            source_digest = hashlib.sha256(source_image.read_bytes()).hexdigest()
+            previous_output = self._image_generation_progress(node_execution_id)
+            previous_asset_ids = previous_output.get("asset_ids", [])
+            previous_signatures = previous_output.get("image_generation_signatures", {})
+            if not isinstance(previous_asset_ids, list):
+                previous_asset_ids = []
+            if not isinstance(previous_signatures, dict):
+                previous_signatures = {}
             for slide in slide_payload:
                 slide_no = slide["slide_no"]
                 prompt = f"Use the reference image as visual inspiration. Create an image for slide {slide_no}: {slide['text']}"
-                image_bytes = self._image_provider.generate(prompt=prompt, source_image=source_image)
-                if not image_bytes:
-                    raise RuntimeError("Image provider returned an empty image")
+                signature = self._image_generation_signature(
+                    prompt=prompt,
+                    source_asset=source_asset,
+                    source_digest=source_digest,
+                )
                 file_name = f"slide-{slide_no}.png"
                 storage_key = (
                     f"workflows/{workflow_execution_id}/image-generate/"
                     f"node-{node_execution_id}/{file_name}"
                 )
+                asset = session.scalar(
+                    select(FileAsset)
+                    .where(
+                        FileAsset.storage_key == storage_key,
+                        FileAsset.workflow_execution_id == workflow_execution_id,
+                        FileAsset.created_by_node_execution_id == node_execution_id,
+                        FileAsset.asset_type == AssetType.IMAGE,
+                        FileAsset.slide_no == slide_no,
+                    )
+                    .with_for_update()
+                )
+                if (
+                    str(slide_no) in previous_signatures
+                    and previous_signatures[str(slide_no)] == signature
+                    and asset is not None
+                    and self._valid_stored_image(asset, temporary_root / f"existing-{slide_no}.png")
+                ):
+                    asset_ids.append(asset.id)
+                    continue
+
+                image_bytes = image_provider.generate(prompt=prompt, source_image=source_image)
+                if not image_bytes:
+                    raise RuntimeError("Image provider returned an empty image")
                 output_file = temporary_root / file_name
                 output_file.write_bytes(image_bytes)
-                self._storage.upload_private(storage_key, output_file, "image/png")
-                asset = self._session.scalar(
-                    select(FileAsset).where(FileAsset.storage_key == storage_key)
-                )
+                storage.upload_private(storage_key, output_file, "image/png")
                 if asset is None:
                     asset = FileAsset(
                         workflow_execution_id=workflow_execution_id,
@@ -376,17 +412,98 @@ class V3NodeExecutor:
                         file_size=len(image_bytes),
                         slide_no=slide_no,
                     )
-                    self._session.add(asset)
+                    session.add(asset)
                 else:
                     asset.file_size = len(image_bytes)
                     asset.mime_type = "image/png"
-                self._session.flush()
+                session.flush()
                 asset_ids.append(asset.id)
+                previous_signatures[str(slide_no)] = signature
+                previous_asset_ids = asset_ids.copy()
+                progress_node = session.get(NodeExecution, node_execution_id)
+                if progress_node is None:
+                    raise ValueError("IMAGE_GENERATE node execution does not exist")
+                progress_node.output_data = {
+                    "slides": slide_payload,
+                    "asset_ids": previous_asset_ids,
+                    "image_generation_signatures": previous_signatures,
+                }
+                session.flush()
         return NodeExecutionResult(
-            output_data={"slides": slide_payload, "asset_ids": asset_ids},
+            output_data={
+                "slides": slide_payload,
+                "asset_ids": asset_ids,
+                "image_generation_signatures": previous_signatures,
+            },
             attempt_metadata={"runtime": "v3-image-provider"},
             ai_company="OPENAI",
             model=self._image_model_name,
+        )
+
+    def _lock_image_generation_scope(self, workflow_execution_id: int, node_execution_id: int) -> None:
+        """Serialize duplicate deliveries for one workflow/node before provider calls."""
+        if self._session is None:
+            raise NodeExecutorConfigurationError("IMAGE_GENERATE requires a database session")
+        session = self._session
+        workflow = session.scalar(
+            select(WorkflowExecution)
+            .where(WorkflowExecution.id == workflow_execution_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        node = session.scalar(
+            select(NodeExecution)
+            .where(
+                NodeExecution.id == node_execution_id,
+                NodeExecution.workflow_execution_id == workflow_execution_id,
+                NodeExecution.node_type == "IMAGE_GENERATE",
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if workflow is None or node is None:
+            raise ValueError("IMAGE_GENERATE execution scope does not exist")
+
+    def _image_generation_progress(self, node_execution_id: int) -> dict[str, Any]:
+        if self._session is None:
+            return {}
+        node = self._session.get(NodeExecution, node_execution_id)
+        if node is None or not isinstance(node.output_data, dict):
+            return {}
+        return node.output_data
+
+    def _image_generation_signature(
+        self,
+        *,
+        prompt: str,
+        source_asset: FileAsset,
+        source_digest: str,
+    ) -> str:
+        signature_data = {
+            "prompt": prompt,
+            "source_asset_id": source_asset.id,
+            "source_storage_key": source_asset.storage_key,
+            "source_sha256": source_digest,
+            "model": self._image_model_name,
+            "settings": {"output_format": "png"},
+        }
+        serialized = json.dumps(signature_data, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(serialized).hexdigest()
+
+    def _valid_stored_image(self, asset: FileAsset, destination: Path) -> bool:
+        if asset.mime_type != "image/png":
+            return False
+        if self._storage is None:
+            return False
+        try:
+            self._storage.materialize_private(asset.storage_key, destination)
+            image_bytes = destination.read_bytes()
+        except (FileNotFoundError, OSError, ValueError):
+            return False
+        return (
+            image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+            and len(image_bytes) == asset.file_size
+            and len(image_bytes) > 8
         )
 
     def _image_check(

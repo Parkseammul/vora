@@ -1,6 +1,7 @@
 """Direct image-generation provider contracts used by the V3 runtime."""
 
 import base64
+import os
 from pathlib import Path
 from typing import Protocol
 
@@ -19,7 +20,17 @@ class OpenAIImageProvider:
             raise ValueError("OPENAI_API_KEY is required for image generation")
         from openai import OpenAI
 
-        self._client = OpenAI(api_key=api_key)
+        max_retries = os.environ.get("OPENAI_MAX_RETRIES")
+        if max_retries is None:
+            self._client = OpenAI(api_key=api_key)
+        else:
+            try:
+                parsed_max_retries = int(max_retries)
+            except ValueError as exc:
+                raise ValueError("OPENAI_MAX_RETRIES must be a non-negative integer") from exc
+            if parsed_max_retries < 0:
+                raise ValueError("OPENAI_MAX_RETRIES must be a non-negative integer")
+            self._client = OpenAI(api_key=api_key, max_retries=parsed_max_retries)
         self._model = model
 
     def generate(self, *, prompt: str, source_image: Path) -> bytes:

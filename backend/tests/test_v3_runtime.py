@@ -56,9 +56,15 @@ from app.v3_runtime import (
 from app.workflow_definitions import workflow_registry
 from app.workflow_engine import WorkflowEngine
 
+VALID_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0dIDAT\x08\xd7c\xf8"
+    b"\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99\x1d\x1d\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
 
 class FakeImageProvider:
-    def __init__(self, image: bytes = b"generated-image") -> None:
+    def __init__(self, image: bytes = VALID_PNG) -> None:
         self.image = image
         self.calls: list[tuple[str, Path]] = []
 
@@ -71,6 +77,18 @@ class FailingImageProvider:
     def generate(self, *, prompt: str, source_image: Path) -> bytes:
         del prompt, source_image
         raise RuntimeError("image provider unavailable")
+
+
+class FailOnCallImageProvider(FakeImageProvider):
+    def __init__(self, fail_on_call: int) -> None:
+        super().__init__()
+        self.fail_on_call = fail_on_call
+
+    def generate(self, *, prompt: str, source_image: Path) -> bytes:
+        if len(self.calls) + 1 == self.fail_on_call:
+            self.calls.append((prompt, source_image))
+            raise RuntimeError("image provider failed on configured slide")
+        return super().generate(prompt=prompt, source_image=source_image)
 
 
 class FakeStorage:
@@ -898,7 +916,8 @@ def test_image_generate_retry_reuses_asset_row_and_storage_key(session: Session)
     session.add(node)
     session.flush()
     storage = FakeStorage()
-    executor = V3NodeExecutor(session=session, image_provider=FakeImageProvider(), storage=storage)
+    provider = FakeImageProvider()
+    executor = V3NodeExecutor(session=session, image_provider=provider, storage=storage)
     payload = {"slides": _five_slides()}
 
     first = executor.execute("IMAGE_GENERATE", payload, workflow_execution_id=execution.id, node_execution_id=node.id)
@@ -909,6 +928,107 @@ def test_image_generate_retry_reuses_asset_row_and_storage_key(session: Session)
         select(FileAsset).where(FileAsset.created_by_node_execution_id == node.id)
     ).all()
     assert len(assets) == 5
+    assert len(provider.calls) == 5
+
+
+def test_image_generate_partial_failure_reuses_only_completed_slides(session: Session) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=0,
+        input_data={},
+        status=NodeExecutionStatus.RUNNING,
+    )
+    session.add(node)
+    session.flush()
+    storage = FakeStorage()
+    failing_provider = FailOnCallImageProvider(fail_on_call=4)
+    first_executor = V3NodeExecutor(
+        session=session,
+        image_provider=failing_provider,
+        image_model_name="test-image-model",
+        storage=storage,
+    )
+
+    with pytest.raises(RuntimeError, match="configured slide"):
+        first_executor.execute(
+            "IMAGE_GENERATE",
+            {"slides": _five_slides()},
+            workflow_execution_id=execution.id,
+            node_execution_id=node.id,
+        )
+    session.commit()
+
+    progress = session.get(NodeExecution, node.id)
+    assert progress is not None and isinstance(progress.output_data, dict)
+    assert len(progress.output_data["asset_ids"]) == 3
+    assert len(session.scalars(select(FileAsset).where(FileAsset.created_by_node_execution_id == node.id)).all()) == 3
+
+    retry_provider = FakeImageProvider()
+    retry_executor = V3NodeExecutor(
+        session=session,
+        image_provider=retry_provider,
+        image_model_name="test-image-model",
+        storage=storage,
+    )
+    result = retry_executor.execute(
+        "IMAGE_GENERATE",
+        {"slides": _five_slides()},
+        workflow_execution_id=execution.id,
+        node_execution_id=node.id,
+    )
+
+    assert isinstance(result, NodeExecutionResult)
+    assert len(retry_provider.calls) == 2
+    assets = session.scalars(
+        select(FileAsset)
+        .where(FileAsset.created_by_node_execution_id == node.id)
+        .order_by(FileAsset.slide_no)
+    ).all()
+    assert [asset.slide_no for asset in assets] == [1, 2, 3, 4, 5]
+    assert all(storage.files[asset.storage_key] == VALID_PNG for asset in assets)
+    assert len(result.output_data["image_generation_signatures"]) == 5
+
+
+def test_image_generate_does_not_reuse_slide_when_prompt_changes(session: Session) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=0,
+        input_data={},
+        status=NodeExecutionStatus.RUNNING,
+    )
+    session.add(node)
+    session.flush()
+    provider = FakeImageProvider()
+    executor = V3NodeExecutor(
+        session=session,
+        image_provider=provider,
+        image_model_name="test-image-model",
+        storage=FakeStorage(),
+    )
+    executor.execute(
+        "IMAGE_GENERATE",
+        {"slides": _five_slides()},
+        workflow_execution_id=execution.id,
+        node_execution_id=node.id,
+    )
+
+    changed_slides = _five_slides()
+    changed_slides[1] = {"slide_no": 2, "text": "Changed supporting copy"}
+    executor.execute(
+        "IMAGE_GENERATE",
+        {"slides": changed_slides},
+        workflow_execution_id=execution.id,
+        node_execution_id=node.id,
+    )
+
+    assert len(provider.calls) == 6
+    assert "Changed supporting copy" in provider.calls[-1][0]
 
 
 def test_image_check_reads_generated_assets_and_persists_structured_result(session: Session) -> None:

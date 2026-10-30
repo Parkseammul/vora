@@ -24,6 +24,7 @@ def test_openai_image_provider_edits_source_image_and_decodes_png(
     )
     openai_class = Mock(return_value=client)
     monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=openai_class))
+    monkeypatch.delenv("OPENAI_MAX_RETRIES", raising=False)
     source = tmp_path / "source.png"
     source.write_bytes(b"reference")
 
@@ -37,6 +38,32 @@ def test_openai_image_provider_edits_source_image_and_decodes_png(
     assert client.images.edit.call_args.kwargs["model"] == "gpt-image-2.5-sunburst"
     assert client.images.edit.call_args.kwargs["prompt"] == "Make a slide image"
     assert client.images.edit.call_args.kwargs["output_format"] == "png"
+
+
+def test_openai_image_provider_can_disable_sdk_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    openai_class = Mock()
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=openai_class))
+    monkeypatch.setenv("OPENAI_MAX_RETRIES", "0")
+
+    OpenAIImageProvider("test-key", "gpt-image-2.5-sunburst")
+
+    openai_class.assert_called_once_with(api_key="test-key", max_retries=0)
+
+
+@pytest.mark.parametrize("value", ["-1", "not-an-integer"])
+def test_openai_image_provider_rejects_invalid_sdk_retry_setting(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    openai_class = Mock()
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=openai_class))
+    monkeypatch.setenv("OPENAI_MAX_RETRIES", value)
+
+    with pytest.raises(ValueError, match="OPENAI_MAX_RETRIES"):
+        OpenAIImageProvider("test-key", "gpt-image-2.5-sunburst")
+
+    openai_class.assert_not_called()
 
 
 def test_openai_image_provider_rejects_empty_api_key() -> None:
