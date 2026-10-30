@@ -1,13 +1,16 @@
+import base64
+import json
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from secrets import token_urlsafe
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlencode, urlsplit
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
@@ -21,7 +24,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr, field_validator, model_validator
 
 # SQL 문자열을 안전하게 실행하기 위한 SQLAlchemy 함수
-from sqlalchemy import func, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -147,17 +150,67 @@ class ApprovalRequest(BaseModel):
     decision: ApprovalDecision = ApprovalDecision.APPROVED
     revision_target: Literal["PLAN", "TEXT", "IMAGE"] | None = None
     revision_request: str | None = None
+    # target/feedback/slide_numbers are the structured V3 revision contract.
+    # The legacy revision_target/revision_request fields remain accepted.
+    target: Literal["PLAN", "TEXT", "IMAGE"] | None = None
+    slide_numbers: list[int] | None = None
+    feedback: str | None = None
 
     @model_validator(mode="after")
     def rejected_revision_must_be_complete(self) -> "ApprovalRequest":
+        target = self.revision_target or self.target
+        feedback = self.feedback or self.revision_request
         if self.decision is ApprovalDecision.REJECTED and (
-            self.revision_target is None
-            or self.revision_request is None
-            or not self.revision_request.strip()
+            target is None or feedback is None or not feedback.strip()
         ):
             raise ValueError(
                 "REJECTED requires revision_target and a non-blank revision_request"
             )
+        if self.slide_numbers is not None:
+            if target != "IMAGE":
+                raise ValueError("slide_numbers is only supported for IMAGE revisions")
+            normalized = sorted(set(self.slide_numbers))
+            if normalized != self.slide_numbers or not normalized or any(
+                slide_no not in range(1, 6) for slide_no in normalized
+            ):
+                raise ValueError("slide_numbers must contain unique values from 1 through 5")
+        return self
+
+
+class WorkflowListItem(BaseModel):
+    workflow_execution_id: int
+    workflow_version: int
+    status: str
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+    thumbnail_url: str | None = None
+
+
+class WorkflowListResponse(BaseModel):
+    items: list[WorkflowListItem]
+    next_cursor: str | None = None
+
+
+class CompletedRevisionRequest(BaseModel):
+    target: Literal["PLAN", "TEXT", "IMAGE"]
+    slide_numbers: list[int] | None = None
+    feedback: str
+
+    @model_validator(mode="after")
+    def validate_revision(self) -> "CompletedRevisionRequest":
+        if not self.feedback.strip():
+            raise ValueError("feedback must not be blank")
+        if self.slide_numbers is not None:
+            if self.target != "IMAGE":
+                raise ValueError("slide_numbers is only supported for IMAGE revisions")
+            if (
+                not self.slide_numbers
+                or sorted(set(self.slide_numbers)) != self.slide_numbers
+                or any(slide_no not in range(1, 6) for slide_no in self.slide_numbers)
+            ):
+                raise ValueError("slide_numbers must contain unique values from 1 through 5")
         return self
 
 
@@ -317,6 +370,7 @@ def get_content_plan_chat_model() -> ChatOpenAI:
     return ChatOpenAI(
         model=settings.content_planning_model,
         api_key=SecretStr(settings.openai_api_key) if settings.openai_api_key else None,
+        **_chat_model_settings(),
     )
 
 
@@ -325,6 +379,7 @@ def get_text_generate_chat_model() -> ChatOpenAI:
     return ChatOpenAI(
         model=settings.script_generation_model,
         api_key=SecretStr(settings.openai_api_key) if settings.openai_api_key else None,
+        **_chat_model_settings(),
     )
 
 
@@ -333,6 +388,7 @@ def get_text_check_chat_model() -> ChatOpenAI:
     return ChatOpenAI(
         model=settings.script_generation_model,
         api_key=SecretStr(settings.openai_api_key) if settings.openai_api_key else None,
+        **_chat_model_settings(),
     )
 
 
@@ -341,7 +397,22 @@ def get_image_check_chat_model() -> ChatOpenAI:
     return ChatOpenAI(
         model=settings.script_generation_model,
         api_key=SecretStr(settings.openai_api_key) if settings.openai_api_key else None,
+        **_chat_model_settings(),
     )
+
+
+def _chat_model_settings() -> dict[str, Any]:
+    """Apply the shared retry override without changing the default deployment behavior."""
+    value = os.environ.get("OPENAI_MAX_RETRIES")
+    if value is None:
+        return {}
+    try:
+        max_retries = int(value)
+    except ValueError as exc:
+        raise ValueError("OPENAI_MAX_RETRIES must be a non-negative integer") from exc
+    if max_retries < 0:
+        raise ValueError("OPENAI_MAX_RETRIES must be a non-negative integer")
+    return {"max_retries": max_retries}
 
 
 def get_workflow_engine(
@@ -558,6 +629,63 @@ def _v3_safe_output(node: NodeExecution | None) -> dict[str, object] | None:
     return allowed
 
 
+def _v3_revision_assets(
+    session: Session,
+    execution: WorkflowExecution,
+    image_node: NodeExecution,
+) -> dict[int, FileAsset] | None:
+    output = image_node.output_data
+    asset_ids = output.get("asset_ids") if isinstance(output, dict) else None
+    if (
+        image_node.status is not NodeExecutionStatus.SUCCEEDED
+        or not isinstance(asset_ids, list)
+        or len(asset_ids) != 5
+        or len(set(asset_ids)) != 5
+        or not all(isinstance(asset_id, int) for asset_id in asset_ids)
+    ):
+        return None
+
+    assets = list(
+        session.scalars(
+            select(FileAsset).where(
+                FileAsset.workflow_execution_id == execution.id,
+                FileAsset.asset_type == AssetType.IMAGE,
+                FileAsset.slide_no.in_([1, 2, 3, 4, 5]),
+                FileAsset.id.in_(asset_ids),
+            )
+        )
+    )
+    by_slide = {
+        asset.slide_no: asset
+        for asset in assets
+        if asset.slide_no is not None
+    }
+    creator_ids = {
+        creator_id
+        for creator_id in (asset.created_by_node_execution_id for asset in assets)
+        if creator_id is not None
+    }
+    successful_image_node_ids = set(
+        session.scalars(
+            select(NodeExecution.id).where(
+                NodeExecution.id.in_(creator_ids),
+                NodeExecution.workflow_execution_id == execution.id,
+                NodeExecution.node_type == "IMAGE_GENERATE",
+                NodeExecution.status == NodeExecutionStatus.SUCCEEDED,
+            )
+        )
+    )
+    if (
+        set(by_slide) != {1, 2, 3, 4, 5}
+        or any(
+            asset.created_by_node_execution_id not in successful_image_node_ids
+            for asset in by_slide.values()
+        )
+    ):
+        return None
+    return by_slide
+
+
 def _v3_images_for_revision(
     session: Session,
     execution: WorkflowExecution,
@@ -566,32 +694,20 @@ def _v3_images_for_revision(
     image_node = _v3_node_for_revision(
         session, execution.id, "IMAGE_GENERATE", revision_no
     )
-    if image_node is None or image_node.status is not NodeExecutionStatus.SUCCEEDED:
+    if image_node is None:
         return []
-    output = image_node.output_data
-    asset_ids = output.get("asset_ids") if isinstance(output, dict) else None
-    if not isinstance(asset_ids, list) or not all(isinstance(asset_id, int) for asset_id in asset_ids):
-        return []
-    assets = list(
-        session.scalars(
-            select(FileAsset).where(
-                FileAsset.workflow_execution_id == execution.id,
-                FileAsset.created_by_node_execution_id == image_node.id,
-                FileAsset.asset_type == AssetType.IMAGE,
-                FileAsset.slide_no.in_([1, 2, 3, 4, 5]),
-                FileAsset.id.in_(asset_ids),
-            )
-        )
-    )
-    by_slide = {asset.slide_no: asset for asset in assets}
-    if set(by_slide) != {1, 2, 3, 4, 5}:
+    by_slide = _v3_revision_assets(session, execution, image_node)
+    if by_slide is None:
         return []
     return [
         {
             "slide_no": slide_no,
             "file_name": by_slide[slide_no].file_name,
             "mime_type": by_slide[slide_no].mime_type,
-            "image_url": f"/workflow-executions/{execution.id}/slides/{slide_no}/image",
+            "image_url": (
+                f"/workflow-executions/{execution.id}/slides/{slide_no}/image"
+                f"?revision_no={revision_no}"
+            ),
         }
         for slide_no in range(1, 6)
     ]
@@ -599,6 +715,23 @@ def _v3_images_for_revision(
 
 def _v3_workflow_response(session: Session, execution: WorkflowExecution) -> dict[str, object]:
     revision_no = _current_v3_revision(session, execution.id)
+    current_image_node = _v3_node_for_revision(
+        session, execution.id, "IMAGE_GENERATE", revision_no
+    )
+    editing_slides = (
+        current_image_node.input_data.get("image_slide_numbers")
+        if current_image_node is not None and isinstance(current_image_node.input_data, dict)
+        and execution.status in {WorkflowExecutionStatus.RUNNING, WorkflowExecutionStatus.FAILED}
+        else None
+    )
+    prior_image_node = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "IMAGE_GENERATE",
+            NodeExecution.revision_no < revision_no,
+            NodeExecution.status == NodeExecutionStatus.SUCCEEDED,
+        ).order_by(NodeExecution.revision_no.desc()).limit(1)
+    )
     nodes: dict[str, dict[str, object] | None] = {}
     for node_type in V3_NODE_KEYS:
         node = _v3_node_for_revision(session, execution.id, node_type, revision_no)
@@ -623,6 +756,7 @@ def _v3_workflow_response(session: Session, execution: WorkflowExecution) -> dic
         "status": execution.status.value,
         "current_node_type": execution.current_node_type,
         "current_revision": revision_no,
+        "editing_slides": editing_slides if isinstance(editing_slides, list) else None,
         "nodes": nodes,
         "human_approval": {
             "waiting": approval_waiting,
@@ -630,6 +764,10 @@ def _v3_workflow_response(session: Session, execution: WorkflowExecution) -> dic
             "status": approval["status"] if approval else None,
         },
         "images": _v3_images_for_revision(session, execution, revision_no),
+        "previous_images": (
+            _v3_images_for_revision(session, execution, prior_image_node.revision_no)
+            if prior_image_node is not None else []
+        ),
     }
 
 
@@ -646,8 +784,9 @@ def _detail_response(session: Session, execution: WorkflowExecution, node_key: s
 
 def _publication_response(session: Session, publication: SocialPublication) -> dict[str, object]:
     connection = session.get(SocialAccountConnection, publication.social_account_connection_id)
+    node = session.get(NodeExecution, publication.node_execution_id)
     attempts = list(session.scalars(select(SocialPublicationAttempt).where(SocialPublicationAttempt.social_publication_id == publication.id).order_by(SocialPublicationAttempt.attempt_no)))
-    return {"id": publication.id, "platform": connection.platform.value if connection else "UNKNOWN", "status": publication.status.value, "external_post_url": publication.external_post_url, "attempt": {"current": attempts[-1].attempt_no if attempts else 0, "max": 3}}
+    return {"id": publication.id, "platform": connection.platform.value if connection else "UNKNOWN", "status": publication.status.value, "revision_no": node.revision_no if node else None, "external_post_url": publication.external_post_url, "attempt": {"current": attempts[-1].attempt_no if attempts else 0, "max": 3}}
 
 
 def _attempt_trace(session: Session, attempt: NodeExecutionAttempt) -> dict[str, object]:
@@ -774,6 +913,65 @@ def _dev_user_or_404(session: Session) -> User:
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+@app.get("/workflow-executions", response_model=WorkflowListResponse)
+def list_workflow_executions(
+    limit: int = Query(5, ge=1, le=50),
+    cursor: str | None = Query(None),
+    session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
+):
+    statement = (
+        select(WorkflowExecution)
+        .where(WorkflowExecution.user_id == current_user.id)
+        .order_by(WorkflowExecution.updated_at.desc(), WorkflowExecution.id.desc())
+        .limit(limit + 1)
+    )
+    if cursor:
+        updated_at, execution_id = _decode_workflow_list_cursor(cursor)
+        statement = statement.where(
+            or_(
+                WorkflowExecution.updated_at < updated_at,
+                and_(
+                    WorkflowExecution.updated_at == updated_at,
+                    WorkflowExecution.id < execution_id,
+                ),
+            )
+        )
+    executions = list(session.scalars(statement))
+    has_next = len(executions) > limit
+    executions = executions[:limit]
+    if not executions:
+        return WorkflowListResponse(items=[], next_cursor=None)
+
+    execution_ids = [execution.id for execution in executions]
+    snapshots = list(
+        session.scalars(
+            select(ExecutionInputSnapshot).where(
+                ExecutionInputSnapshot.workflow_execution_id.in_(execution_ids)
+            )
+        )
+    )
+    snapshots_by_execution = {snapshot.workflow_execution_id: snapshot for snapshot in snapshots}
+    thumbnails = _workflow_list_thumbnail_urls(session, executions)
+    items = [
+        WorkflowListItem(
+            workflow_execution_id=execution.id,
+            workflow_version=execution.workflow_version,
+            status=execution.status.value,
+            title=_workflow_list_title(snapshots_by_execution.get(execution.id), execution),
+            created_at=execution.created_at,
+            updated_at=execution.updated_at,
+            completed_at=execution.completed_at,
+            thumbnail_url=thumbnails.get(execution.id),
+        )
+        for execution in executions
+    ]
+    return WorkflowListResponse(
+        items=items,
+        next_cursor=_encode_workflow_list_cursor(executions[-1]) if has_next else None,
+    )
 
 
 @app.get("/workflow-executions/{workflow_execution_id}")
@@ -1113,29 +1311,23 @@ def _video_file_or_404(asset: FileAsset) -> Path:
 
 
 def _v3_image_asset_or_404(
-    session: Session, execution: WorkflowExecution, slide_no: int
+    session: Session, execution: WorkflowExecution, slide_no: int,
+    revision_no: int | None = None,
 ) -> FileAsset:
     if execution.workflow_version != 3:
         raise HTTPException(status_code=404, detail="V3 slide image was not found")
     if slide_no not in range(1, 6):
         raise HTTPException(status_code=422, detail="slide_no must be between 1 and 5")
-    revision_no = _current_v3_revision(session, execution.id)
+    current_revision = _current_v3_revision(session, execution.id)
+    if revision_no is None:
+        revision_no = current_revision
+    if revision_no < 0 or revision_no > current_revision:
+        raise HTTPException(status_code=404, detail="V3 slide image was not found")
     image_node = _v3_node_for_revision(session, execution.id, "IMAGE_GENERATE", revision_no)
     if image_node is None or image_node.status is not NodeExecutionStatus.SUCCEEDED:
         raise HTTPException(status_code=404, detail="V3 slide image was not found")
-    output = image_node.output_data
-    asset_ids = output.get("asset_ids") if isinstance(output, dict) else None
-    if not isinstance(asset_ids, list) or not all(isinstance(asset_id, int) for asset_id in asset_ids):
-        raise HTTPException(status_code=404, detail="V3 slide image was not found")
-    asset = session.scalar(
-        select(FileAsset).where(
-            FileAsset.id.in_(asset_ids),
-            FileAsset.workflow_execution_id == execution.id,
-            FileAsset.created_by_node_execution_id == image_node.id,
-            FileAsset.asset_type == AssetType.IMAGE,
-            FileAsset.slide_no == slide_no,
-        )
-    )
+    assets = _v3_revision_assets(session, execution, image_node)
+    asset = assets.get(slide_no) if assets is not None else None
     if asset is None or asset.mime_type not in {"image/png", "image/jpeg"}:
         raise HTTPException(status_code=404, detail="V3 slide image was not found")
     return asset
@@ -1155,6 +1347,7 @@ def stream_generated_video(
 def get_v3_slide_image(
     workflow_execution_id: int,
     slide_no: int,
+    revision_no: int | None = None,
     session: Session = Depends(get_session),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
 ):
@@ -1163,7 +1356,7 @@ def get_v3_slide_image(
         workflow_execution_id,
         _owner_id_for_route(session, workflow_execution_id, current_user),
     )
-    asset = _v3_image_asset_or_404(session, execution, slide_no)
+    asset = _v3_image_asset_or_404(session, execution, slide_no, revision_no)
     headers = {"Cache-Control": "private, no-store"}
     storage = get_storage_provider()
     if settings.storage_provider.lower() == "s3":
@@ -1207,7 +1400,7 @@ async def create_workflow_execution(
         content_type=source_image.content_type or "",
         content=await source_image.read(),
     )
-    service = WorkflowExecutionService(session)
+    service = WorkflowExecutionService(session, settings.uploads_root)
     try:
         execution = service.create_pending(
             request_text=request_text,
@@ -1280,6 +1473,133 @@ def create_revision(
     }
 
 
+def _encode_workflow_list_cursor(execution: WorkflowExecution) -> str:
+    payload = json.dumps(
+        {"updated_at": execution.updated_at.isoformat(), "id": execution.id},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_workflow_list_cursor(cursor: str) -> tuple[datetime, int]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        updated_at = datetime.fromisoformat(payload["updated_at"])
+        execution_id = int(payload["id"])
+        if updated_at.tzinfo is None or execution_id <= 0:
+            raise ValueError
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, UnicodeError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid workflow list cursor") from exc
+    return updated_at, execution_id
+
+
+def _workflow_list_title(snapshot: ExecutionInputSnapshot | None, execution: WorkflowExecution) -> str:
+    if snapshot is not None and snapshot.request_text.strip():
+        return snapshot.request_text.strip()[:120]
+    return "카드뉴스 프로젝트" if execution.workflow_version == 3 else "콘텐츠 프로젝트"
+
+
+def _workflow_list_thumbnail_urls(
+    session: Session, executions: list[WorkflowExecution]
+) -> dict[int, str]:
+    execution_ids = [execution.id for execution in executions]
+    if not execution_ids:
+        return {}
+    image_nodes = list(
+        session.scalars(
+            select(NodeExecution)
+            .where(
+                NodeExecution.workflow_execution_id.in_(execution_ids),
+                NodeExecution.node_type == "IMAGE_GENERATE",
+                NodeExecution.status == NodeExecutionStatus.SUCCEEDED,
+            )
+            .order_by(NodeExecution.revision_no.desc(), NodeExecution.id.desc())
+        )
+    )
+    latest_nodes: dict[int, NodeExecution] = {}
+    asset_ids: set[int] = set()
+    for node in image_nodes:
+        if node.workflow_execution_id in latest_nodes:
+            continue
+        output = node.output_data if isinstance(node.output_data, dict) else {}
+        ids = output.get("asset_ids")
+        if not isinstance(ids, list) or not ids or not all(isinstance(asset_id, int) for asset_id in ids):
+            continue
+        latest_nodes[node.workflow_execution_id] = node
+        asset_ids.update(ids)
+    if not asset_ids:
+        return {}
+    assets = list(
+        session.scalars(
+            select(FileAsset).where(
+                FileAsset.workflow_execution_id.in_(execution_ids),
+                FileAsset.asset_type == AssetType.IMAGE,
+                FileAsset.id.in_(asset_ids),
+                FileAsset.slide_no == 1,
+            )
+        )
+    )
+    by_id = {asset.id: asset for asset in assets}
+    result: dict[int, str] = {}
+    for execution_id, node in latest_nodes.items():
+        output = node.output_data if isinstance(node.output_data, dict) else {}
+        ids = output.get("asset_ids")
+        asset = by_id.get(ids[0]) if isinstance(ids, list) and ids else None
+        if asset is not None and asset.workflow_execution_id == execution_id:
+            result[execution_id] = f"/workflow-executions/{execution_id}/slides/1/image?revision_no={node.revision_no}"
+    return result
+
+
+@app.post("/workflow-executions/{workflow_execution_id}/revisions/from-completed")
+def revise_completed_v3_workflow(
+    workflow_execution_id: int,
+    request: CompletedRevisionRequest,
+    session: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
+):
+    execution = _get_owned_execution_or_404(
+        session, workflow_execution_id,
+        _owner_id_for_route(session, workflow_execution_id, current_user),
+    )
+    target_node_key = {
+        "PLAN": "CONTENT_PLAN",
+        "TEXT": "TEXT_GENERATE",
+        "IMAGE": "IMAGE_GENERATE",
+    }[request.target]
+    try:
+        get_workflow_engine(
+            session, get_ai_workflow_services(session), execution.workflow_version
+        ).prepare_completed_revision(
+            execution.id,
+            target_node_key,
+            request.feedback.strip(),
+            image_slide_numbers=request.slide_numbers,
+        )
+        intent = get_generation_dispatcher(session).create(
+            execution.id, ACTION_REVISION, target_node_key, request.feedback.strip()
+        )
+        session.commit()
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="Revision was already started") from exc
+    except Exception:
+        session.rollback()
+        raise
+    get_generation_dispatcher(session).enqueue(intent.id)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "workflow_execution_id": execution.id,
+            "status": execution.status.value,
+            "dispatch_intent_id": intent.id,
+        },
+    )
+
+
 @app.post("/workflow-executions/{workflow_execution_id}/approvals")
 def approve_workflow_node(
     workflow_execution_id: int,
@@ -1319,11 +1639,13 @@ def approve_workflow_node(
     session.add(approval)
     if execution.workflow_version == 3:
         if request.decision is ApprovalDecision.REJECTED:
+            target = request.revision_target or request.target
             target_node_key = {
                 "PLAN": "CONTENT_PLAN",
                 "TEXT": "TEXT_GENERATE",
                 "IMAGE": "IMAGE_GENERATE",
-            }[request.revision_target or ""]
+            }[target or ""]
+            feedback = request.feedback or request.revision_request or ""
             # Engine owns revision/node/attempt state; this API transaction adds
             # the user decision and durable dispatch intent before any worker runs.
             session.flush()
@@ -1332,14 +1654,12 @@ def approve_workflow_node(
             ).prepare_rejected_revision(
                 execution.id,
                 target_node_key,
-                request.revision_request or "",
+                feedback,
                 user_approval_id=approval.id,
+                image_slide_numbers=request.slide_numbers,
             )
             intent = get_generation_dispatcher(session).create(
-                execution.id,
-                ACTION_REVISION,
-                target_node_key,
-                request.revision_request or "",
+                execution.id, ACTION_REVISION, target_node_key, feedback
             )
         else:
             intent = get_generation_dispatcher(session).create(execution.id, ACTION_RESUME)

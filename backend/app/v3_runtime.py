@@ -349,6 +349,69 @@ class V3NodeExecutor:
         source_asset = session.get(FileAsset, snapshot.source_asset_id)
         if source_asset is None:
             raise NodeExecutorConfigurationError("IMAGE_GENERATE source asset does not exist")
+        requested_slides = input_data.get("image_slide_numbers")
+        if requested_slides is not None:
+            if not isinstance(requested_slides, list) or sorted(set(requested_slides)) != requested_slides or any(
+                not isinstance(slide_no, int) or slide_no not in range(1, 6)
+                for slide_no in requested_slides
+            ):
+                raise ValueError("image_slide_numbers must contain unique values from 1 through 5")
+            if not requested_slides:
+                raise ValueError("image_slide_numbers must not be empty")
+            selected_slides = set(requested_slides)
+        else:
+            selected_slides = set(range(1, 6))
+
+        prior_assets: dict[int, FileAsset] = {}
+        prior_signatures: dict[str, str] = {}
+        if requested_slides is not None and selected_slides != set(range(1, 6)):
+            current_node = session.get(NodeExecution, node_execution_id)
+            prior_node = session.scalar(
+                select(NodeExecution)
+                .where(
+                    NodeExecution.workflow_execution_id == workflow_execution_id,
+                    NodeExecution.node_type == "IMAGE_GENERATE",
+                    NodeExecution.revision_no < (current_node.revision_no if current_node else 0),
+                    NodeExecution.status == NodeExecutionStatus.SUCCEEDED,
+                )
+                .order_by(NodeExecution.revision_no.desc(), NodeExecution.id.desc())
+                .limit(1)
+            )
+            if prior_node is None or not isinstance(prior_node.output_data, dict):
+                raise ValueError("Selective IMAGE revision requires a successful prior IMAGE_GENERATE")
+            prior_asset_ids = prior_node.output_data.get("asset_ids")
+            prior_signature_data = prior_node.output_data.get("image_generation_signatures", {})
+            if (
+                not isinstance(prior_asset_ids, list)
+                or len(prior_asset_ids) != 5
+                or not isinstance(prior_signature_data, dict)
+            ):
+                raise ValueError("Prior IMAGE_GENERATE output is incomplete for selective reuse")
+            prior_rows = list(session.scalars(select(FileAsset).where(FileAsset.id.in_(prior_asset_ids))))
+            prior_assets = {asset.slide_no: asset for asset in prior_rows if asset.slide_no is not None}
+            successful_creator_ids = set(
+                session.scalars(
+                    select(NodeExecution.id).where(
+                        NodeExecution.workflow_execution_id == workflow_execution_id,
+                        NodeExecution.node_type == "IMAGE_GENERATE",
+                        NodeExecution.status == NodeExecutionStatus.SUCCEEDED,
+                        NodeExecution.revision_no <= prior_node.revision_no,
+                    )
+                )
+            )
+            if set(prior_assets) != set(range(1, 6)) or any(
+                asset.workflow_execution_id != workflow_execution_id
+                or asset.created_by_node_execution_id not in successful_creator_ids
+                or asset.asset_type is not AssetType.IMAGE
+                for asset in prior_assets.values()
+            ):
+                raise ValueError("Prior IMAGE_GENERATE assets are invalid for selective reuse")
+            prior_signatures = {
+                str(slide_no): signature
+                for slide_no, signature in prior_signature_data.items()
+                if isinstance(signature, str)
+            }
+
         asset_ids: list[int] = []
         with tempfile.TemporaryDirectory(prefix="vora-image-") as temporary_directory:
             temporary_root = Path(temporary_directory)
@@ -362,9 +425,25 @@ class V3NodeExecutor:
                 previous_asset_ids = []
             if not isinstance(previous_signatures, dict):
                 previous_signatures = {}
+            previous_signatures = {**prior_signatures, **previous_signatures}
             for slide in slide_payload:
                 slide_no = slide["slide_no"]
                 prompt = f"Use the reference image as visual inspiration. Create an image for slide {slide_no}: {slide['text']}"
+                feedback = input_data.get("revision_request")
+                if slide_no in selected_slides and isinstance(feedback, str) and feedback.strip():
+                    prompt += f" Revision feedback for slide {slide_no}: {feedback.strip()}"
+
+                if slide_no not in selected_slides:
+                    prior_asset = prior_assets.get(slide_no)
+                    if prior_asset is None or not self._valid_stored_image(
+                        prior_asset, temporary_root / f"reused-{slide_no}.png"
+                    ):
+                        raise ValueError(
+                            f"Cannot reuse prior IMAGE_GENERATE asset for slide {slide_no}"
+                        )
+                    asset_ids.append(prior_asset.id)
+                    continue
+
                 signature = self._image_generation_signature(
                     prompt=prompt,
                     source_asset=source_asset,
@@ -634,15 +713,24 @@ class V3NodeExecutor:
         generated_ids = latest_image_node.output_data.get("asset_ids")
         if generated_ids != asset_ids:
             raise ValueError("PUBLICATION asset_ids do not match the latest generated images")
+        successful_image_node_ids = set(
+            self._session.scalars(
+                select(NodeExecution.id).where(
+                    NodeExecution.workflow_execution_id == workflow_execution_id,
+                    NodeExecution.node_type == "IMAGE_GENERATE",
+                    NodeExecution.status == NodeExecutionStatus.SUCCEEDED,
+                )
+            )
+        )
         assets = list(self._session.scalars(select(FileAsset).where(FileAsset.id.in_(asset_ids))))
         by_id = {asset.id: asset for asset in assets}
         if len(by_id) != 5 or any(
             asset.workflow_execution_id != workflow_execution_id
             or asset.asset_type is not AssetType.IMAGE
-            or asset.created_by_node_execution_id != latest_image_node.id
+            or asset.created_by_node_execution_id not in successful_image_node_ids
             for asset in by_id.values()
         ):
-            raise ValueError("PUBLICATION asset does not belong to the approved image generation")
+            raise ValueError("PUBLICATION asset does not belong to a successful image generation")
         ordered_assets = sorted(by_id.values(), key=lambda asset: asset.slide_no or 0)
         if [asset.slide_no for asset in ordered_assets] != [1, 2, 3, 4, 5]:
             raise ValueError("PUBLICATION images must have unique slide_no values 1 through 5")

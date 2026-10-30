@@ -265,11 +265,22 @@ class PublicationService:
     def _validated_assets(self, publication_node: NodeExecution, asset_ids: object, by_id: dict[int, FileAsset]) -> list[FileAsset]:
         if not isinstance(asset_ids, list) or len(asset_ids) != 5 or not all(isinstance(item, int) for item in asset_ids):
             raise ValueError("Publication assets are invalid")
-        image_node = self._session.scalar(select(NodeExecution).where(NodeExecution.workflow_execution_id == publication_node.workflow_execution_id, NodeExecution.node_type == "IMAGE_GENERATE", NodeExecution.status == NodeExecutionStatus.SUCCEEDED).order_by(NodeExecution.revision_no.desc(), NodeExecution.id.desc()))
+        image_node = self._session.scalar(select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == publication_node.workflow_execution_id,
+            NodeExecution.node_type == "IMAGE_GENERATE",
+            NodeExecution.revision_no == publication_node.revision_no,
+            NodeExecution.status == NodeExecutionStatus.SUCCEEDED,
+        ))
         if image_node is None or image_node.output_data is None or image_node.output_data.get("asset_ids") != asset_ids:
-            raise ValueError("Publication images do not match the latest IMAGE_GENERATE revision")
+            raise ValueError("Publication images do not match the approved IMAGE_GENERATE result")
+        successful_creators = set(self._session.scalars(select(NodeExecution.id).where(
+            NodeExecution.workflow_execution_id == publication_node.workflow_execution_id,
+            NodeExecution.node_type == "IMAGE_GENERATE",
+            NodeExecution.revision_no <= publication_node.revision_no,
+            NodeExecution.status == NodeExecutionStatus.SUCCEEDED,
+        )))
         ordered = sorted(by_id.values(), key=lambda asset: asset.slide_no or 0)
-        if len(ordered) != 5 or [asset.slide_no for asset in ordered] != [1, 2, 3, 4, 5] or any(asset.asset_type.value != "IMAGE" or asset.workflow_execution_id != publication_node.workflow_execution_id or asset.created_by_node_execution_id != image_node.id for asset in ordered):
+        if len(ordered) != 5 or [asset.slide_no for asset in ordered] != [1, 2, 3, 4, 5] or any(asset.asset_type.value != "IMAGE" or asset.workflow_execution_id != publication_node.workflow_execution_id or asset.created_by_node_execution_id not in successful_creators for asset in ordered):
             raise ValueError("Publication images are not the approved five slides")
         return ordered
 
