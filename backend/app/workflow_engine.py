@@ -1,4 +1,4 @@
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -163,6 +163,7 @@ class WorkflowEngine:
         revision_request: str,
         *,
         user_approval_id: int,
+        image_slide_numbers: Sequence[int] | None = None,
     ) -> WorkflowExecutionStatus:
         """Commit a user revision intent before executing its first external node."""
         try:
@@ -171,6 +172,7 @@ class WorkflowEngine:
                 target_node_key,
                 revision_request,
                 user_approval_id=user_approval_id,
+                image_slide_numbers=image_slide_numbers,
             )
             # Commit the rejection, revision intent, node, and attempt before external work.
             self._commit_state()
@@ -186,6 +188,7 @@ class WorkflowEngine:
         revision_request: str,
         *,
         user_approval_id: int,
+        image_slide_numbers: Sequence[int] | None = None,
     ) -> tuple[WorkflowExecution, WorkflowDefinition, NodeExecution, NodeExecutionAttempt]:
         """Prepare a revision without committing or executing an external provider.
 
@@ -200,6 +203,9 @@ class WorkflowEngine:
             raise ValueError("Only a WAITING_APPROVAL workflow execution can be revised")
         definition = self._definition_for(execution)
         definition.node(target_node_key)
+        image_slide_numbers = self._normalize_image_slide_numbers(
+            target_node_key, image_slide_numbers
+        )
         waiting_node = self._latest_waiting_node(execution.id)
         if waiting_node is None:
             raise ValueError("No node execution is waiting for approval")
@@ -214,13 +220,83 @@ class WorkflowEngine:
             or approval.decision is not ApprovalDecision.REJECTED
         ):
             raise ValueError("Rejected approval does not match the current approval node")
-        revision_input = self._revision_input(execution, definition, target_node_key, revision_request)
+        revision_input = self._revision_input(
+            execution, definition, target_node_key, revision_request, image_slide_numbers
+        )
+        return self._prepare_revision_state(
+            execution, definition, target_node_key, revision_request, revision_input, approval.id
+        )
+
+    def prepare_completed_revision(
+        self,
+        workflow_execution_id: int,
+        target_node_key: str,
+        feedback: str,
+        *,
+        image_slide_numbers: Sequence[int] | None = None,
+    ) -> tuple[WorkflowExecution, WorkflowDefinition, NodeExecution, NodeExecutionAttempt]:
+        """Start a user revision from an approved V3 result under a workflow lock."""
+        if not feedback.strip():
+            raise ValueError("feedback must not be blank")
+        execution = self._session.scalar(
+            select(WorkflowExecution)
+            .where(WorkflowExecution.id == workflow_execution_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if execution is None or execution.workflow_version != 3:
+            raise ValueError("Completed V3 workflow does not exist")
+        if execution.status is not WorkflowExecutionStatus.SUCCEEDED:
+            raise ValueError("Only a SUCCEEDED workflow can be edited again")
+        definition = self._definition_for(execution)
+        if target_node_key not in {"CONTENT_PLAN", "TEXT_GENERATE", "IMAGE_GENERATE"}:
+            raise ValueError("Invalid completed revision target")
+        image_slide_numbers = self._normalize_image_slide_numbers(
+            target_node_key, image_slide_numbers
+        )
+        publication = self._latest_node_execution(execution.id, "PUBLICATION")
+        approval_node = self._latest_node_execution(execution.id, "HUMAN_APPROVAL")
+        if (
+            publication is None
+            or publication.status is not NodeExecutionStatus.SUCCEEDED
+            or approval_node is None
+            or approval_node.status is not NodeExecutionStatus.SUCCEEDED
+            or publication.revision_no != approval_node.revision_no
+        ):
+            raise ValueError("A completed approved publication is required")
+        approval = self._session.scalar(
+            select(UserApproval).where(
+                UserApproval.workflow_execution_id == execution.id,
+                UserApproval.node_execution_id == approval_node.id,
+                UserApproval.decision == ApprovalDecision.APPROVED,
+            )
+        )
+        if approval is None:
+            raise ValueError("The completed result has no final approval")
+        revision_input = self._revision_input(
+            execution, definition, target_node_key, feedback, image_slide_numbers
+        )
+        # The final approved decision anchors this new user revision; the old
+        # approval and publication rows remain unchanged.
+        return self._prepare_revision_state(
+            execution, definition, target_node_key, feedback, revision_input, approval.id
+        )
+
+    def _prepare_revision_state(
+        self,
+        execution: WorkflowExecution,
+        definition: WorkflowDefinition,
+        target_node_key: str,
+        revision_request: str,
+        revision_input: dict[str, Any],
+        user_approval_id: int,
+    ) -> tuple[WorkflowExecution, WorkflowDefinition, NodeExecution, NodeExecutionAttempt]:
         revision_no = self._next_revision_no(execution.id)
         started_at = self._now()
         self._session.add(
             Revision(
                 workflow_execution_id=execution.id,
-                user_approval_id=approval.id,
+                user_approval_id=user_approval_id,
                 revision_no=revision_no,
                 start_node_type=target_node_key,
                 request_text=revision_request,
@@ -407,7 +483,13 @@ class WorkflowEngine:
 
     def retry_failed_execution(self, workflow_execution_id: int) -> WorkflowExecutionStatus:
         """Retries the latest failed node without creating a user revision version."""
-        execution = self._get_execution(workflow_execution_id)
+        execution = self._session.scalar(
+            select(WorkflowExecution)
+            .where(WorkflowExecution.id == workflow_execution_id)
+            .with_for_update()
+        )
+        if execution is None:
+            raise ValueError(f"Workflow execution does not exist: {workflow_execution_id}")
         if execution.status is not WorkflowExecutionStatus.FAILED:
             raise ValueError("Only a FAILED workflow execution can be retried")
 
@@ -418,6 +500,7 @@ class WorkflowEngine:
                 NodeExecution.status == NodeExecutionStatus.FAILED,
             )
             .order_by(NodeExecution.revision_no.desc(), NodeExecution.id.desc())
+            .with_for_update()
         )
         if node_execution is None:
             raise ValueError("No failed node execution is available for retry")
@@ -431,7 +514,6 @@ class WorkflowEngine:
         if latest_attempt_no is None:
             raise ValueError("Failed node execution has no attempt history")
         definition = self._definition_for(execution)
-        node_definition = definition.node(node_execution.node_type)
         started_at = self._now()
         node_execution.status = NodeExecutionStatus.RUNNING
         execution.current_node_type = node_execution.node_type
@@ -443,55 +525,17 @@ class WorkflowEngine:
             attempt_no=latest_attempt_no + 1,
             status=NodeExecutionAttemptStatus.RUNNING,
             started_at=started_at,
-            metadata_={"retry_kind": "USER_REQUESTED"},
+            metadata_={
+                "retry_kind": "USER_REQUESTED",
+                "execution_started_at": started_at.isoformat(),
+            },
         )
         self._session.add(attempt)
         self._commit_state()
 
         if node_execution.node_type == "video_generation" and self._video_task_dispatcher is not None:
             return self._enqueue_video_attempt(execution, node_execution, attempt)
-
-        try:
-            execution_result = self._executor.execute(
-                node_execution.node_type,
-                node_execution.input_data,
-                workflow_execution_id=execution.id,
-                node_execution_id=node_execution.id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            finished_at = self._now()
-            attempt.status = NodeExecutionAttemptStatus.FAILED
-            attempt.error_code = self._error_code(exc)
-            attempt.error_message = str(exc)
-            attempt.completed_at = finished_at
-            attempt.latency_ms = self._latency_ms(attempt.started_at, finished_at)
-            node_execution.status = NodeExecutionStatus.FAILED
-            node_execution.completed_at = finished_at
-            execution.status = WorkflowExecutionStatus.FAILED
-            execution.current_node_type = None
-            execution.completed_at = finished_at
-            self._commit_state()
-            return execution.status
-
-        finished_at = self._now()
-        attempt.status = NodeExecutionAttemptStatus.SUCCEEDED
-        attempt.completed_at = finished_at
-        attempt.latency_ms = self._latency_ms(attempt.started_at, finished_at)
-        if isinstance(execution_result, NodeExecutionResult):
-            node_execution.output_data = execution_result.output_data
-            attempt.metadata_ = {**attempt.metadata_, **execution_result.attempt_metadata}
-            self._record_attempt_execution_details(attempt, execution_result)
-        else:
-            node_execution.output_data = execution_result
-        if node_definition.requires_approval:
-            node_execution.status = NodeExecutionStatus.WAITING
-            execution.status = WorkflowExecutionStatus.WAITING_APPROVAL
-            execution.current_node_type = node_execution.node_type
-        else:
-            node_execution.status = NodeExecutionStatus.SUCCEEDED
-        node_execution.completed_at = finished_at
-        self._commit_state()
-        return execution.status
+        return self._execute_prepared_node(execution, definition, node_execution, attempt)
 
     def _run_nodes(
         self,
@@ -900,6 +944,7 @@ class WorkflowEngine:
         definition: WorkflowDefinition,
         target_node_key: str,
         revision_request: str,
+        image_slide_numbers: Sequence[int] | None = None,
     ) -> dict[str, Any]:
         node_keys = [node.key for node in definition.nodes]
         target_index = node_keys.index(target_node_key)
@@ -920,7 +965,22 @@ class WorkflowEngine:
         if previous_target is not None and previous_target.output_data is not None:
             revision_input["previous_output"] = previous_target.output_data
         revision_input["revision_request"] = revision_request
+        if image_slide_numbers is not None:
+            revision_input["image_slide_numbers"] = list(image_slide_numbers)
         return revision_input
+
+    @staticmethod
+    def _normalize_image_slide_numbers(
+        target_node_key: str, image_slide_numbers: Sequence[int] | None
+    ) -> list[int] | None:
+        if image_slide_numbers is None:
+            return None
+        if target_node_key != "IMAGE_GENERATE":
+            raise ValueError("slide_numbers is only supported for IMAGE revisions")
+        normalized = sorted(set(image_slide_numbers))
+        if not normalized or any(slide_no not in range(1, 6) for slide_no in normalized):
+            raise ValueError("slide_numbers must contain unique values from 1 through 5")
+        return normalized
 
     def _latest_success(
         self, workflow_execution_id: int, node_key: str

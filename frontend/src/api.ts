@@ -1,7 +1,13 @@
-import type { Detail, InstagramPublicationRequest, PlanOutput, PublicationDetail, ScriptOutput, SocialConnection, VideoDetail, WorkflowRead, V3WorkflowTrace } from "./types";
+import type { Detail, InstagramPublicationRequest, PlanOutput, PublicationDetail, RecentWorkflowResponse, ScriptOutput, SocialConnection, VideoDetail, WorkflowRead, V3WorkflowTrace } from "./types";
 
 const baseUrl = import.meta.env.VITE_API_BASE_URL ?? "";
 const apiUrl = (path: string) => baseUrl ? `${baseUrl.replace(/\/$/, "")}/${path.replace(/^\//, "")}` : path;
+export function getConfiguredRulesVersionId(): number | null {
+  const configuredRulesVersion = import.meta.env.VITE_VORA_RULES_VERSION_ID;
+  if (!configuredRulesVersion?.trim()) return null;
+  const value = Number(configuredRulesVersion);
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
 
 export class ApiError extends Error {
   constructor(public readonly status: number, message: string) { super(message); this.name = "ApiError"; }
@@ -50,30 +56,39 @@ async function requestBlob(path: string, signal?: AbortSignal): Promise<Blob> {
 }
 
 export const api = {
+  getRecentWorkflows: (limit = 5, cursor?: string, signal?: AbortSignal) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (cursor) params.set("cursor", cursor);
+    return request<RecentWorkflowResponse>(`/workflow-executions?${params.toString()}`, { signal });
+  },
   getWorkflow: (id: number, signal?: AbortSignal) => request<WorkflowRead>(`/workflow-executions/${id}`, { signal }),
   getWorkflowTrace: (id: number, signal?: AbortSignal) => request<V3WorkflowTrace>(`/workflow-executions/${id}/trace`, { signal }),
   getPlan: (id: number) => request<Detail<PlanOutput>>(`/workflow-executions/${id}/plan`),
   getScript: (id: number) => request<Detail<ScriptOutput>>(`/workflow-executions/${id}/script`),
   getVideo: (id: number) => request<VideoDetail>(`/workflow-executions/${id}/video`),
-  createWorkflow: (text: string, image: File | File[], marketingInfo = "Instagram 카드뉴스 제작", rulesVersionId = 1) => {
+  createWorkflow: (text: string, image: File | File[], marketingInfo = "Instagram 카드뉴스 제작", rulesVersionId: number) => {
+    if (!Number.isInteger(rulesVersionId) || rulesVersionId <= 0) throw new Error("A valid VORA rules version is required");
     const form = new FormData(); form.append("request_text", text); form.append("marketing_info", marketingInfo); form.append("rules_version_id", String(rulesVersionId));
     const source = Array.isArray(image) ? image[0] : image; if (source) form.append("source_image", source);
     return request<{ workflow_execution_id: number; workflow_version?: number }>("/workflow-executions", { method: "POST", body: form });
   },
-  approve: (id: number, nodeExecutionId: number, decision: "APPROVED" | "REJECTED" = "APPROVED", revisionTarget?: "PLAN" | "TEXT" | "IMAGE", revisionRequest?: string) => request<{ workflow_execution_id: number; status: string }>(`/workflow-executions/${id}/approvals`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ node_execution_id: nodeExecutionId, decision, ...(decision === "REJECTED" ? { revision_target: revisionTarget, revision_request: revisionRequest } : {}) }),
+  approve: (id: number, nodeExecutionId: number, decision: "APPROVED" | "REJECTED" = "APPROVED", revisionTarget?: "PLAN" | "TEXT" | "IMAGE", revisionRequest?: string, revisionOptions?: { slideNumbers?: number[]; feedback?: string }) => request<{ workflow_execution_id: number; status: string }>(`/workflow-executions/${id}/approvals`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ node_execution_id: nodeExecutionId, decision, ...(decision === "REJECTED" ? { revision_target: revisionTarget, target: revisionTarget, revision_request: revisionRequest, feedback: revisionOptions?.feedback ?? revisionRequest, ...(revisionOptions?.slideNumbers ? { slide_numbers: revisionOptions.slideNumbers } : {}) } : {}) }),
   }),
   revise: (id: number, currentNode: string, revisionRequest: string) => request<{ restart_node: string }>(`/workflow-executions/${id}/revisions`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ current_node: currentNode, revision_request: revisionRequest }),
   }),
+  reviseCompleted: (id: number, body: { target: "PLAN" | "TEXT" | "IMAGE"; slide_numbers?: number[]; feedback: string }) => request<{ workflow_execution_id: number; status: string }>(`/workflow-executions/${id}/revisions/from-completed`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  }),
   retry: (id: number) => request<void>(`/workflow-executions/${id}/retry`, { method: "POST" }),
   eventUrl: (id: number) => apiUrl(`/workflow-executions/${id}/video-generation/events`),
   subscribeSse: (path: string, onMessage: (data: string) => void, onError: (error: unknown) => void) => openEventStream(path, onMessage, onError),
-  getPublications: (id: number) => request<PublicationDetail>(`/workflow-executions/${id}/publications`),
+  getPublications: (id: number, signal?: AbortSignal) => request<PublicationDetail>(`/workflow-executions/${id}/publications`, { signal }),
   publish: (id: number, body: object) => request<PublicationDetail>(`/workflow-executions/${id}/publications`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   publishInstagram: (id: number, body: InstagramPublicationRequest) => request<PublicationDetail>(`/workflow-executions/${id}/publications`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   publicationEventUrl: (id: number) => apiUrl(`/workflow-executions/${id}/publication/events`),
-  connections: () => request<{ connections: SocialConnection[] }>("/social/connections"),
+  connections: (signal?: AbortSignal) => request<{ connections: SocialConnection[] }>("/social/connections", { signal }),
   authorize: (platform: string, returnTo = "/settings/social") => request<{ authorization_url: string }>(`/social/${platform}/authorize?return_to=${encodeURIComponent(returnTo)}`),
   assetUrl: apiUrl,
   getSlideImageBlob: requestBlob,

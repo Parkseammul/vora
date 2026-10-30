@@ -52,6 +52,24 @@ export interface V3Workflow {
   nodes: Record<V3NodeType, V3NodeExecution | null>;
   human_approval: V3ApprovalTarget;
   images: V3ImageAsset[];
+  previous_images?: V3ImageAsset[];
+  editing_slides?: number[] | null;
+}
+
+export interface RecentWorkflow {
+  workflow_execution_id: number;
+  workflow_version: number;
+  status: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  thumbnail_url: string | null;
+}
+
+export interface RecentWorkflowResponse {
+  items: RecentWorkflow[];
+  next_cursor: string | null;
 }
 
 export interface V3TraceNode {
@@ -99,7 +117,7 @@ export interface VideoDetail extends Detail<VideoOutput> {
 }
 
 export type SocialPlatform = "YOUTUBE" | "INSTAGRAM";
-export interface Publication { id: number; platform: SocialPlatform; status: "PENDING" | "PUBLISHING" | "PUBLISHED" | "SUCCESS" | "FAILED"; external_post_url: string | null; error_message: string | null; attempt: { current: number; max: number }; }
+export interface Publication { id: number; platform: SocialPlatform; status: "PENDING" | "PUBLISHING" | "PUBLISHED" | "SUCCESS" | "FAILED"; revision_no?: number | null; external_post_url: string | null; error_message: string | null; attempt: { current: number; max: number }; }
 export interface PublicationDetail { draft: { youtube_title: string; youtube_description: string; instagram_caption: string }; publications: Publication[]; }
 export interface SocialConnection { platform: SocialPlatform; account_name: string | null; status: string; }
 export interface InstagramPublicationRequest { platforms: ["INSTAGRAM"]; instagram_caption: string; force_republish: false; }

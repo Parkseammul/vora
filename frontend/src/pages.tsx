@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { api } from "./api";
+import { api, getConfiguredRulesVersionId } from "./api";
 import { ApprovalActions, usePolling } from "./components";
 import { useWorkflow } from "./WorkflowContext";
 import type { Detail, PlanOutput, PublicationDetail, ScriptOutput, VideoDetail } from "./types";
@@ -8,7 +8,7 @@ import type { Detail, PlanOutput, PublicationDetail, ScriptOutput, VideoDetail }
 export function RequestPage() {
   const navigate = useNavigate(); const [text, setText] = useState(""); const [images, setImages] = useState<File[]>([]); const [busy, setBusy] = useState(false); const [error, setError] = useState(""); const drag = useRef<number | null>(null);
   const addFiles = (files: FileList | null) => { if (!files) return; const next = [...images, ...Array.from(files)]; if (next.length > 6) { setError("이미지는 최대 6장까지 등록할 수 있습니다."); return; } if (next.some((file) => !["image/jpeg", "image/png"].includes(file.type))) { setError("JPG와 PNG 이미지만 등록할 수 있습니다."); return; } setError(""); setImages(next); };
-  const submit = async () => { if (!text.trim()) { setError("숏폼 요청을 입력해주세요."); return; } setBusy(true); setError(""); try { const result = await api.createWorkflow(text, images); navigate(`/workflows/${result.workflow_execution_id}/plan`); } catch (e) { setError(e instanceof Error ? e.message : "요청 생성에 실패했습니다."); } finally { setBusy(false); } };
+  const submit = async () => { if (!text.trim()) { setError("숏폼 요청을 입력해주세요."); return; } const rulesVersionId = getConfiguredRulesVersionId(); if (rulesVersionId === null) { setError("VORA 규칙 버전이 설정되지 않았습니다."); return; } setBusy(true); setError(""); try { const result = await api.createWorkflow(text, images, "Instagram 카드뉴스 제작", rulesVersionId); navigate(`/workflows/${result.workflow_execution_id}/plan`); } catch (e) { setError(e instanceof Error ? e.message : "요청 생성에 실패했습니다."); } finally { setBusy(false); } };
   return <main className="request-page"><section className="request-card"><p className="eyebrow">VORA</p><h1>무엇을 만들어볼까요?</h1><p>원하는 영상의 목적과 분위기를 자연어로 알려주세요.</p><textarea aria-label="숏폼 요청" value={text} onChange={(event) => setText(event.target.value)} placeholder="예: 이 제품 사진으로 20대 러너를 위한 활기찬 30초 광고 영상을 만들어줘" rows={7} />
     <label className="drop-zone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles(event.dataTransfer.files); }}><input type="file" accept="image/jpeg,image/png" multiple onChange={(event) => addFiles(event.target.files)} />이미지를 끌어놓거나 선택하세요 · 최대 6장</label>
     {images.length > 0 && <ol className="image-list">{images.map((image, index) => <li key={`${image.name}-${index}`} draggable onDragStart={() => { drag.current = index; }} onDragOver={(event) => event.preventDefault()} onDrop={() => { if (drag.current === null || drag.current === index) return; const next = [...images]; const [moved] = next.splice(drag.current, 1); next.splice(index, 0, moved); setImages(next); drag.current = null; }}><span>↕</span>{image.name}<button aria-label={`${image.name} 삭제`} onClick={() => setImages(images.filter((_, itemIndex) => itemIndex !== index))}>삭제</button></li>)}</ol>}

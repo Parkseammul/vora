@@ -8,8 +8,10 @@ import { PlanPage, ScriptPage, SocialSettingsPage, VideoPage } from "./pages";
 import "./styles.css";
 import "./studio.css";
 import "./creativeStudio.css";
+import "./v3Studio.css";
 import "./homePrototype.css";
 import "./auth.css";
+import "./recentProjects.css";
 import { AuthCallbackPage, AuthProvider, LoginPage, RequireAuth } from "./auth";
 
 createRoot(document.getElementById("root")!).render(<StrictMode><BrowserRouter><AuthProvider><Routes>

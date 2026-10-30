@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api } from "./api";
+import { api, configureAccessTokenProvider, getConfiguredRulesVersionId } from "./api";
 
 describe("Instagram publication API", () => {
   afterEach(() => { configureAccessTokenProvider(undefined); vi.unstubAllGlobals(); });
@@ -18,8 +18,6 @@ describe("Instagram publication API", () => {
     }));
   });
 });
-
-import { configureAccessTokenProvider } from "./api";
 
 describe("frontend authentication transport", () => {
   it("adds the access token to API and image blob requests", async () => {
@@ -67,5 +65,39 @@ describe("frontend authentication transport", () => {
     stream.close();
     expect((fetchStub.mock.calls[0][1] as RequestInit).signal).toBeInstanceOf(AbortSignal);
     expect(((fetchStub.mock.calls[0][1] as RequestInit).signal as AbortSignal).aborted).toBe(true);
+  });
+});
+
+describe("completed card revision API", () => {
+  afterEach(() => { configureAccessTokenProvider(undefined); vi.unstubAllGlobals(); });
+
+  it("uses the authenticated workflow route and selected slide payload", async () => {
+    configureAccessTokenProvider(() => "test-access-token");
+    const fetchStub = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ workflow_execution_id: 42, status: "RUNNING" }) });
+    vi.stubGlobal("fetch", fetchStub);
+    await api.reviseCompleted(42, { target: "IMAGE", slide_numbers: [4], feedback: "Fix slide four" });
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expect(fetchStub).toHaveBeenCalledWith(
+      "/workflow-executions/42/revisions/from-completed",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ target: "IMAGE", slide_numbers: [4], feedback: "Fix slide four" }),
+      }),
+    );
+    const options = fetchStub.mock.calls[0][1] as RequestInit;
+    expect((options.headers as Headers).get("Authorization")).toBe("Bearer test-access-token");
+  });
+});
+
+describe("workflow rules version configuration", () => {
+  it("does not create a workflow without a valid rules version", async () => {
+    const fetchStub = vi.fn();
+    vi.stubGlobal("fetch", fetchStub);
+
+    expect(getConfiguredRulesVersionId()).toBeNull();
+    expect(() => api.createWorkflow("topic", new File(["image"], "home.png", { type: "image/png" }), "Instagram 카드뉴스 제작", 0)).toThrow(
+      "A valid VORA rules version is required",
+    );
+    expect(fetchStub).not.toHaveBeenCalled();
   });
 });

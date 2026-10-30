@@ -38,7 +38,10 @@ from app.models import (
     PromptVersion,
     Revision,
     RulesVersion,
+    SocialAccountConnection,
+    SocialPlatform,
     SocialPublication,
+    SocialPublicationStatus,
     User,
     UserApproval,
     WorkflowDispatchIntent,
@@ -46,6 +49,7 @@ from app.models import (
     WorkflowExecutionStatus,
 )
 from app.node_executors import NodeExecutionResult
+from app.publication import PublicationService
 from app.v3_runtime import (
     ContentPlanOutput,
     ImageCheckOutput,
@@ -56,9 +60,15 @@ from app.v3_runtime import (
 from app.workflow_definitions import workflow_registry
 from app.workflow_engine import WorkflowEngine
 
+VALID_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0dIDAT\x08\xd7c\xf8"
+    b"\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99\x1d\x1d\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
 
 class FakeImageProvider:
-    def __init__(self, image: bytes = b"generated-image") -> None:
+    def __init__(self, image: bytes = VALID_PNG) -> None:
         self.image = image
         self.calls: list[tuple[str, Path]] = []
 
@@ -67,10 +77,32 @@ class FakeImageProvider:
         return self.image
 
 
+class ConfiguredFakeImageProvider(FakeImageProvider):
+    def __init__(self, settings: dict[str, str | int]) -> None:
+        super().__init__()
+        self._settings = settings
+
+    @property
+    def generation_settings(self) -> dict[str, str | int]:
+        return self._settings
+
+
 class FailingImageProvider:
     def generate(self, *, prompt: str, source_image: Path) -> bytes:
         del prompt, source_image
         raise RuntimeError("image provider unavailable")
+
+
+class FailOnCallImageProvider(FakeImageProvider):
+    def __init__(self, fail_on_call: int) -> None:
+        super().__init__()
+        self.fail_on_call = fail_on_call
+
+    def generate(self, *, prompt: str, source_image: Path) -> bytes:
+        if len(self.calls) + 1 == self.fail_on_call:
+            self.calls.append((prompt, source_image))
+            raise RuntimeError("image provider failed on configured slide")
+        return super().generate(prompt=prompt, source_image=source_image)
 
 
 class FakeStorage:
@@ -409,6 +441,153 @@ def _cleanup_independent_v3_fixture(workflow_execution_id: int, version: int) ->
         cleanup.execute(delete(PromptVersion).where(PromptVersion.version == version))
         cleanup.execute(delete(RulesVersion).where(RulesVersion.version == version))
         cleanup.commit()
+
+
+def test_v3_retry_continues_to_image_check_and_human_approval_without_new_revision(
+    session: Session,
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    image_provider = FakeImageProvider()
+    executor = V3NodeExecutor(
+        session=session,
+        fail_node="IMAGE_GENERATE",
+        content_plan_model=RunnableLambda(_content_plan_model),
+        text_generate_model=RunnableLambda(_text_generate_model),
+        text_check_model=RunnableLambda(_text_check_model),
+        image_check_model=RunnableLambda(_image_check_model),
+        image_provider=image_provider,
+        image_model_name="test-image-model",
+        storage=FakeStorage(),
+    )
+    workflow_engine = WorkflowEngine(session, workflow_registry, executor)
+
+    assert workflow_engine.start_execution(execution.id, {"request_text": "fake"}) is WorkflowExecutionStatus.FAILED
+    failed_image = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "IMAGE_GENERATE",
+        )
+    )
+    assert failed_image is not None
+    executor._fail_node = None
+
+    assert workflow_engine.retry_failed_execution(execution.id) is WorkflowExecutionStatus.WAITING_APPROVAL
+    nodes = list(
+        session.scalars(
+            select(NodeExecution)
+            .where(NodeExecution.workflow_execution_id == execution.id)
+            .order_by(NodeExecution.id)
+        )
+    )
+    assert [(node.node_type, node.status) for node in nodes] == [
+        ("CONTENT_PLAN", NodeExecutionStatus.SUCCEEDED),
+        ("TEXT_GENERATE", NodeExecutionStatus.SUCCEEDED),
+        ("TEXT_CHECK", NodeExecutionStatus.SUCCEEDED),
+        ("IMAGE_GENERATE", NodeExecutionStatus.SUCCEEDED),
+        ("IMAGE_CHECK", NodeExecutionStatus.SUCCEEDED),
+        ("HUMAN_APPROVAL", NodeExecutionStatus.WAITING),
+    ]
+    assert failed_image.id == next(node.id for node in nodes if node.node_type == "IMAGE_GENERATE")
+    assert failed_image.revision_no == 0
+    assert len(list(session.scalars(select(NodeExecution).where(
+        NodeExecution.workflow_execution_id == execution.id,
+        NodeExecution.node_type == "PUBLICATION",
+    )))) == 0
+    image_attempts = list(
+        session.scalars(
+            select(NodeExecutionAttempt)
+            .where(NodeExecutionAttempt.node_execution_id == failed_image.id)
+            .order_by(NodeExecutionAttempt.attempt_no)
+        )
+    )
+    assert [attempt.attempt_no for attempt in image_attempts] == [1, 2]
+    assert image_attempts[1].status is NodeExecutionAttemptStatus.SUCCEEDED
+    assert image_attempts[1].metadata_["retry_kind"] == "USER_REQUESTED"
+    assert len(image_provider.calls) == 5
+
+    with pytest.raises(ValueError, match="Only a FAILED workflow execution can be retried"):
+        workflow_engine.retry_failed_execution(execution.id)
+    assert len(list(session.scalars(select(NodeExecution).where(
+        NodeExecution.workflow_execution_id == execution.id,
+        NodeExecution.node_type == "IMAGE_CHECK",
+    )))) == 1
+
+
+def test_recover_completed_image_generation_runs_only_image_check_once(
+    session: Session,
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    image_provider = FakeImageProvider()
+    executor = V3NodeExecutor(
+        session=session,
+        content_plan_model=RunnableLambda(_content_plan_model),
+        text_generate_model=RunnableLambda(_text_generate_model),
+        text_check_model=RunnableLambda(_text_check_model),
+        image_check_model=RunnableLambda(_image_check_model),
+        image_provider=image_provider,
+        image_model_name="test-image-model",
+        storage=FakeStorage(),
+        fail_node="IMAGE_CHECK",
+    )
+    workflow_engine = WorkflowEngine(session, workflow_registry, executor)
+
+    assert workflow_engine.start_execution(execution.id, {"request_text": "fake"}) is WorkflowExecutionStatus.FAILED
+    image_node = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "IMAGE_GENERATE",
+        )
+    )
+    image_check = session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "IMAGE_CHECK",
+        )
+    )
+    assert image_node is not None and image_check is not None and image_node.output_data is not None
+    generated_asset_ids = list(image_node.output_data["asset_ids"])
+    image_check_attempts = list(
+        session.scalars(
+            select(NodeExecutionAttempt).where(NodeExecutionAttempt.node_execution_id == image_check.id)
+        )
+    )
+    for attempt in image_check_attempts:
+        session.delete(attempt)
+    session.flush()
+    session.delete(image_check)
+    execution.status = WorkflowExecutionStatus.RUNNING
+    execution.current_node_type = "IMAGE_GENERATE"
+    execution.completed_at = None
+    session.commit()
+    executor._fail_node = None
+
+    assert workflow_engine.recover_interrupted_execution(execution.id) is WorkflowExecutionStatus.WAITING_APPROVAL
+    session.refresh(image_node)
+    assert image_node.status is NodeExecutionStatus.SUCCEEDED
+    assert image_node.output_data["asset_ids"] == generated_asset_ids
+    assert len(image_provider.calls) == 5
+    assert len(list(session.scalars(select(NodeExecution).where(
+        NodeExecution.workflow_execution_id == execution.id,
+        NodeExecution.node_type == "IMAGE_CHECK",
+    )))) == 1
+    assert session.scalar(select(NodeExecution).where(
+        NodeExecution.workflow_execution_id == execution.id,
+        NodeExecution.node_type == "HUMAN_APPROVAL",
+    )).status is NodeExecutionStatus.WAITING  # type: ignore[union-attr]
+    assert session.scalar(select(NodeExecution).where(
+        NodeExecution.workflow_execution_id == execution.id,
+        NodeExecution.node_type == "PUBLICATION",
+    )) is None
+
+    with pytest.raises(ValueError, match="Workflow execution is not recoverable"):
+        workflow_engine.recover_interrupted_execution(execution.id)
+    assert len(list(session.scalars(select(NodeExecution).where(
+        NodeExecution.workflow_execution_id == execution.id,
+        NodeExecution.node_type == "IMAGE_CHECK",
+    )))) == 1
+    assert len(image_provider.calls) == 5
 
 
 def test_v3_chain_reaches_human_approval_with_runnable_attempts(session: Session) -> None:
@@ -898,7 +1077,8 @@ def test_image_generate_retry_reuses_asset_row_and_storage_key(session: Session)
     session.add(node)
     session.flush()
     storage = FakeStorage()
-    executor = V3NodeExecutor(session=session, image_provider=FakeImageProvider(), storage=storage)
+    provider = FakeImageProvider()
+    executor = V3NodeExecutor(session=session, image_provider=provider, storage=storage)
     payload = {"slides": _five_slides()}
 
     first = executor.execute("IMAGE_GENERATE", payload, workflow_execution_id=execution.id, node_execution_id=node.id)
@@ -909,6 +1089,441 @@ def test_image_generate_retry_reuses_asset_row_and_storage_key(session: Session)
         select(FileAsset).where(FileAsset.created_by_node_execution_id == node.id)
     ).all()
     assert len(assets) == 5
+    assert len(provider.calls) == 5
+
+
+def test_image_generate_partial_failure_reuses_only_completed_slides(session: Session) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=0,
+        input_data={},
+        status=NodeExecutionStatus.RUNNING,
+    )
+    session.add(node)
+    session.flush()
+    storage = FakeStorage()
+    failing_provider = FailOnCallImageProvider(fail_on_call=4)
+    first_executor = V3NodeExecutor(
+        session=session,
+        image_provider=failing_provider,
+        image_model_name="test-image-model",
+        storage=storage,
+    )
+
+    with pytest.raises(RuntimeError, match="configured slide"):
+        first_executor.execute(
+            "IMAGE_GENERATE",
+            {"slides": _five_slides()},
+            workflow_execution_id=execution.id,
+            node_execution_id=node.id,
+        )
+    session.commit()
+
+    progress = session.get(NodeExecution, node.id)
+    assert progress is not None and isinstance(progress.output_data, dict)
+    assert len(progress.output_data["asset_ids"]) == 3
+    assert len(session.scalars(select(FileAsset).where(FileAsset.created_by_node_execution_id == node.id)).all()) == 3
+
+    retry_provider = FakeImageProvider()
+    retry_executor = V3NodeExecutor(
+        session=session,
+        image_provider=retry_provider,
+        image_model_name="test-image-model",
+        storage=storage,
+    )
+    result = retry_executor.execute(
+        "IMAGE_GENERATE",
+        {"slides": _five_slides()},
+        workflow_execution_id=execution.id,
+        node_execution_id=node.id,
+    )
+
+    assert isinstance(result, NodeExecutionResult)
+    assert len(retry_provider.calls) == 2
+    assets = session.scalars(
+        select(FileAsset)
+        .where(FileAsset.created_by_node_execution_id == node.id)
+        .order_by(FileAsset.slide_no)
+    ).all()
+    assert [asset.slide_no for asset in assets] == [1, 2, 3, 4, 5]
+    assert all(storage.files[asset.storage_key] == VALID_PNG for asset in assets)
+    assert len(result.output_data["image_generation_signatures"]) == 5
+
+
+@pytest.mark.parametrize(
+    ("selected_slides", "expected_calls"),
+    [([4], 1), ([2, 4], 2), ([1, 2, 3, 4, 5], 5)],
+)
+def test_selective_image_revision_reuses_unselected_prior_assets(
+    session: Session, selected_slides: list[int], expected_calls: int
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    storage = FakeStorage()
+    prior_node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=0,
+        input_data={"slides": _five_slides()},
+        output_data={
+            "slides": _five_slides(),
+            "asset_ids": [],
+            "image_generation_signatures": {str(slide_no): f"prior-{slide_no}" for slide_no in range(1, 6)},
+        },
+        status=NodeExecutionStatus.SUCCEEDED,
+    )
+    session.add(prior_node)
+    session.flush()
+    prior_assets: list[FileAsset] = []
+    for slide_no in range(1, 6):
+        asset = FileAsset(
+            workflow_execution_id=execution.id,
+            created_by_node_execution_id=prior_node.id,
+            asset_type=AssetType.IMAGE,
+            storage_key=f"prior/{execution.id}/{slide_no}.png",
+            file_name=f"slide-{slide_no}.png",
+            mime_type="image/png",
+            file_size=len(VALID_PNG),
+            slide_no=slide_no,
+        )
+        prior_assets.append(asset)
+        session.add(asset)
+    session.flush()
+    prior_node.output_data["asset_ids"] = [asset.id for asset in prior_assets]
+    for asset in prior_assets:
+        storage.files[asset.storage_key] = VALID_PNG
+    current_node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=1,
+        input_data={"slides": _five_slides(), "revision_request": "4번 슬라이드 제목을 수정해 주세요."},
+        status=NodeExecutionStatus.RUNNING,
+    )
+    session.add(current_node)
+    session.flush()
+    provider = FakeImageProvider(VALID_PNG)
+    executor = V3NodeExecutor(session=session, image_provider=provider, storage=storage)
+
+    result = executor.execute(
+        "IMAGE_GENERATE",
+        {
+            "slides": _five_slides(),
+            "revision_request": "4번 슬라이드 제목을 수정해 주세요.",
+            "image_slide_numbers": selected_slides,
+        },
+        workflow_execution_id=execution.id,
+        node_execution_id=current_node.id,
+    )
+
+    assert len(provider.calls) == expected_calls
+    assert len(result.output_data["asset_ids"]) == 5
+    result_ids = result.output_data["asset_ids"]
+    for slide_no, prior_asset in enumerate(prior_assets, start=1):
+        if slide_no not in selected_slides:
+            assert result_ids[slide_no - 1] == prior_asset.id
+    assert all(
+        (str(slide_no) in call[0]) and ("4번 슬라이드 제목을 수정해 주세요." in call[0])
+        for slide_no, call in zip(selected_slides, provider.calls, strict=True)
+    )
+    assert len(session.scalars(select(FileAsset).where(
+        FileAsset.created_by_node_execution_id == current_node.id
+    )).all()) == expected_calls
+
+
+def test_selective_image_revision_fails_explicitly_when_reused_asset_is_invalid(
+    session: Session,
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    storage = FakeStorage()
+    prior_node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=0,
+        output_data={"asset_ids": [], "image_generation_signatures": {}},
+        status=NodeExecutionStatus.SUCCEEDED,
+    )
+    session.add(prior_node)
+    session.flush()
+    assets = []
+    for slide_no in range(1, 6):
+        asset = FileAsset(
+            workflow_execution_id=execution.id,
+            created_by_node_execution_id=prior_node.id,
+            asset_type=AssetType.IMAGE,
+            storage_key=f"prior-invalid/{slide_no}.png",
+            file_name=f"slide-{slide_no}.png",
+            mime_type="image/png",
+            file_size=len(VALID_PNG),
+            slide_no=slide_no,
+        )
+        assets.append(asset)
+        session.add(asset)
+    session.flush()
+    prior_node.output_data = {
+        "asset_ids": [asset.id for asset in assets],
+        "image_generation_signatures": {str(slide_no): f"prior-{slide_no}" for slide_no in range(1, 6)},
+    }
+    for asset in assets:
+        storage.files[asset.storage_key] = VALID_PNG
+    del storage.files[assets[2].storage_key]
+    current_node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=1,
+        status=NodeExecutionStatus.RUNNING,
+    )
+    session.add(current_node)
+    session.flush()
+    provider = FakeImageProvider(VALID_PNG)
+    executor = V3NodeExecutor(session=session, image_provider=provider, storage=storage)
+
+    with pytest.raises(ValueError, match="Cannot reuse prior IMAGE_GENERATE asset for slide 3"):
+        executor.execute(
+            "IMAGE_GENERATE",
+            {"slides": _five_slides(), "image_slide_numbers": [4]},
+            workflow_execution_id=execution.id,
+            node_execution_id=current_node.id,
+        )
+    assert provider.calls == []
+
+
+def test_selective_image_revision_retry_generates_only_missing_selected_slide(
+    session: Session,
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    storage = FakeStorage()
+    prior_node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=0,
+        output_data={"asset_ids": [], "image_generation_signatures": {}},
+        status=NodeExecutionStatus.SUCCEEDED,
+    )
+    session.add(prior_node)
+    session.flush()
+    prior_assets = []
+    for slide_no in range(1, 6):
+        asset = FileAsset(
+            workflow_execution_id=execution.id,
+            created_by_node_execution_id=prior_node.id,
+            asset_type=AssetType.IMAGE,
+            storage_key=f"prior-retry/{slide_no}.png",
+            file_name=f"slide-{slide_no}.png",
+            mime_type="image/png",
+            file_size=len(VALID_PNG),
+            slide_no=slide_no,
+        )
+        prior_assets.append(asset)
+        session.add(asset)
+    session.flush()
+    prior_node.output_data = {
+        "asset_ids": [asset.id for asset in prior_assets],
+        "image_generation_signatures": {str(slide_no): f"prior-{slide_no}" for slide_no in range(1, 6)},
+    }
+    for asset in prior_assets:
+        storage.files[asset.storage_key] = VALID_PNG
+    current_node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=1,
+        status=NodeExecutionStatus.RUNNING,
+    )
+    session.add(current_node)
+    session.flush()
+    payload = {
+        "slides": _five_slides(),
+        "revision_request": "선택한 슬라이드만 수정해 주세요.",
+        "image_slide_numbers": [2, 4],
+    }
+    with pytest.raises(RuntimeError, match="configured slide"):
+        V3NodeExecutor(
+            session=session,
+            image_provider=FailOnCallImageProvider(fail_on_call=2),
+            storage=storage,
+        ).execute("IMAGE_GENERATE", payload, workflow_execution_id=execution.id, node_execution_id=current_node.id)
+    session.commit()
+
+    retry_provider = FakeImageProvider(VALID_PNG)
+    result = V3NodeExecutor(
+        session=session, image_provider=retry_provider, storage=storage
+    ).execute("IMAGE_GENERATE", payload, workflow_execution_id=execution.id, node_execution_id=current_node.id)
+
+    assert len(retry_provider.calls) == 1
+    assert "slide 4" in retry_provider.calls[0][0]
+    assert len(result.output_data["asset_ids"]) == 5
+    assert result.output_data["asset_ids"][0] == prior_assets[0].id
+    assert result.output_data["asset_ids"][2] == prior_assets[2].id
+    assert result.output_data["asset_ids"][4] == prior_assets[4].id
+
+
+def test_structured_image_revision_request_preserves_legacy_fields() -> None:
+    request = main.ApprovalRequest(
+        node_execution_id=1,
+        decision=ApprovalDecision.REJECTED,
+        target="IMAGE",
+        slide_numbers=[4],
+        feedback="4번 슬라이드 제목을 수정해 주세요.",
+    )
+
+    assert request.target == "IMAGE"
+    assert request.slide_numbers == [4]
+    assert request.feedback == "4번 슬라이드 제목을 수정해 주세요."
+
+    legacy = main.ApprovalRequest(
+        node_execution_id=1,
+        decision=ApprovalDecision.REJECTED,
+        revision_target="IMAGE",
+        revision_request="전체 이미지를 수정해 주세요.",
+    )
+    assert legacy.revision_target == "IMAGE"
+    assert legacy.revision_request == "전체 이미지를 수정해 주세요."
+
+
+def test_publication_accepts_mixed_assets_from_successful_image_revisions(session: Session) -> None:
+    execution = _execution(session)
+    prior_node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=0,
+        output_data={"asset_ids": []},
+        status=NodeExecutionStatus.SUCCEEDED,
+    )
+    session.add(prior_node)
+    session.flush()
+    assets: list[FileAsset] = []
+    for slide_no in range(1, 6):
+        asset = FileAsset(
+            workflow_execution_id=execution.id,
+            created_by_node_execution_id=prior_node.id,
+            asset_type=AssetType.IMAGE,
+            storage_key=f"publication-prior/{slide_no}.png",
+            file_name=f"slide-{slide_no}.png",
+            mime_type="image/png",
+            file_size=1,
+            slide_no=slide_no,
+        )
+        assets.append(asset)
+        session.add(asset)
+    session.flush()
+    revised_node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=1,
+        output_data={"asset_ids": []},
+        status=NodeExecutionStatus.SUCCEEDED,
+    )
+    session.add(revised_node)
+    session.flush()
+    revised_asset = FileAsset(
+        workflow_execution_id=execution.id,
+        created_by_node_execution_id=revised_node.id,
+        asset_type=AssetType.IMAGE,
+        storage_key="publication-revised/4.png",
+        file_name="slide-4.png",
+        mime_type="image/png",
+        file_size=1,
+        slide_no=4,
+    )
+    session.add(revised_asset)
+    session.flush()
+    mixed_ids = [assets[0].id, assets[1].id, assets[2].id, revised_asset.id, assets[4].id]
+    revised_node.output_data = {"asset_ids": mixed_ids}
+    result = V3NodeExecutor(session=session).execute(
+        "PUBLICATION", {"asset_ids": mixed_ids}, workflow_execution_id=execution.id, node_execution_id=revised_node.id
+    )
+
+    assert result.output_data == {"asset_ids": mixed_ids}
+
+
+def test_image_generate_does_not_reuse_slide_when_prompt_changes(session: Session) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=0,
+        input_data={},
+        status=NodeExecutionStatus.RUNNING,
+    )
+    session.add(node)
+    session.flush()
+    provider = FakeImageProvider()
+    executor = V3NodeExecutor(
+        session=session,
+        image_provider=provider,
+        image_model_name="test-image-model",
+        storage=FakeStorage(),
+    )
+    executor.execute(
+        "IMAGE_GENERATE",
+        {"slides": _five_slides()},
+        workflow_execution_id=execution.id,
+        node_execution_id=node.id,
+    )
+
+    changed_slides = _five_slides()
+    changed_slides[1] = {"slide_no": 2, "text": "Changed supporting copy"}
+    executor.execute(
+        "IMAGE_GENERATE",
+        {"slides": changed_slides},
+        workflow_execution_id=execution.id,
+        node_execution_id=node.id,
+    )
+
+    assert len(provider.calls) == 6
+    assert "Changed supporting copy" in provider.calls[-1][0]
+
+
+def test_image_generate_does_not_reuse_when_generation_settings_change(session: Session) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=0,
+        input_data={},
+        status=NodeExecutionStatus.RUNNING,
+    )
+    session.add(node)
+    session.flush()
+    storage = FakeStorage()
+    first_provider = ConfiguredFakeImageProvider({"output_format": "png"})
+    first_executor = V3NodeExecutor(
+        session=session,
+        image_provider=first_provider,
+        image_model_name="test-image-model",
+        storage=storage,
+    )
+    first_executor.execute(
+        "IMAGE_GENERATE",
+        {"slides": _five_slides()},
+        workflow_execution_id=execution.id,
+        node_execution_id=node.id,
+    )
+
+    second_provider = ConfiguredFakeImageProvider(
+        {"output_format": "png", "quality": "low", "size": "1024x1024", "n": 1}
+    )
+    second_executor = V3NodeExecutor(
+        session=session,
+        image_provider=second_provider,
+        image_model_name="test-image-model",
+        storage=storage,
+    )
+    second_executor.execute(
+        "IMAGE_GENERATE",
+        {"slides": _five_slides()},
+        workflow_execution_id=execution.id,
+        node_execution_id=node.id,
+    )
+
+    assert len(first_provider.calls) == 5
+    assert len(second_provider.calls) == 5
 
 
 def test_image_check_reads_generated_assets_and_persists_structured_result(session: Session) -> None:
@@ -2175,6 +2790,283 @@ def test_resume_and_revision_crash_recovery_continue_only_unfinished_boundary(
             )
         )
     ) == 1
+
+
+@pytest.mark.parametrize("publication_status", [SocialPublicationStatus.PUBLISHING, SocialPublicationStatus.PUBLISHED])
+def test_completed_v3_can_edit_one_slide_and_preserve_approved_result(
+    session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    publication_status: SocialPublicationStatus,
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    provider = FakeImageProvider()
+    storage = FakeStorage()
+    workflow_engine = WorkflowEngine(
+        session, workflow_registry,
+        V3NodeExecutor(
+            session=session,
+            content_plan_model=RunnableLambda(_content_plan_model),
+            text_generate_model=RunnableLambda(_text_generate_model),
+            text_check_model=RunnableLambda(_text_check_model),
+            image_check_model=RunnableLambda(_image_check_model),
+            image_provider=provider,
+            storage=storage,
+        ),
+    )
+    assert workflow_engine.start_execution(execution.id, {"request_text": "fake"}) is WorkflowExecutionStatus.WAITING_APPROVAL
+    original_image = session.scalar(select(NodeExecution).where(
+        NodeExecution.workflow_execution_id == execution.id,
+        NodeExecution.node_type == "IMAGE_GENERATE",
+        NodeExecution.revision_no == 0,
+    ))
+    original_approval = session.scalar(select(NodeExecution).where(
+        NodeExecution.workflow_execution_id == execution.id,
+        NodeExecution.node_type == "HUMAN_APPROVAL",
+        NodeExecution.revision_no == 0,
+    ))
+    assert original_image is not None and original_approval is not None
+    original_asset_ids = list(original_image.output_data["asset_ids"])
+    monkeypatch.setattr(main.settings, "uploads_root", tmp_path)
+    for storage_key, image_bytes in storage.files.items():
+        output_file = tmp_path / storage_key
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.write_bytes(image_bytes)
+
+    with _approval_client(session, workflow_engine, monkeypatch) as client:
+        premature = client.post(
+            f"/workflow-executions/{execution.id}/revisions/from-completed",
+            json={"target": "IMAGE", "slide_numbers": [4], "feedback": "Too early"},
+        )
+        assert premature.status_code == 422
+        accepted = client.post(
+            f"/workflow-executions/{execution.id}/approvals",
+            json={"node_execution_id": original_approval.id},
+        )
+        assert accepted.status_code == 202
+        _consume_latest_v3_dispatch(session, workflow_engine, execution.id)
+        original_publication = session.scalar(select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "PUBLICATION",
+            NodeExecution.revision_no == 0,
+        ))
+        assert original_publication is not None
+        assert execution.status is WorkflowExecutionStatus.SUCCEEDED
+        connection = SocialAccountConnection(
+            user_id=execution.user_id, platform=SocialPlatform.INSTAGRAM,
+            external_account_id=f"test-{uuid4()}", access_token="test-only",
+        )
+        session.add(connection)
+        session.flush()
+        existing_post = SocialPublication(
+            node_execution_id=original_publication.id,
+            social_account_connection_id=connection.id,
+            status=publication_status,
+            idempotency_key=f"existing-{uuid4()}",
+            external_post_id="original-post" if publication_status is SocialPublicationStatus.PUBLISHED else None,
+        )
+        session.add(existing_post)
+        session.commit()
+        baseline_calls = len(provider.calls)
+        assert baseline_calls == 5
+
+        body = {"target": "IMAGE", "slide_numbers": [4], "feedback": "Fix the title on slide four"}
+        assert client.post(
+            f"/workflow-executions/{execution.id}/revisions/from-completed",
+            json={"target": "IMAGE", "slide_numbers": [], "feedback": "Invalid"},
+        ).status_code == 422
+        assert client.post(
+            f"/workflow-executions/{execution.id}/revisions/from-completed",
+            json={"target": "TEXT", "slide_numbers": [4], "feedback": "Invalid"},
+        ).status_code == 422
+        revision_response = client.post(
+            f"/workflow-executions/{execution.id}/revisions/from-completed", json=body
+        )
+        assert revision_response.status_code == 202
+        assert revision_response.json()["status"] == "RUNNING"
+        duplicate = client.post(
+            f"/workflow-executions/{execution.id}/revisions/from-completed", json=body
+        )
+        assert duplicate.status_code == 422
+        assert len(provider.calls) == baseline_calls
+        revision = session.scalar(select(Revision).where(Revision.workflow_execution_id == execution.id))
+        assert revision is not None and revision.revision_no == 1
+        original_decision = session.scalar(select(UserApproval).where(UserApproval.node_execution_id == original_approval.id))
+        assert original_decision is not None and original_decision.decision is ApprovalDecision.APPROVED
+        assert revision.user_approval_id == original_decision.id
+        assert original_image.status is NodeExecutionStatus.SUCCEEDED
+        assert original_image.output_data["asset_ids"] == original_asset_ids
+        assert original_publication.status is NodeExecutionStatus.SUCCEEDED
+        assert original_publication.output_data["asset_ids"] == original_asset_ids
+        pending_read = client.get(f"/workflow-executions/{execution.id}")
+        assert pending_read.status_code == 200
+        assert pending_read.json()["images"] == []
+        assert len(pending_read.json()["previous_images"]) == 5
+        assert pending_read.json()["editing_slides"] == [4]
+        old_image_url = pending_read.json()["previous_images"][0]["image_url"]
+        assert "revision_no=0" in old_image_url
+        assert client.get(old_image_url).status_code == 200
+        assert client.get(f"/workflow-executions/{execution.id}/slides/1/image").status_code == 404
+
+        _consume_latest_v3_dispatch(session, workflow_engine, execution.id)
+        for storage_key, image_bytes in storage.files.items():
+            output_file = tmp_path / storage_key
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            output_file.write_bytes(image_bytes)
+        assert execution.status is WorkflowExecutionStatus.WAITING_APPROVAL
+        assert len(provider.calls) == baseline_calls + 1
+        assert "Fix the title on slide four" in provider.calls[-1][0]
+        revised_image = session.scalar(select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "IMAGE_GENERATE",
+            NodeExecution.revision_no == 1,
+        ))
+        revised_check = session.scalar(select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "IMAGE_CHECK",
+            NodeExecution.revision_no == 1,
+        ))
+        waiting = session.scalar(select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "HUMAN_APPROVAL",
+            NodeExecution.revision_no == 1,
+        ))
+        assert revised_image is not None and revised_check is not None and waiting is not None
+        assert revised_check.status is NodeExecutionStatus.SUCCEEDED
+        assert revised_check.output_data["passed"] is True
+        revised_asset_ids = revised_image.output_data["asset_ids"]
+        assert len(revised_asset_ids) == 5
+        assert [revised_asset_ids[index] for index in (0, 1, 2, 4)] == [
+            original_asset_ids[index] for index in (0, 1, 2, 4)
+        ]
+        assert revised_asset_ids[3] != original_asset_ids[3]
+        current_read = client.get(f"/workflow-executions/{execution.id}").json()
+        assert len(current_read["images"]) == 5
+        assert len(current_read["previous_images"]) == 5
+        assert client.get(current_read["images"][0]["image_url"]).status_code == 200
+
+        approved = client.post(
+            f"/workflow-executions/{execution.id}/approvals",
+            json={"node_execution_id": waiting.id},
+        )
+        assert approved.status_code == 202
+        _consume_latest_v3_dispatch(session, workflow_engine, execution.id)
+        assert execution.status is WorkflowExecutionStatus.SUCCEEDED
+        new_publication = session.scalar(select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "PUBLICATION",
+            NodeExecution.revision_no == 1,
+        ))
+        assert new_publication is not None
+        assert new_publication.status is NodeExecutionStatus.SUCCEEDED
+        assert new_publication.output_data["asset_ids"] == revised_asset_ids
+        assert session.scalar(select(SocialPublication).join(
+            NodeExecution, SocialPublication.node_execution_id == NodeExecution.id
+        ).where(NodeExecution.workflow_execution_id == execution.id)) is existing_post
+        assert existing_post.status is publication_status
+        assert existing_post.node_execution_id == original_publication.id
+
+        second_edit = client.post(
+            f"/workflow-executions/{execution.id}/revisions/from-completed",
+            json={"target": "IMAGE", "slide_numbers": [2], "feedback": "Adjust slide two"},
+        )
+        assert second_edit.status_code == 202
+        _consume_latest_v3_dispatch(session, workflow_engine, execution.id)
+        assert execution.status is WorkflowExecutionStatus.WAITING_APPROVAL
+        assert len(provider.calls) == baseline_calls + 2
+        second_image = session.scalar(select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "IMAGE_GENERATE",
+            NodeExecution.revision_no == 2,
+        ))
+        assert second_image is not None
+        second_ids = second_image.output_data["asset_ids"]
+        assert second_ids[1] != revised_asset_ids[1]
+        assert [second_ids[index] for index in (0, 2, 3, 4)] == [
+            revised_asset_ids[index] for index in (0, 2, 3, 4)
+        ]
+        assert revised_image.output_data["asset_ids"] == revised_asset_ids
+        assert original_image.output_data["asset_ids"] == original_asset_ids
+        publication_service = PublicationService(session, Mock(), Mock(), Mock())
+        original_assets = list(session.scalars(select(FileAsset).where(FileAsset.id.in_(original_asset_ids))))
+        revised_assets = list(session.scalars(select(FileAsset).where(FileAsset.id.in_(revised_asset_ids))))
+        assert len(publication_service._validated_assets(
+            original_publication, original_asset_ids, {asset.id: asset for asset in original_assets}
+        )) == 5
+        assert len(publication_service._validated_assets(
+            new_publication, revised_asset_ids, {asset.id: asset for asset in revised_assets}
+        )) == 5
+    main.app.dependency_overrides.clear()
+
+
+def test_completed_v3_partial_image_edit_retries_only_missing_slide(
+    session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    storage = FakeStorage()
+    executor = V3NodeExecutor(
+        session=session,
+        content_plan_model=RunnableLambda(_content_plan_model),
+        text_generate_model=RunnableLambda(_text_generate_model),
+        text_check_model=RunnableLambda(_text_check_model),
+        image_check_model=RunnableLambda(_image_check_model),
+        image_provider=FakeImageProvider(),
+        storage=storage,
+    )
+    workflow_engine = WorkflowEngine(session, workflow_registry, executor)
+    assert workflow_engine.start_execution(execution.id, {"request_text": "fake"}) is WorkflowExecutionStatus.WAITING_APPROVAL
+    original_image = session.scalar(select(NodeExecution).where(
+        NodeExecution.workflow_execution_id == execution.id,
+        NodeExecution.node_type == "IMAGE_GENERATE",
+        NodeExecution.revision_no == 0,
+    ))
+    approval_node = session.scalar(select(NodeExecution).where(
+        NodeExecution.workflow_execution_id == execution.id,
+        NodeExecution.node_type == "HUMAN_APPROVAL",
+        NodeExecution.revision_no == 0,
+    ))
+    assert original_image is not None and approval_node is not None
+    original_ids = list(original_image.output_data["asset_ids"])
+
+    with _approval_client(session, workflow_engine, monkeypatch) as client:
+        assert client.post(
+            f"/workflow-executions/{execution.id}/approvals",
+            json={"node_execution_id": approval_node.id},
+        ).status_code == 202
+        _consume_latest_v3_dispatch(session, workflow_engine, execution.id)
+        assert execution.status is WorkflowExecutionStatus.SUCCEEDED
+
+        failing_provider = FailOnCallImageProvider(fail_on_call=2)
+        executor._image_provider = failing_provider
+        assert client.post(
+            f"/workflow-executions/{execution.id}/revisions/from-completed",
+            json={"target": "IMAGE", "slide_numbers": [2, 4], "feedback": "Fix both"},
+        ).status_code == 202
+        _consume_latest_v3_dispatch(session, workflow_engine, execution.id)
+        assert execution.status is WorkflowExecutionStatus.FAILED
+        failed_image = session.scalar(select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "IMAGE_GENERATE",
+            NodeExecution.revision_no == 1,
+        ))
+        assert failed_image is not None
+        generated = list(session.scalars(select(FileAsset).where(
+            FileAsset.created_by_node_execution_id == failed_image.id,
+        )))
+        assert [asset.slide_no for asset in generated] == [2]
+        successful_id = generated[0].id
+
+        retry_provider = FakeImageProvider()
+        executor._image_provider = retry_provider
+        assert workflow_engine.retry_failed_execution(execution.id) is WorkflowExecutionStatus.WAITING_APPROVAL
+        assert len(retry_provider.calls) == 1
+        assert failed_image.output_data["asset_ids"][1] == successful_id
+        assert failed_image.output_data["asset_ids"][3] != original_ids[3]
+        assert [failed_image.output_data["asset_ids"][index] for index in (0, 2, 4)] == [
+            original_ids[index] for index in (0, 2, 4)
+        ]
+        assert original_image.output_data["asset_ids"] == original_ids
+    main.app.dependency_overrides.clear()
 
 
 @pytest.mark.parametrize("revision_target", ["PLAN", "TEXT", "IMAGE"])
