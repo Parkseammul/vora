@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 from langchain_core.runnables import RunnableLambda
+from pydantic import ValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
@@ -100,6 +101,83 @@ def _image_executor_kwargs() -> dict[str, object]:
         "image_check_model": RunnableLambda(_image_check_model),
         "image_check_model_name": "test-image-check-model",
     }
+
+
+def _five_slides() -> list[dict[str, object]]:
+    return [
+        {"slide_no": index, "text": text}
+        for index, text in enumerate(("Headline", "Supporting copy", "Benefit", "Proof", "Call to action"), 1)
+    ]
+
+
+def test_v3_output_models_accept_exactly_five_slides() -> None:
+    assert len(TextGenerateOutput.model_validate({"slides": _five_slides()}).slides) == 5
+    assert len(
+        ContentPlanOutput.model_validate(
+            {"core_message": "message", "slide_structure": ["hook", "benefit", "proof", "detail", "cta"]}
+        ).slide_structure
+    ) == 5
+
+
+@pytest.mark.parametrize(
+    "slides",
+    [
+        _five_slides()[:-1],
+        _five_slides() + [{"slide_no": 6, "text": "Extra"}],
+        [*_five_slides()[:4], {"slide_no": 4, "text": "Duplicate"}],
+        [*_five_slides()[:2], {"slide_no": 4, "text": "Missing three"}, *_five_slides()[3:]],
+        [{"slide_no": 0, "text": "Out of range"}, *_five_slides()[1:]],
+        [*_five_slides()[:2], {"slide_no": 3, "text": "   "}, *_five_slides()[3:]],
+    ],
+)
+def test_v3_output_models_reject_invalid_five_slide_contract(
+    slides: list[dict[str, object]],
+) -> None:
+    with pytest.raises(ValidationError):
+        TextGenerateOutput.model_validate({"slides": slides})
+
+
+def test_image_generate_rejects_invalid_slides_before_provider_call(session: Session) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    provider = FakeImageProvider()
+    node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=0,
+        input_data={},
+        status=NodeExecutionStatus.RUNNING,
+    )
+    session.add(node)
+    session.flush()
+    executor = V3NodeExecutor(session=session, image_provider=provider, storage=FakeStorage())
+
+    with pytest.raises(ValidationError):
+        executor.execute(
+            "IMAGE_GENERATE",
+            {"slides": _five_slides()[:-1]},
+            workflow_execution_id=execution.id,
+            node_execution_id=node.id,
+        )
+
+    assert provider.calls == []
+
+
+def test_image_check_requires_five_unique_asset_ids(session: Session) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    executor = V3NodeExecutor(
+        session=session,
+        storage=FakeStorage(),
+        image_check_model=RunnableLambda(_image_check_model),
+    )
+
+    with pytest.raises(ValueError, match="five unique integers"):
+        executor.execute(
+            "IMAGE_CHECK",
+            {"asset_ids": [1, 2, 3, 4], "slides": _five_slides()},
+            workflow_execution_id=execution.id,
+        )
 
 
 @pytest.fixture
@@ -203,8 +281,10 @@ def _failing_image_check_model(_: object) -> ImageCheckOutput:
 
 
 def _v3_input_contract(
-    session: Session, execution: WorkflowExecution, version: int = 1
+    session: Session, execution: WorkflowExecution, version: int | None = None
 ) -> None:
+    if version is None:
+        version = int(uuid4().hex[:7], 16)
     rules = RulesVersion(version=version, rules_data={"tone": "clear"})
     content_plan_prompt = PromptVersion(
         node_type="CONTENT_PLAN", version=version, prompt_template=PROMPT_TEMPLATE
@@ -467,7 +547,9 @@ def test_v3_content_plan_uses_prompt_version_and_persists_structured_output(sess
     assert attempt is not None
     assert attempt.status is NodeExecutionAttemptStatus.SUCCEEDED
     assert attempt.prompt_version_id is not None
-    assert attempt.metadata_ == {"runtime": "v3-langchain", "prompt_version": 1}
+    prompt = session.get(PromptVersion, attempt.prompt_version_id)
+    assert prompt is not None
+    assert attempt.metadata_ == {"runtime": "v3-langchain", "prompt_version": prompt.version}
 
 
 def test_v3_content_plan_model_failure_marks_attempt_node_and_workflow_failed(
@@ -543,7 +625,9 @@ def test_v3_text_generate_uses_prompt_version_and_persists_structured_output(
     assert attempt.prompt_version_id is not None
     assert attempt.ai_company == "OPENAI"
     assert attempt.model == "test-text-generate-model"
-    assert attempt.metadata_ == {"runtime": "v3-langchain", "prompt_version": 1}
+    prompt = session.get(PromptVersion, attempt.prompt_version_id)
+    assert prompt is not None
+    assert attempt.metadata_ == {"runtime": "v3-langchain", "prompt_version": prompt.version}
 
 
 def test_v3_text_generate_model_failure_marks_attempt_node_and_workflow_failed(
@@ -652,7 +736,7 @@ def test_v3_text_check_failed_review_is_a_successful_node_execution(session: Ses
         )
     )
     assert text_check is not None
-    assert text_check.status is NodeExecutionStatus.SUCCEEDED
+    assert text_check.status is NodeExecutionStatus.FAILED
     assert text_check.output_data is not None
     assert text_check.output_data["passed"] is False
     assert text_check.output_data["violations"] == ["Forbidden word used"]
@@ -661,6 +745,12 @@ def test_v3_text_check_failed_review_is_a_successful_node_execution(session: Ses
     )
     assert attempt is not None
     assert attempt.status is NodeExecutionAttemptStatus.SUCCEEDED
+    assert session.scalar(
+        select(NodeExecution).where(
+            NodeExecution.workflow_execution_id == execution.id,
+            NodeExecution.node_type == "IMAGE_GENERATE",
+        )
+    ) is None
 
 
 def test_v3_text_check_model_failure_marks_attempt_node_and_workflow_failed(
@@ -720,7 +810,7 @@ def test_image_generate_persists_each_generated_file_asset(session: Session) -> 
 
     result = executor.execute(
         "IMAGE_GENERATE",
-        {"slides": [{"slide_no": 1, "text": "Headline"}]},
+        {"slides": _five_slides()},
         workflow_execution_id=execution.id,
         node_execution_id=node.id,
     )
@@ -735,6 +825,7 @@ def test_image_generate_persists_each_generated_file_asset(session: Session) -> 
     assert asset.mime_type == "image/png"
     assert asset.file_size == len(b"generated-png")
     assert storage.files[asset.storage_key] == b"generated-png"
+    assert len(provider.calls) == 5
     assert "Headline" in provider.calls[0][0]
 
 
@@ -759,7 +850,7 @@ def test_image_generate_storage_failure_does_not_create_asset(session: Session) 
     with pytest.raises(OSError, match="storage unavailable"):
         executor.execute(
             "IMAGE_GENERATE",
-            {"slides": [{"slide_no": 1, "text": "Headline"}]},
+            {"slides": _five_slides()},
             workflow_execution_id=execution.id,
             node_execution_id=node.id,
         )
@@ -787,7 +878,7 @@ def test_image_generate_provider_failure_does_not_create_asset(session: Session)
     with pytest.raises(RuntimeError, match="image provider unavailable"):
         executor.execute(
             "IMAGE_GENERATE",
-            {"slides": [{"slide_no": 1, "text": "Headline"}]},
+            {"slides": _five_slides()},
             workflow_execution_id=execution.id,
             node_execution_id=node.id,
         )
@@ -808,7 +899,7 @@ def test_image_generate_retry_reuses_asset_row_and_storage_key(session: Session)
     session.flush()
     storage = FakeStorage()
     executor = V3NodeExecutor(session=session, image_provider=FakeImageProvider(), storage=storage)
-    payload = {"slides": [{"slide_no": 1, "text": "Headline"}]}
+    payload = {"slides": _five_slides()}
 
     first = executor.execute("IMAGE_GENERATE", payload, workflow_execution_id=execution.id, node_execution_id=node.id)
     second = executor.execute("IMAGE_GENERATE", payload, workflow_execution_id=execution.id, node_execution_id=node.id)
@@ -817,7 +908,7 @@ def test_image_generate_retry_reuses_asset_row_and_storage_key(session: Session)
     assets = session.scalars(
         select(FileAsset).where(FileAsset.created_by_node_execution_id == node.id)
     ).all()
-    assert len(assets) == 1
+    assert len(assets) == 5
 
 
 def test_image_check_reads_generated_assets_and_persists_structured_result(session: Session) -> None:
@@ -842,7 +933,7 @@ def test_image_check_reads_generated_assets_and_persists_structured_result(sessi
     )
     generated = executor.execute(
         "IMAGE_GENERATE",
-        {"slides": [{"slide_no": 1, "text": "Headline"}, {"slide_no": 2, "text": "Copy"}]},
+        {"slides": _five_slides()},
         workflow_execution_id=execution.id,
         node_execution_id=image_node.id,
     )
@@ -859,7 +950,12 @@ def test_image_check_reads_generated_assets_and_persists_structured_result(sessi
         "violations": [],
         "feedback": None,
     }
-    assert checked.attempt_metadata == {"runtime": "v3-langchain-vision", "prompt_version": 1}
+    checked_prompt = session.get(PromptVersion, checked.prompt_version_id)
+    assert checked_prompt is not None
+    assert checked.attempt_metadata == {
+        "runtime": "v3-langchain-vision",
+        "prompt_version": checked_prompt.version,
+    }
     assert checked.model == "test-image-check-model"
 
 
@@ -910,7 +1006,7 @@ def test_image_check_missing_file_and_provider_error_fail_explicitly(session: Se
         image_check_model=RunnableLambda(_failing_image_check_model),
     )
 
-    with pytest.raises(ValueError, match="generated image asset does not exist"):
+    with pytest.raises(ValueError, match="five unique integers"):
         executor.execute(
             "IMAGE_CHECK", {"asset_ids": [999999], "slides": []}, workflow_execution_id=execution.id
         )
@@ -937,11 +1033,11 @@ def test_image_check_missing_file_and_provider_error_fail_explicitly(session: Se
         storage=MissingStorage(),
         image_check_model=RunnableLambda(_image_check_model),
     )
-    with pytest.raises(FileNotFoundError, match="storage"):
+    with pytest.raises(ValueError, match="five unique integers"):
         missing_file_executor.execute(
             "IMAGE_CHECK", {"asset_ids": [generated.id], "slides": []}, workflow_execution_id=execution.id
         )
-    with pytest.raises(RuntimeError, match="IMAGE_CHECK model unavailable"):
+    with pytest.raises(ValueError, match="five unique integers"):
         executor.execute(
             "IMAGE_CHECK", {"asset_ids": [generated.id], "slides": []}, workflow_execution_id=execution.id
         )

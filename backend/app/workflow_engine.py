@@ -580,6 +580,14 @@ class WorkflowEngine:
             else:
                 output_data = execution_result
             node_execution.output_data = output_data
+            if node_key == "TEXT_CHECK" and output_data.get("passed") is False:
+                node_execution.status = NodeExecutionStatus.FAILED
+                node_execution.completed_at = finished_at
+                execution.status = WorkflowExecutionStatus.FAILED
+                execution.current_node_type = None
+                execution.completed_at = finished_at
+                self._commit_state()
+                return execution.status
             if node_definition.requires_approval:
                 node_execution.status = NodeExecutionStatus.WAITING
                 execution.status = WorkflowExecutionStatus.WAITING_APPROVAL
@@ -652,6 +660,13 @@ class WorkflowEngine:
             output_data = execution_result
         node_execution.output_data = output_data
         node_execution.completed_at = finished_at
+        if node_execution.node_type == "TEXT_CHECK" and output_data.get("passed") is False:
+            node_execution.status = NodeExecutionStatus.FAILED
+            execution.status = WorkflowExecutionStatus.FAILED
+            execution.current_node_type = None
+            execution.completed_at = finished_at
+            self._commit_state()
+            return execution.status
         if node_definition.requires_approval:
             node_execution.status = NodeExecutionStatus.WAITING
             execution.status = WorkflowExecutionStatus.WAITING_APPROVAL
