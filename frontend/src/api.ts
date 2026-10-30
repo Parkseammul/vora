@@ -1,4 +1,4 @@
-import type { Detail, InstagramPublicationRequest, PlanOutput, PublicationDetail, ScriptOutput, SocialConnection, VideoDetail, WorkflowRead } from "./types";
+import type { Detail, InstagramPublicationRequest, PlanOutput, PublicationDetail, ScriptOutput, SocialConnection, VideoDetail, WorkflowRead, V3WorkflowTrace } from "./types";
 
 const baseUrl = import.meta.env.VITE_API_BASE_URL ?? "";
 const apiUrl = (path: string) => baseUrl ? `${baseUrl.replace(/\/$/, "")}/${path.replace(/^\//, "")}` : path;
@@ -51,6 +51,7 @@ async function requestBlob(path: string, signal?: AbortSignal): Promise<Blob> {
 
 export const api = {
   getWorkflow: (id: number, signal?: AbortSignal) => request<WorkflowRead>(`/workflow-executions/${id}`, { signal }),
+  getWorkflowTrace: (id: number, signal?: AbortSignal) => request<V3WorkflowTrace>(`/workflow-executions/${id}/trace`, { signal }),
   getPlan: (id: number) => request<Detail<PlanOutput>>(`/workflow-executions/${id}/plan`),
   getScript: (id: number) => request<Detail<ScriptOutput>>(`/workflow-executions/${id}/script`),
   getVideo: (id: number) => request<VideoDetail>(`/workflow-executions/${id}/video`),
