@@ -479,13 +479,16 @@ class V3NodeExecutor:
         source_asset: FileAsset,
         source_digest: str,
     ) -> str:
+        provider_settings = getattr(self._image_provider, "generation_settings", None)
+        if not isinstance(provider_settings, dict):
+            provider_settings = {"output_format": "png"}
         signature_data = {
             "prompt": prompt,
             "source_asset_id": source_asset.id,
             "source_storage_key": source_asset.storage_key,
             "source_sha256": source_digest,
             "model": self._image_model_name,
-            "settings": {"output_format": "png"},
+            "settings": provider_settings,
         }
         serialized = json.dumps(signature_data, ensure_ascii=False, sort_keys=True).encode("utf-8")
         return hashlib.sha256(serialized).hexdigest()

@@ -73,6 +73,16 @@ class FakeImageProvider:
         return self.image
 
 
+class ConfiguredFakeImageProvider(FakeImageProvider):
+    def __init__(self, settings: dict[str, str | int]) -> None:
+        super().__init__()
+        self._settings = settings
+
+    @property
+    def generation_settings(self) -> dict[str, str | int]:
+        return self._settings
+
+
 class FailingImageProvider:
     def generate(self, *, prompt: str, source_image: Path) -> bytes:
         del prompt, source_image
@@ -1029,6 +1039,53 @@ def test_image_generate_does_not_reuse_slide_when_prompt_changes(session: Sessio
 
     assert len(provider.calls) == 6
     assert "Changed supporting copy" in provider.calls[-1][0]
+
+
+def test_image_generate_does_not_reuse_when_generation_settings_change(session: Session) -> None:
+    execution = _execution(session)
+    _v3_input_contract(session, execution)
+    node = NodeExecution(
+        workflow_execution_id=execution.id,
+        node_type="IMAGE_GENERATE",
+        revision_no=0,
+        input_data={},
+        status=NodeExecutionStatus.RUNNING,
+    )
+    session.add(node)
+    session.flush()
+    storage = FakeStorage()
+    first_provider = ConfiguredFakeImageProvider({"output_format": "png"})
+    first_executor = V3NodeExecutor(
+        session=session,
+        image_provider=first_provider,
+        image_model_name="test-image-model",
+        storage=storage,
+    )
+    first_executor.execute(
+        "IMAGE_GENERATE",
+        {"slides": _five_slides()},
+        workflow_execution_id=execution.id,
+        node_execution_id=node.id,
+    )
+
+    second_provider = ConfiguredFakeImageProvider(
+        {"output_format": "png", "quality": "low", "size": "1024x1024", "n": 1}
+    )
+    second_executor = V3NodeExecutor(
+        session=session,
+        image_provider=second_provider,
+        image_model_name="test-image-model",
+        storage=storage,
+    )
+    second_executor.execute(
+        "IMAGE_GENERATE",
+        {"slides": _five_slides()},
+        workflow_execution_id=execution.id,
+        node_execution_id=node.id,
+    )
+
+    assert len(first_provider.calls) == 5
+    assert len(second_provider.calls) == 5
 
 
 def test_image_check_reads_generated_assets_and_persists_structured_result(session: Session) -> None:
